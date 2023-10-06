@@ -27,8 +27,7 @@ jobs:
         
     - name: Package as archive
       shell: bash
-      run: | 
-        ls -la target/arm-unknown-linux-gnueabihf/release
+      run: |
         cp target/arm-unknown-linux-gnueabihf/release/discord_status_bot discord_status_bot
 
     - name: Copy over
@@ -40,3 +39,15 @@ jobs:
         port: ${{ secrets.PORT }}
         source: "discord_status_bot"
         target: ${{ secrets.TARGET_DIR }}
+
+    - name: Restarting the job
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.KEY }}
+        port: ${{ secrets.PORT }}
+        script: |
+          kill -9 $(ps -aux | grep discord_status | awk '{print $2}')
+          cd ${{ secrets.TARGET_DIR }}
+          nohup ./discord_status_bot &
