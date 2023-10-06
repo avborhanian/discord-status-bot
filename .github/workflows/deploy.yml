@@ -1,0 +1,48 @@
+name: Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Cache
+      uses: actions/cache@v2
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.rustup
+          target
+        key: ubuntu-latest-stable
+
+    - name: Install Linker
+      run: |
+        sudo apt update
+        sudo apt install gcc-arm-linux-gnueabihf
+
+    - name: Install Rust
+      run: |
+        rustup install stable
+        rustup target add arm-unknown-linux-gnueabihf
+        rustup show
+
+    - name: Build
+      run: cargo build --release --target arm-unknown-linux-gnueabihf
+
+    - name: Copy over
+      uses: appleboy/scp-action@v0.1.4
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        password: ${{ secrets.PASSWORD }}
+        port: ${{ secrets.PORT }}
+        source: "target/arm-unknown-linux-gnueabihf/release/discord_status_bot"
+        target: /
