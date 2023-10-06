@@ -604,7 +604,7 @@ async fn check_match_history(
         )?;
     }
 
-    check_pentakill_info(pentakillers, &discord_client).await?;
+    check_pentakill_info(pentakillers, discord_client).await?;
 
     let mut queue_scores_msgs = queue_scores
         .iter()
@@ -677,7 +677,7 @@ async fn check_match_history(
         }
     }
 
-    update_discord_status(&results, Some(&current_status)).await
+    update_discord_status(&results, Some(current_status)).await
 }
 
 fn update_match_info(
@@ -740,7 +740,7 @@ fn update_match_info(
                 queue_id,
                 true,
                 game_end_timestamp,
-                &match_info,
+                match_info,
             )?
         }
         false => {
@@ -753,7 +753,7 @@ fn update_match_info(
                 queue_id,
                 false,
                 game_end_timestamp,
-                &match_info,
+                match_info,
             )?;
         }
     };
@@ -824,7 +824,7 @@ async fn check_pentakill_info(
             pentakill_links.push(format!(
                 "[{}'s pentakill game here](https://blitz.gg/lol/match/na1/{}/{})",
                 formatted_names,
-                names.first().unwrap().replace(" ", "%20"),
+                names.first().unwrap().replace(' ', "%20"),
                 game_id
             ))
         }
@@ -875,9 +875,10 @@ async fn update_discord_status(
             "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzExNi4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTE2LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiJodHRwczovL3d3dy5nb29nbGUuY29tLyIsInJlZmVycmluZ19kb21haW4iOiJ3d3cuZ29vZ2xlLmNvbSIsInNlYXJjaF9lbmdpbmUiOiJnb29nbGUiLCJyZWZlcnJlcl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVsZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6MjI2MjIwLCJjbGllbnRfZXZlbnRfc291cmNlIjpudWxsfQ==",
         ),
     );
-    true_reqwest
-        .url_mut()
-        .set_path("api/v10/channels/705937071641985104/voice-status");
+    true_reqwest.url_mut().set_path(&format!(
+        "api/v10/channels/{}/voice-status",
+        GAMES_VOICE_CHANNEL_ID.as_u64(),
+    ));
     *true_reqwest.method_mut() = Method::PUT;
     client.execute(true_reqwest).await?;
     Ok(())
