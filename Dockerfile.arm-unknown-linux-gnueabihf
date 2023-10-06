@@ -1,0 +1,7 @@
+FROM ghcr.io/cross-rs/arm-unknown-linux-gnueabihf:main
+ARG DEBIAN_FRONTEND=noninteractive
+
+COPY sccache.sh /
+RUN /sccache.sh aarch64-unknown-linux-musl
+
+ENV RUSTC_WRAPPER="/usr/bin/sccache"

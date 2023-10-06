@@ -1,0 +1,7 @@
+Quick implementation of searching history and logging.
+
+Current limitations:
+- Don't have a way to determine others who actually played automatically
+    - We could instead watch the people in the discord, and when the game play status changes in some way, check then.
+- Remove unwraps so we handle errors gracefully, instead of crashing.
+- There's a bug where we have discord users not being removed. Might need to add better tracking to figure out why.

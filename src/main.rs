@@ -1,0 +1,904 @@
+use core::panic;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::models::MatchInfo;
+use anyhow::Result;
+use anyhow::*;
+use chrono::Datelike;
+use chrono::TimeZone;
+use chrono::Timelike;
+use futures::stream;
+use futures_util::StreamExt;
+use http::Method;
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+use models::*;
+use reqwest::header;
+use riven::consts::{PlatformRoute, Queue, RegionalRoute};
+use riven::models::match_v5::Match;
+use riven::models::summoner_v4::Summoner;
+use riven::RiotApi;
+use serde_json::to_vec;
+use serde_json::Value;
+use serenity::async_trait;
+use serenity::model::id::ChannelId;
+use serenity::model::prelude::Member;
+use serenity::prelude::*;
+use tokio::sync::Mutex;
+use tokio::task;
+use tokio::time;
+use tracing::{error, info};
+use tracing_subscriber::filter;
+use tracing_subscriber::prelude::*;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+mod models;
+
+const GAMES_VOICE_CHANNEL_ID: ChannelId = ChannelId(705937071641985104);
+const HIGHLIGHT_REEL_CHANNEL_ID: u64 = 876160308304039996;
+
+macro_rules! riot_api {
+    ($response:expr) => {{
+        let result = $response;
+        match result {
+            Result::Err(mut e) => {
+                let status_code = { e.status_code().clone() };
+                return match status_code {
+                    None => Result::Err(anyhow!(
+                        "{}",
+                        match e.take_response() {
+                            Some(r) => {
+                                let message = r.text();
+                                let text = message.await?;
+                                text.clone()
+                            }
+                            None => String::from("<no response>"),
+                        }
+                    )),
+                    Some(http::status::StatusCode::FORBIDDEN) => panic!("The Riot Key is bad."),
+                    Some(http::status::StatusCode::TOO_MANY_REQUESTS) => match e.take_response() {
+                        Some(r) => {
+                            let wait_time = Duration::from_secs(
+                                (String::from_utf8(
+                                    r.headers()
+                                        .get("retry-after")
+                                        .unwrap_or(&header::HeaderValue::from_str("2").unwrap())
+                                        .as_bytes()
+                                        .to_vec(),
+                                )
+                                .unwrap())
+                                .parse::<u64>()
+                                .unwrap(),
+                            ) + Duration::from_millis(
+                                (chrono::Local::now().timestamp_millis() % 1000 + 1000) as u64,
+                            );
+                            tokio::time::sleep(wait_time).await;
+                            return Result::Err(anyhow!(
+                                "Rate limited - had to wait {} seconds",
+                                wait_time.as_secs()
+                            ));
+                        }
+                        None => {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            return Result::Err(anyhow!(
+                                "Rate limited - didn't know what to wait, so waited 2 seconds"
+                            ));
+                        }
+                    },
+                    _s => {
+                        return Result::Err(anyhow!(e));
+                    }
+                };
+            }
+            Result::Ok(s) => Result::<_, anyhow::Error>::Ok(s),
+        }
+    }};
+}
+
+struct Handler {
+    users: Arc<RwLock<HashMap<u64, bool>>>,
+    current_status: Arc<RwLock<String>>,
+}
+
+impl Handler {
+    async fn remove_user(&self, member: &Member) {
+        let mut users = self.users.write().await;
+        users.remove(&member.user.id.0);
+        if users.len() == 0 {
+            let message = self.current_status.read().await.to_string();
+            info!("Len is 0, going to update the status to {}", message);
+            match update_discord_status(&message, None).await {
+                Result::Ok(_) => {}
+                Err(e) => error!("Error while updating: {}", e),
+            }
+        } else {
+            info!("Users len is {}, not updating.", users.len());
+        }
+    }
+}
+
+#[async_trait]
+impl EventHandler for Handler {
+    async fn ready(&self, ctx: serenity::prelude::Context, _data: serenity::model::prelude::Ready) {
+        info!("Ready event received");
+        if let Result::Ok(channel) = ctx.http.get_channel(*GAMES_VOICE_CHANNEL_ID.as_u64()).await {
+            info!("Games channel passed");
+            if let serenity::model::prelude::Channel::Guild(guild_channel) = channel {
+                info!("It's a guild channel");
+                if let Result::Ok(members) = guild_channel.members(ctx.cache).await {
+                    info!("We found members");
+                    let mut users = self.users.write().await;
+                    for member in members {
+                        users.insert(*member.user.id.as_u64(), false);
+                    }
+                }
+                info!(
+                    "Users was updated to have a length of {}",
+                    self.users.read().await.len()
+                );
+            }
+        }
+    }
+
+    async fn voice_state_update(
+        &self,
+        _ctx: serenity::prelude::Context,
+        old: Option<serenity::model::voice::VoiceState>,
+        new: serenity::model::voice::VoiceState,
+    ) {
+        match (old, new.channel_id, new.member) {
+            (None, None, None | Some(_)) => {
+                info!("I didn't think the None, None, None | Some(_) pattern could be reached");
+            }
+            (None, Some(_), None) => {
+                info!("I didn't think the None, Some(_), None pattern could be reached");
+            }
+            (None, Some(new_channel_id), Some(ref member)) => {
+                if new_channel_id == GAMES_VOICE_CHANNEL_ID {
+                    let mut users = self.users.write().await;
+                    users.insert(member.user.id.0, false);
+                }
+            }
+            (Some(old_channel), None | Some(_), None) => {
+                if let Some(GAMES_VOICE_CHANNEL_ID) = old_channel.channel_id {
+                    if let Some(member) = old_channel.member {
+                        self.remove_user(&member).await;
+                    }
+                }
+            }
+            (Some(old_channel), None, Some(member)) => {
+                if let Some(GAMES_VOICE_CHANNEL_ID) = old_channel.channel_id {
+                    self.remove_user(&member).await;
+                }
+            }
+            (Some(old_channel), Some(new_channel_id), Some(ref member)) => {
+                if new_channel_id == GAMES_VOICE_CHANNEL_ID {
+                    let mut users = self.users.write().await;
+                    users.insert(member.user.id.0, false);
+                } else if let Some(GAMES_VOICE_CHANNEL_ID) = old_channel.channel_id {
+                    if let Some(member) = old_channel.member {
+                        self.remove_user(&member).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+async fn fetch_summoner_info(riot_api: &RiotApi) -> Result<()> {
+    let summoners = fetch_summoners()?;
+
+    for summoner_name in summoners.iter() {
+        let maybe_summoner: Option<Summoner> = riot_api!(
+            riot_api
+                .summoner_v4()
+                .get_by_summoner_name(PlatformRoute::NA1, summoner_name.1)
+                .await
+        )?;
+        if let Some(summoner) = maybe_summoner {
+            update_summoner(&summoner)?
+        } else {
+            info!(
+                "No summoner information was found for name {}",
+                summoner_name.1
+            );
+        }
+    }
+    Ok(())
+}
+
+fn get_start_time() -> Result<i64> {
+    let mut datetime = chrono::Local::now();
+    if datetime.time().hour() < 8 {
+        datetime = match datetime.checked_sub_days(chrono::naive::Days::new(1)) {
+            Some(d) => d,
+            None => {
+                return Err(anyhow!("Unable to sub day"));
+            }
+        }
+    }
+    datetime = chrono::Local
+        .with_ymd_and_hms(
+            datetime.date_naive().year(),
+            datetime.date_naive().month(),
+            datetime.date_naive().day(),
+            6,
+            0,
+            0,
+        )
+        .unwrap();
+    Result::Ok(datetime.timestamp())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    std::panic::set_hook(Box::new(|i| {
+        error!("Panic'd: {}", i);
+    }));
+    let riot_api_key: &str = &env::var("RIOT_API_TOKEN")?;
+    let riot_api = RiotApi::new(riot_api_key);
+    let file_appender = tracing_appender::rolling::daily(
+        if cfg!(target_os = "linux") {
+            "/var/logs/discord"
+        } else {
+            "./"
+        },
+        "server.log",
+    );
+    let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
+    let console_layer = console_subscriber::ConsoleLayer::builder()
+        // set the address the server is bound to
+        .server_addr(([0, 0, 0, 0], 5555))
+        .spawn();
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking_appender)
+                .with_filter(filter::filter_fn(|metadata| {
+                    metadata.target().starts_with("discord_status_bot")
+                })),
+        )
+        .init();
+    let active_users: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
+    let current_status: Arc<RwLock<String>> = Arc::new(RwLock::new(String::from("")));
+
+    // Login with a bot token from the environment
+    let token = env::var("DISCORD_BOT_TOKEN").expect("token");
+    let intents = GatewayIntents::non_privileged()
+        | GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MEMBERS
+        | GatewayIntents::GUILD_MESSAGES;
+    let handler = Handler {
+        users: active_users.clone(),
+        current_status: current_status.clone(),
+    };
+    let mut client = Client::builder(&token, intents)
+        .event_handler(handler)
+        .await
+        .expect("Error creating client");
+
+    let http_client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .connection_verbose(true)
+        .build()?;
+    let discord_client = Arc::new(
+        serenity::http::HttpBuilder::new(&token)
+            .ratelimiter_disabled(true)
+            .client(http_client)
+            .build(),
+    );
+    let discord_events = client.start();
+
+    let forever = task::spawn(async move {
+        let discord_client = discord_client.clone();
+        let current_status = current_status.clone();
+        let mut start_time = 0;
+        let mut interval = time::interval(Duration::from_secs(5));
+        let summoners = fetch_summoners()?;
+        loop {
+            // TODO(araam): It's a cute idea, butttt in reality if this is empty,
+            // We should still do the check at least once (aka start of day).
+            // Then if empty still, we can then just wait 3 minutes before re-running
+            // To see if anyone joined.
+            // let discord_user_ids = {
+            //     let data = active_users.read().await;
+            //     data.keys().copied().collect::<HashSet<u64>>()
+            // };
+            let active_summoners = summoners
+                .iter()
+                // .filter(|s| discord_user_ids.contains(s.0))
+                .map(|s| s.1)
+                .collect::<HashSet<_>>();
+            let puuids = fetch_puuids(&active_summoners)?;
+            for puuid in puuids.iter() {
+                interval.tick().await;
+                let matches_fetch: Result<Vec<String>> = riot_api!(
+                    riot_api
+                        .match_v5()
+                        .get_match_ids_by_puuid(
+                            RegionalRoute::AMERICAS,
+                            puuid,
+                            None,
+                            None,
+                            None,
+                            Some(start_time),
+                            None,
+                            None,
+                        )
+                        .await
+                );
+                match (matches_fetch, start_time < get_start_time()?) {
+                    (Result::Ok(match_list), _) if !match_list.is_empty() => {
+                        info!("Some matches were found, scan all histories now.");
+                        match check_match_history(&riot_api, &discord_client, &current_status).await
+                        {
+                            Result::Ok(_) => {}
+                            Result::Err(e) => error!("{}", e),
+                        }
+                        start_time = chrono::Local::now().timestamp();
+                    }
+                    (_, true) => {
+                        info!("It's a new day, time to scan histories at least once.");
+                        match check_match_history(&riot_api, &discord_client, &current_status).await
+                        {
+                            Result::Ok(_) => {}
+                            Result::Err(e) => error!("{}", e),
+                        }
+                        start_time = chrono::Local::now().timestamp();
+                    }
+                    (Result::Err(e), _) => error!("{}", e),
+                    (Result::Ok(_), false) => {}
+                }
+            }
+        }
+    });
+
+    discord_events.await?;
+    forever.await?
+}
+
+fn update_match(
+    match_id: &String,
+    queue_id: i64,
+    is_win: bool,
+    end_timestamp: i64,
+    match_info: &Match,
+) -> Result<()> {
+    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let mut statement = connection
+        .prepare("INSERT OR IGNORE INTO match (id, queue_id, win, end_timestamp, MatchInfo) VALUES (?1, ?2, ?3, ?4, ?5);")?;
+    statement.execute([
+        match_id,
+        &queue_id.to_string(),
+        &is_win.to_string(),
+        &end_timestamp.to_string(),
+        &serde_json::to_string(match_info)?,
+    ])?;
+    Ok(())
+}
+
+fn fetch_discord_usernames() -> Result<HashMap<String, String>> {
+    let mut summoner_map: HashMap<String, String> = HashMap::new();
+    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let mut statement = connection.prepare("SELECT DiscordId, LOWER(summonerName) FROM User")?;
+    statement
+        .query_map([], |row| {
+            let discord_id: String = row.get(0).unwrap();
+            let summoner = row.get(1).unwrap();
+            Result::Ok((discord_id, summoner))
+        })?
+        .for_each(|result| {
+            let (discord_id, summoner) = result.unwrap();
+            summoner_map.insert(summoner, discord_id);
+        });
+    Ok(summoner_map)
+}
+
+fn fetch_puuids(summoners: &HashSet<&String>) -> Result<HashSet<String>> {
+    let mut puuids = HashSet::new();
+    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT puuid FROM summoner WHERE name in ({})",
+        summoners
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))?;
+    statement
+        .query_map([], |row| row.get(0))?
+        .for_each(|result| {
+            puuids.insert(result.unwrap());
+        });
+    Ok(puuids)
+}
+
+fn update_summoner(summoner: &Summoner) -> Result<()> {
+    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let mut statement = connection
+        .prepare("UPDATE Summoner SET id = ?1, accountid = ?2, puuid = ?3 WHERE Name = ?4;")?;
+    statement.execute([
+        &summoner.id,
+        &summoner.account_id,
+        &summoner.puuid,
+        &summoner.name,
+    ])?;
+    Ok(())
+}
+
+fn fetch_summoners() -> Result<HashMap<u64, String>> {
+    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let mut statement = connection.prepare("SELECT DiscordId, SummonerName FROM USER;")?;
+    let query = statement.query_map([], |row| {
+        Result::Ok((
+            row.get::<usize, String>(0).unwrap().parse::<u64>().unwrap(),
+            row.get(1).unwrap(),
+        ))
+    })?;
+    Ok(query.map(|r| r.unwrap()).collect::<HashMap<u64, String>>())
+}
+
+async fn fetch_seen_events(
+    matches: &Arc<Mutex<HashMap<String, u8>>>,
+) -> Result<HashMap<String, MatchInfo>> {
+    let match_id_string = {
+        matches
+            .lock()
+            .await
+            .clone()
+            .into_keys()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT id, queue_id, win, IFNULL(end_timestamp, 0), MatchInfo FROM match WHERE id IN ({});",
+        match_id_string
+    ))?;
+    let mut seen_matches: HashMap<String, MatchInfo> = HashMap::new();
+    statement
+        .query_map([], |row| {
+            Result::Ok(MatchInfo {
+                id: row.get(0).unwrap(),
+                queue_id: row.get(1).unwrap(),
+                win: row.get::<usize, String>(2).unwrap() == "true",
+                end_timestamp: chrono::NaiveDateTime::from_timestamp_millis(row.get(3).unwrap())
+                    .unwrap(),
+                match_info: serde_json::from_str(&row.get::<usize, String>(4).unwrap()).unwrap(),
+            })
+        })?
+        .for_each(|result| {
+            let match_info = result.unwrap();
+            seen_matches
+                .entry(match_info.id.clone())
+                .or_insert(match_info);
+        });
+    Ok(seen_matches)
+}
+
+async fn check_match_history(
+    riot_api: &RiotApi,
+    discord_client: &Arc<serenity::http::Http>,
+    current_status: &Arc<RwLock<String>>,
+) -> Result<()> {
+    let queue_ids: HashMap<Queue, &str> = HashMap::from([
+        (Queue::SUMMONERS_RIFT_5V5_DRAFT_PICK, "Draft"),
+        (Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo"),
+        (Queue::SUMMONERS_RIFT_5V5_BLIND_PICK, "Blind"),
+        (Queue::SUMMONERS_RIFT_5V5_RANKED_FLEX, "Flex"),
+        (Queue::HOWLING_ABYSS_5V5_ARAM, "ARAM"),
+        (Queue::SUMMONERS_RIFT_CLASH, "Clash"),
+    ]);
+    let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+    let start_time = get_start_time()?;
+
+    let summoner_info = fetch_summoners()?;
+    let summoners = summoner_info.values().collect::<HashSet<_>>();
+    let puuids = fetch_puuids(&summoners)?;
+
+    let matches: Arc<Mutex<HashMap<String, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let matches_requests = stream::iter(puuids.clone())
+        .map(|puuid| async move {
+            riot_api!(
+                riot_api
+                    .match_v5()
+                    .get_match_ids_by_puuid(
+                        RegionalRoute::AMERICAS,
+                        &puuid,
+                        None,
+                        None,
+                        None,
+                        Some(start_time),
+                        None,
+                        None,
+                    )
+                    .await
+            )
+        })
+        .buffer_unordered(5);
+    let matches_list: Vec<_> = matches_requests.collect().await;
+
+    let iter = matches_list.iter();
+    for result in iter {
+        match result {
+            Result::Ok(match_ids) => {
+                let mut lock = matches.lock().await;
+                for match_id in match_ids {
+                    *lock.entry(match_id.to_string()).or_insert(0) += 1;
+                }
+            }
+            Result::Err(e) => {
+                return Err(anyhow!("Encountered error: {:?}", e));
+            }
+        }
+    }
+
+    let seen_matches = fetch_seen_events(&matches).await?;
+    let mut pentakillers = Vec::new();
+
+    let mut match_list = {
+        let list = matches.lock().await;
+        let result = list.keys().cloned().collect::<Vec<_>>();
+        result
+    };
+    match_list.sort();
+    for match_id in match_list {
+        // Only one of our players in this game, skip the score.
+        if matches.lock().await.get(&match_id).unwrap() == &1 {
+            continue;
+        }
+        if seen_matches.contains_key(&match_id) {
+            if let Some(match_info) = seen_matches.get(&match_id) {
+                let queue_id = Queue::try_from(match_info.queue_id.parse::<u16>()?)?;
+                let game_score = queue_scores.entry(queue_id).or_insert(Score {
+                    wins: 0,
+                    games: 0,
+                    warmup: 0,
+                });
+                game_score.games += 1;
+                if match_info.win {
+                    game_score.wins += 1;
+                } else if game_score.warmup < 2
+                    && game_score.wins < 1
+                    && queue_id != Queue::SUMMONERS_RIFT_CLASH
+                {
+                    game_score.warmup += 1;
+                    game_score.games -= 1;
+                }
+                continue;
+            }
+        }
+        let response = riot_api!(
+            riot_api
+                .match_v5()
+                .get_match(RegionalRoute::AMERICAS, &match_id)
+                .await
+        )?;
+        let match_info = match response {
+            Some(m) => m,
+            None => {
+                error!("Unable to find match id {}", match_id);
+                continue;
+            }
+        };
+
+        update_match_info(
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            start_time,
+        )?;
+    }
+
+    check_pentakill_info(pentakillers, &discord_client).await?;
+
+    let mut queue_scores_msgs = queue_scores
+        .iter()
+        .map(|(queue_id, score)| {
+            let game_mode = queue_ids.get(queue_id).unwrap();
+            if score.warmup > 0 && score.games == 0 && *queue_id != Queue::SUMMONERS_RIFT_CLASH {
+                return format!("{game_mode}: 🏃");
+            }
+            format!(
+                "{game_mode}:\u{2006}{}\u{2006}-\u{2006}{}",
+                score.wins,
+                score.games - score.wins
+            )
+        })
+        .collect::<Vec<_>>();
+    queue_scores_msgs.sort();
+    let mut results = queue_scores_msgs.join("\u{2006}|\u{2006}");
+    if queue_scores.is_empty() {
+        results = String::from("No group rift games yet!");
+    } else {
+        // We're too long, so need to do some tricks to shorten the length.
+        if results.chars().collect::<Vec<char>>().len() > 40 {
+            queue_scores_msgs = queue_scores
+                .iter()
+                .map(|(queue_id, score)| {
+                    let game_mode = queue_ids.get(queue_id).unwrap();
+                    if score.warmup > 0
+                        && score.games == 0
+                        && *queue_id != Queue::SUMMONERS_RIFT_CLASH
+                    {
+                        return format!("{game_mode}: 🏃");
+                    }
+                    format!(
+                        "{game_mode}:\u{2006}{}\u{2006}-\u{2006}{}",
+                        score.wins,
+                        score.games - score.wins
+                    )
+                })
+                .collect::<Vec<_>>();
+            queue_scores_msgs.sort();
+            results = queue_scores_msgs.join("\u{2006}|\u{2006}");
+        }
+        // We're still too long, so need to do some tricks to shorten the length.
+        if results.chars().collect::<Vec<char>>().len() > 40 {
+            queue_scores_msgs = queue_scores
+                .iter()
+                .map(|(queue_id, score)| {
+                    let game_mode = queue_ids
+                        .get(queue_id)
+                        .unwrap()
+                        .chars()
+                        .next()
+                        .unwrap()
+                        .to_uppercase();
+                    if score.warmup > 0
+                        && score.games == 0
+                        && *queue_id != Queue::SUMMONERS_RIFT_CLASH
+                    {
+                        return format!("{game_mode}: 🏃");
+                    }
+                    format!(
+                        "{game_mode}:\u{2006}{}\u{2006}-\u{2006}{}",
+                        score.wins,
+                        score.games - score.wins
+                    )
+                })
+                .collect::<Vec<_>>();
+            queue_scores_msgs.sort();
+            results = queue_scores_msgs.join("\u{2006}|\u{2006}");
+        }
+    }
+
+    update_discord_status(&results, Some(&current_status)).await
+}
+
+fn update_match_info(
+    match_info: &Match,
+    queue_scores: &mut HashMap<Queue, Score>,
+    queue_ids: &HashMap<Queue, &str>,
+    puuids: &HashSet<String>,
+    pentakillers: &mut Vec<(i64, String)>,
+    start_time: i64,
+) -> Result<()> {
+    let game_end_timestamp = match match_info.info.game_end_timestamp {
+        Some(x) => x,
+        None => {
+            info!("Found the match, but can't get a end timestamp. So continuing.");
+            return Result::Ok(());
+        }
+    };
+    if game_end_timestamp < start_time {
+        return Result::Ok(());
+    }
+
+    if !queue_ids.contains_key(&match_info.info.queue_id) {
+        return Result::Ok(());
+    }
+
+    let game_score = queue_scores
+        .entry(match_info.info.queue_id)
+        .or_insert(Score {
+            wins: 0,
+            games: 0,
+            warmup: 0,
+        });
+    game_score.games += 1;
+
+    let queue_id: i64 = {
+        let id: u16 = match_info.info.queue_id.try_into()?;
+        id.into()
+    };
+
+    let team_id = match_info
+        .info
+        .participants
+        .iter()
+        .find(|p| puuids.clone().contains(&p.puuid))
+        .unwrap()
+        .team_id;
+
+    match match_info
+        .info
+        .teams
+        .iter()
+        .find(|t| t.team_id == team_id)
+        .unwrap()
+        .win
+    {
+        true => {
+            game_score.wins += 1;
+            update_match(
+                &match_info.metadata.match_id,
+                queue_id,
+                true,
+                game_end_timestamp,
+                &match_info,
+            )?
+        }
+        false => {
+            if game_score.warmup < 2 && game_score.wins < 1 {
+                game_score.warmup += 1;
+                game_score.games -= 1;
+            };
+            update_match(
+                &match_info.metadata.match_id,
+                queue_id,
+                false,
+                game_end_timestamp,
+                &match_info,
+            )?;
+        }
+    };
+
+    if match_info.info.queue_id != Queue::HOWLING_ABYSS_5V5_ARAM {
+        pentakillers.extend(
+            match_info
+                .info
+                .participants
+                .iter()
+                .filter(|p| puuids.clone().contains(&p.puuid))
+                .filter(|p| p.penta_kills > 0)
+                .map(|p| (match_info.info.game_id, p.summoner_name.clone())),
+        );
+    }
+    Ok(())
+}
+
+async fn check_pentakill_info(
+    mut pentakillers: Vec<(i64, String)>,
+    discord_auth: &Arc<serenity::http::Http>,
+) -> Result<()> {
+    if !pentakillers.is_empty() {
+        let user_info = fetch_discord_usernames()?;
+        let mut pentakillers_by_name: Vec<_> = pentakillers
+            .iter()
+            .map(|s| format!("<@{}>", *user_info.get(&s.1.to_lowercase()).unwrap()))
+            .collect::<HashSet<_>>()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        pentakillers_by_name.sort();
+        pentakillers.sort();
+
+        let mut pentakill_games: HashMap<i64, Vec<String>> = HashMap::new();
+        for (game_id, name) in pentakillers {
+            let game_info = pentakill_games.entry(game_id).or_default();
+            game_info.push(name);
+        }
+
+        let len = pentakillers_by_name.len();
+        let names: String = match len {
+            1 => pentakillers_by_name.first().unwrap().to_string(),
+            2 => format!(
+                "{} and {}",
+                pentakillers_by_name.first().unwrap(),
+                pentakillers_by_name.last().unwrap()
+            ),
+            _ => format!(
+                "{}, and {}",
+                pentakillers_by_name[0..len - 2].join(", "),
+                pentakillers_by_name.last().unwrap()
+            ),
+        };
+
+        let mut pentakill_links = Vec::new();
+
+        for (game_id, names) in pentakill_games {
+            let formatted_names: String = match len {
+                1 => names.first().unwrap().to_string(),
+                2 => format!("{} and {}", names.first().unwrap(), names.last().unwrap()),
+                _ => format!(
+                    "{}, and {}",
+                    names[0..len - 2].join(", "),
+                    names.last().unwrap()
+                ),
+            };
+            pentakill_links.push(format!(
+                "[{}'s pentakill game here](https://blitz.gg/lol/match/na1/{}/{})",
+                formatted_names,
+                names.first().unwrap().replace(" ", "%20"),
+                game_id
+            ))
+        }
+
+        update_highlight_reel(
+            &format!(
+                "Make sure to congratulate {} on their pentakill{}!\n\n{}",
+                names,
+                if len > 1 { "s" } else { "" },
+                pentakill_links.join("\n")
+            ),
+            discord_auth,
+        )
+        .await?
+    }
+
+    Ok(())
+}
+
+async fn update_discord_status(
+    results: &str,
+    current_status: Option<&Arc<RwLock<String>>>,
+) -> Result<()> {
+    if let Some(current_status) = current_status {
+        let mut s = current_status.write().await;
+        *s = results.to_string();
+        info!("Current status has been updated to '{}'", results);
+    }
+    let mut content = serde_json::Map::new();
+    content.insert(String::from("status"), results.to_string().into());
+    let map: Value = content.into();
+    let owned_map = to_vec(&map.clone())?;
+    let create_message = serenity::http::routing::RouteInfo::CreateMessage {
+        channel_id: GAMES_VOICE_CHANNEL_ID.0,
+    };
+    let mut request_builder = serenity::http::request::RequestBuilder::new(create_message);
+    request_builder.body(Some(&owned_map));
+    let mut request = request_builder.build();
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .connection_verbose(true)
+        .build()?;
+    let token = format!("Bot {}", env::var("DISCORD_BOT_TOKEN")?);
+    let mut true_reqwest = request.build(&client, &token, None).await?.build()?;
+    true_reqwest.headers_mut().append(
+        header::HeaderName::from_lowercase(b"x-super-properties")?,
+        header::HeaderValue::from_static(
+            "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzExNi4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTE2LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiJodHRwczovL3d3dy5nb29nbGUuY29tLyIsInJlZmVycmluZ19kb21haW4iOiJ3d3cuZ29vZ2xlLmNvbSIsInNlYXJjaF9lbmdpbmUiOiJnb29nbGUiLCJyZWZlcnJlcl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVsZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6MjI2MjIwLCJjbGllbnRfZXZlbnRfc291cmNlIjpudWxsfQ==",
+        ),
+    );
+    true_reqwest
+        .url_mut()
+        .set_path("api/v10/channels/705937071641985104/voice-status");
+    *true_reqwest.method_mut() = Method::PUT;
+    client.execute(true_reqwest).await?;
+    Ok(())
+}
+
+async fn update_highlight_reel(
+    results: &str,
+    discord_auth: &Arc<serenity::http::Http>,
+) -> Result<()> {
+    let mut content = serde_json::Map::new();
+    content.insert(
+        String::from("content"),
+        serde_json::Value::String(results.to_string()),
+    );
+    match discord_auth
+        .send_message(HIGHLIGHT_REEL_CHANNEL_ID, &content.into())
+        .await
+    {
+        Result::Ok(message) => info!("Message id is {}", message.id),
+        Result::Err(e) => error!("Ran into an error while sending. Error: {}", e),
+    };
+
+    Ok(())
+}
