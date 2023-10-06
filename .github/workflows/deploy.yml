@@ -25,9 +25,6 @@ jobs:
         args: "--locked --release"
         strip: true
 
-    - name: Build
-      run: cargo build --release --target arm-unknown-linux-gnueabihf
-
     - name: Copy over
       uses: appleboy/scp-action@v0.1.4
       with:
