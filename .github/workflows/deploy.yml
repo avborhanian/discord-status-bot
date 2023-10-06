@@ -13,26 +13,17 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Cache
-      uses: actions/cache@v2
+    - uses: Swatinem/rust-cache@v2
       with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          ~/.rustup
-          target
-        key: ubuntu-latest-stable
-
-    - name: Install Linker
-      run: |
-        sudo apt update
-        sudo apt install gcc-arm-linux-gnueabihf
-
-    - name: Install Rust
-      run: |
-        rustup install stable
-        rustup target add arm-unknown-linux-gnueabihf
-        rustup show
+        cache-on-failure: "false"
+        
+    - name: Build binary
+      uses: houseabsolute/actions-rust-cross@v0
+      with:
+        command: build
+        target: arm-unknown-linux-gnueabihf
+        args: "--locked --release"
+        strip: true
 
     - name: Build
       run: cargo build --release --target arm-unknown-linux-gnueabihf
@@ -42,7 +33,7 @@ jobs:
       with:
         host: ${{ secrets.HOST }}
         username: ${{ secrets.USERNAME }}
-        password: ${{ secrets.PASSWORD }}
+        key: ${{ secrets.KEY }}
         port: ${{ secrets.PORT }}
         source: "target/arm-unknown-linux-gnueabihf/release/discord_status_bot"
         target: /
