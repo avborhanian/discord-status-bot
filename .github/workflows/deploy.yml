@@ -24,13 +24,17 @@ jobs:
         target: arm-unknown-linux-gnueabihf
         args: "--locked --release"
         strip: true
+        
+    - name: Package as archive
+      shell: bash
+      run: ls -la
 
-    - name: Copy over
-      uses: appleboy/scp-action@v0.1.4
-      with:
-        host: ${{ secrets.HOST }}
-        username: ${{ secrets.USERNAME }}
-        key: ${{ secrets.KEY }}
-        port: ${{ secrets.PORT }}
-        source: "target/arm-unknown-linux-gnueabihf/release/discord_status_bot"
-        target: /
+    # - name: Copy over
+    #   uses: appleboy/scp-action@v0.1.4
+    #   with:
+    #     host: ${{ secrets.HOST }}
+    #     username: ${{ secrets.USERNAME }}
+    #     key: ${{ secrets.KEY }}
+    #     port: ${{ secrets.PORT }}
+    #     source: "target/arm-unknown-linux-gnueabihf/release/discord_status_bot"
+    #     target: /
