@@ -26,6 +26,8 @@ use serde_json::to_vec;
 use serde_json::Value;
 use serenity::async_trait;
 use serenity::model::id::ChannelId;
+use serenity::model::prelude::Interaction;
+use serenity::model::prelude::InteractionResponseType;
 use serenity::model::prelude::Member;
 use serenity::prelude::*;
 use tokio::sync::Mutex;
@@ -39,8 +41,10 @@ use tracing_subscriber::prelude::*;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+mod commands;
 mod models;
 
+const DISCORD_GUILD_ID: u64 = 688199744882868236;
 const GAMES_VOICE_CHANNEL_ID: ChannelId = ChannelId(705937071641985104);
 const HIGHLIGHT_REEL_CHANNEL_ID: u64 = 876160308304039996;
 
@@ -143,6 +147,38 @@ impl EventHandler for Handler {
                     "Users was updated to have a length of {}",
                     self.users.read().await.len()
                 );
+            }
+        }
+
+        serenity::model::id::GuildId::set_application_commands(
+            &serenity::model::id::GuildId(DISCORD_GUILD_ID),
+            &ctx.http,
+            |commands| {
+                commands.create_application_command(|command| commands::groups::register(command))
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn interaction_create(&self, ctx: serenity::prelude::Context, interaction: Interaction) {
+        if let Interaction::ApplicationCommand(command) = interaction {
+            info!("Received command interaction: {:#?}", command);
+
+            let content = match command.data.name.as_str() {
+                "groups" => commands::groups::run(&ctx, &command.data.options).await,
+                _ => "not implemented :(".to_string(),
+            };
+
+            if let Err(why) = command
+                .create_interaction_response(&ctx.http, |response| {
+                    response
+                        .kind(InteractionResponseType::ChannelMessageWithSource)
+                        .interaction_response_data(|message| message.content(content))
+                })
+                .await
+            {
+                info!("Cannot respond to slash command: {}", why);
             }
         }
     }
@@ -337,17 +373,8 @@ async fn main() -> Result<()> {
                         )
                         .await
                 );
-                match (matches_fetch, start_time < get_start_time()?) {
-                    (Result::Ok(match_list), _) if !match_list.is_empty() => {
-                        info!("Some matches were found, scan all histories now.");
-                        match check_match_history(&riot_api, &discord_client, &current_status).await
-                        {
-                            Result::Ok(_) => {}
-                            Result::Err(e) => error!("{}", e),
-                        }
-                        start_time = chrono::Local::now().timestamp();
-                    }
-                    (_, true) => {
+                match (start_time < get_start_time()?, matches_fetch) {
+                    (true, _) => {
                         info!("It's a new day, time to scan histories at least once.");
                         match check_match_history(&riot_api, &discord_client, &current_status).await
                         {
@@ -356,8 +383,17 @@ async fn main() -> Result<()> {
                         }
                         start_time = chrono::Local::now().timestamp();
                     }
-                    (Result::Err(e), _) => error!("{}", e),
-                    (Result::Ok(_), false) => {}
+                    (_, Result::Ok(match_list)) if !match_list.is_empty() => {
+                        info!("Some matches were found, scan all histories now.");
+                        match check_match_history(&riot_api, &discord_client, &current_status).await
+                        {
+                            Result::Ok(_) => {}
+                            Result::Err(e) => error!("{}", e),
+                        }
+                        start_time = chrono::Local::now().timestamp();
+                    }
+                    (false, Result::Ok(_)) => {}
+                    (_, Result::Err(e)) => error!("{}", e),
                 }
             }
         }

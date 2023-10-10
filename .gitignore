@@ -3,3 +3,4 @@
 sqlite.db
 .vscode/*
 *.ps1
+server.log.*
