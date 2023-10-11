@@ -124,8 +124,7 @@ pub mod groups {
 
         let number_of_groups = options
             .iter()
-            .find(|o| o.name == "number of groups")
-            .map_or(None, |o| match &o.value {
+            .find(|o| o.name == "number of groups").and_then(|o| match &o.value {
                 Some(serde_json::Value::Number(n)) => Some(n),
                 Some(_) => None,
                 None => None,
@@ -133,8 +132,7 @@ pub mod groups {
 
         let max_users = options
             .iter()
-            .find(|o| o.name == "max users")
-            .map_or(None, |o| match &o.value {
+            .find(|o| o.name == "max users").and_then(|o| match &o.value {
                 Some(serde_json::Value::Number(n)) => Some(n),
                 Some(_) => None,
                 None => None,
@@ -176,7 +174,7 @@ pub mod groups {
         rng: &mut R,
     ) -> String {
         let mut members_to_group = members_to_group.clone();
-        (&mut members_to_group).shuffle(rng);
+        members_to_group.shuffle(rng);
 
         info!("List of members is {:?}", members_to_group);
         info!(
@@ -304,7 +302,6 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(528);
         let value = generate_groups(
             (1..21)
-                .into_iter()
                 .map(|i| member(i, &format!("Test User {}", i)))
                 .collect::<Vec<_>>(),
             4,
