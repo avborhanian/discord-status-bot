@@ -53,14 +53,14 @@ pub mod groups {
             })
             .create_option(|option| {
                 option
-                    .name("number of groups")
+                    .name("number_of_groups")
                     .description("The amount of groups to create. Can't use with option max users.")
                     .kind(CommandOptionType::Number)
                     .required(false)
             })
             .create_option(|option| {
                 option
-                    .name("max users")
+                    .name("max_users")
                     .description("The maximum amount of users in a group. Can't use with option number of groups.")
                     .kind(CommandOptionType::Number)
                     .required(false)
@@ -124,7 +124,8 @@ pub mod groups {
 
         let number_of_groups = options
             .iter()
-            .find(|o| o.name == "number of groups").and_then(|o| match &o.value {
+            .find(|o| o.name == "number_of_groups")
+            .and_then(|o| match &o.value {
                 Some(serde_json::Value::Number(n)) => Some(n),
                 Some(_) => None,
                 None => None,
@@ -132,7 +133,8 @@ pub mod groups {
 
         let max_users = options
             .iter()
-            .find(|o| o.name == "max users").and_then(|o| match &o.value {
+            .find(|o| o.name == "max_users")
+            .and_then(|o| match &o.value {
                 Some(serde_json::Value::Number(n)) => Some(n),
                 Some(_) => None,
                 None => None,
