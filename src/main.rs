@@ -339,6 +339,7 @@ async fn main() -> Result<()> {
         let discord_client = discord_client.clone();
         let current_status = current_status.clone();
         let mut start_time = 0;
+        let mut current_date = 0;
         let mut interval = time::interval(Duration::from_secs(5));
         let summoners = fetch_summoners()?;
         loop {
@@ -373,7 +374,7 @@ async fn main() -> Result<()> {
                         )
                         .await
                 );
-                match (start_time < get_start_time()?, matches_fetch) {
+                match (current_date < get_start_time()?, matches_fetch) {
                     (true, _) => {
                         info!("It's a new day, time to scan histories at least once.");
                         match check_match_history(&riot_api, &discord_client, &current_status).await
@@ -382,6 +383,7 @@ async fn main() -> Result<()> {
                             Result::Err(e) => error!("{}", e),
                         }
                         start_time = chrono::Local::now().timestamp();
+                        current_date = start_time;
                     }
                     (_, Result::Ok(match_list)) if !match_list.is_empty() => {
                         info!("Some matches were found, scan all histories now.");
