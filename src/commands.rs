@@ -1,5 +1,325 @@
+use anyhow::{anyhow, Result};
+
+fn number_to_usize(count: &serde_json::Number) -> Result<usize> {
+    Result::Ok(match (count.as_i64(), count.as_f64(), count.as_u64()) {
+        (Some(i), None, None) => {
+            if i <= 0 {
+                return Result::Err(anyhow!(
+                    "You should provide a positive number. Zero or less is not allowed."
+                ));
+            } else {
+                i.try_into().unwrap()
+            }
+        }
+        (None, Some(f), None) => {
+            if f.round() <= 0.0 {
+                return Result::Err(anyhow!(
+                    "You should provide a positive number. Zero or less is not allowed."
+                ));
+            } else {
+                (f.round() as u64).try_into().unwrap()
+            }
+        }
+        (None, None, Some(u)) => u.try_into().unwrap(),
+        _ => return Result::Err(anyhow!("Unhandled state, please try again later.")),
+    })
+}
+
+pub mod globetrotters {
+    use std::collections::HashMap;
+
+    use serenity::builder;
+    use serenity::model::prelude::application_command::CommandDataOption;
+    use serenity::model::prelude::command::CommandOptionType;
+    use serenity::prelude::Context;
+
+    use super::number_to_usize;
+
+    pub fn register(
+        command: &mut builder::CreateApplicationCommand,
+    ) -> &mut builder::CreateApplicationCommand {
+        command
+            .name("globetrotters")
+            .description("Returns a list of champions required to complete a challenge.")
+            .create_option(|option| {
+                option
+                    .description("Which challenge you want to complete")
+                    .kind(CommandOptionType::Integer)
+                    .add_int_choice("5 Under 5' - Bandle City", 303501)
+                    .add_int_choice("All Hands on Deck - Bilgewater", 303502)
+                    .add_int_choice("FOR DEMACIA - Demacia", 303503)
+                    .add_int_choice("Ice, Ice, Baby - the Freljord", 303504)
+                    .add_int_choice("Everybody was Wuju Fighting - Ionia", 303505)
+                    .add_int_choice("Elemental, My Dear Watson - Ixtal", 303506)
+                    .add_int_choice("Strength Above All - Noxus", 303507)
+                    .add_int_choice("Calculated - Piltover", 303508)
+                    .add_int_choice("Spooky Scary Skeletons - the Shadow Isles", 303509)
+                    .add_int_choice("The Sun Disc Never Sets - Shurima", 303510)
+                    .add_int_choice("Peak Performance - Targon", 303511)
+                    .add_int_choice("(Inhuman Screeching Sounds) - the Void", 303512)
+                    .add_int_choice("Chemtech Comrades - Zaun", 303513)
+                    .required(true)
+            })
+    }
+
+    pub async fn run(_ctx: &Context, options: &[CommandDataOption]) -> String {
+        let choice: usize =
+            options
+                .iter()
+                .find(|o| o.name == "ignore")
+                .map_or(0, |o| match &o.value {
+                    Some(serde_json::Value::Number(s)) => number_to_usize(s).unwrap_or(0),
+                    Some(_) => 0,
+                    None => 0,
+                });
+        if choice == 0 {
+            return "Unable to handle the result sent for whatever reason. Bug Araam.".to_string();
+        }
+
+        let map = HashMap::from([
+            (
+                303501,
+                vec![
+                    riven::consts::Champion::RUMBLE,
+                    riven::consts::Champion::VEX,
+                    riven::consts::Champion::FIZZ,
+                    riven::consts::Champion::CORKI,
+                    riven::consts::Champion::HEIMERDINGER,
+                    riven::consts::Champion::VEIGAR,
+                    riven::consts::Champion::POPPY,
+                    riven::consts::Champion::KLED,
+                    riven::consts::Champion::TEEMO,
+                    riven::consts::Champion::TRISTANA,
+                    riven::consts::Champion::ZIGGS,
+                    riven::consts::Champion::LULU,
+                    riven::consts::Champion::KENNEN,
+                    riven::consts::Champion::GNAR,
+                    riven::consts::Champion::YUUMI,
+                ],
+            ),
+            (
+                303502,
+                vec![
+                    riven::consts::Champion::TWISTED_FATE,
+                    riven::consts::Champion::ILLAOI,
+                    riven::consts::Champion::MISS_FORTUNE,
+                    riven::consts::Champion::GRAVES,
+                    riven::consts::Champion::GANGPLANK,
+                    riven::consts::Champion::FIZZ,
+                    riven::consts::Champion::PYKE,
+                    riven::consts::Champion::NAUTILUS,
+                    riven::consts::Champion::NILAH,
+                    riven::consts::Champion::TAHM_KENCH,
+                ],
+            ),
+            (
+                303503,
+                vec![
+                    riven::consts::Champion::LUX,
+                    riven::consts::Champion::GALIO,
+                    riven::consts::Champion::VAYNE,
+                    riven::consts::Champion::SHYVANA,
+                    riven::consts::Champion::KAYLE,
+                    riven::consts::Champion::LUCIAN,
+                    riven::consts::Champion::POPPY,
+                    riven::consts::Champion::FIORA,
+                    riven::consts::Champion::GAREN,
+                    riven::consts::Champion::MORGANA,
+                    riven::consts::Champion::JARVAN_IV,
+                ],
+            ),
+            (
+                303504,
+                [
+                    riven::consts::Champion::OLAF,
+                    riven::consts::Champion::ANIVIA,
+                    riven::consts::Champion::ORNN,
+                    riven::consts::Champion::BRAUM,
+                    riven::consts::Champion::VOLIBEAR,
+                    riven::consts::Champion::UDYR,
+                    riven::consts::Champion::GRAGAS,
+                    riven::consts::Champion::TRUNDLE,
+                    riven::consts::Champion::SEJUANI,
+                    riven::consts::Champion::NUNU_WILLUMP,
+                    riven::consts::Champion::ASHE,
+                    riven::consts::Champion::GNAR,
+                    riven::consts::Champion::TRYNDAMERE,
+                    riven::consts::Champion::LISSANDRA,
+                ]
+                .to_vec(),
+            ),
+            (
+                303505,
+                vec![
+                    riven::consts::Champion::LEE_SIN,
+                    riven::consts::Champion::SHEN,
+                    riven::consts::Champion::SYNDRA,
+                    riven::consts::Champion::IRELIA,
+                    riven::consts::Champion::AHRI,
+                    riven::consts::Champion::YONE,
+                    riven::consts::Champion::JHIN,
+                    riven::consts::Champion::SETT,
+                    riven::consts::Champion::MASTER_YI,
+                    riven::consts::Champion::IVERN,
+                    riven::consts::Champion::KARMA,
+                    riven::consts::Champion::LILLIA,
+                    riven::consts::Champion::KAYN,
+                    riven::consts::Champion::VARUS,
+                    riven::consts::Champion::ZED,
+                    riven::consts::Champion::RAKAN,
+                    riven::consts::Champion::XAYAH,
+                    riven::consts::Champion::AKALI,
+                    riven::consts::Champion::KENNEN,
+                    riven::consts::Champion::YASUO,
+                    riven::consts::Champion::WUKONG,
+                ],
+            ),
+            (
+                303506,
+                vec![
+                    riven::consts::Champion::NEEKO,
+                    riven::consts::Champion::QIYANA,
+                    riven::consts::Champion::MALPHITE,
+                    riven::consts::Champion::MILIO,
+                    riven::consts::Champion::RENGAR,
+                    riven::consts::Champion::NIDALEE,
+                    riven::consts::Champion::ZYRA,
+                ],
+            ),
+            (
+                303507,
+                vec![
+                    riven::consts::Champion::CASSIOPEIA,
+                    riven::consts::Champion::LE_BLANC,
+                    riven::consts::Champion::SAMIRA,
+                    riven::consts::Champion::VLADIMIR,
+                    riven::consts::Champion::BRIAR,
+                    riven::consts::Champion::SION,
+                    riven::consts::Champion::RELL,
+                    riven::consts::Champion::KLED,
+                    riven::consts::Champion::SWAIN,
+                    riven::consts::Champion::DRAVEN,
+                    riven::consts::Champion::KATARINA,
+                    riven::consts::Champion::DARIUS,
+                    riven::consts::Champion::TALON,
+                    riven::consts::Champion::RIVEN,
+                ],
+            ),
+            (
+                303508,
+                vec![
+                    riven::consts::Champion::EZREAL,
+                    riven::consts::Champion::SERAPHINE,
+                    riven::consts::Champion::CAITLYN,
+                    riven::consts::Champion::CAMILLE,
+                    riven::consts::Champion::CORKI,
+                    riven::consts::Champion::HEIMERDINGER,
+                    riven::consts::Champion::ORIANNA,
+                    riven::consts::Champion::JAYCE,
+                    riven::consts::Champion::VI,
+                ],
+            ),
+            (
+                303509,
+                vec![
+                    riven::consts::Champion::YORICK,
+                    riven::consts::Champion::GWEN,
+                    riven::consts::Champion::HECARIM,
+                    riven::consts::Champion::FIDDLESTICKS,
+                    riven::consts::Champion::MAOKAI,
+                    riven::consts::Champion::VIEGO,
+                    riven::consts::Champion::SENNA,
+                    riven::consts::Champion::EVELYNN,
+                    riven::consts::Champion::THRESH,
+                    riven::consts::Champion::ELISE,
+                    riven::consts::Champion::KALISTA,
+                    riven::consts::Champion::KARTHUS,
+                ],
+            ),
+            (
+                303510,
+                vec![
+                    riven::consts::Champion::AMUMU,
+                    riven::consts::Champion::K_SANTE,
+                    riven::consts::Champion::RAMMUS,
+                    riven::consts::Champion::TALIYAH,
+                    riven::consts::Champion::XERATH,
+                    riven::consts::Champion::AKSHAN,
+                    riven::consts::Champion::SKARNER,
+                    riven::consts::Champion::NASUS,
+                    riven::consts::Champion::AZIR,
+                    riven::consts::Champion::SIVIR,
+                    riven::consts::Champion::NAAFIRI,
+                    riven::consts::Champion::ZILEAN,
+                    riven::consts::Champion::RENEKTON,
+                ],
+            ),
+            (
+                303511,
+                vec![
+                    riven::consts::Champion::SORAKA,
+                    riven::consts::Champion::PANTHEON,
+                    riven::consts::Champion::DIANA,
+                    riven::consts::Champion::AURELION_SOL,
+                    riven::consts::Champion::LEONA,
+                    riven::consts::Champion::APHELIOS,
+                    riven::consts::Champion::TARIC,
+                    riven::consts::Champion::ZOE,
+                ],
+            ),
+            (
+                303512,
+                vec![
+                    riven::consts::Champion::KOG_MAW,
+                    riven::consts::Champion::KAI_SA,
+                    riven::consts::Champion::VEL_KOZ,
+                    riven::consts::Champion::REK_SAI,
+                    riven::consts::Champion::KASSADIN,
+                    riven::consts::Champion::BEL_VETH,
+                    riven::consts::Champion::KHA_ZIX,
+                    riven::consts::Champion::MALZAHAR,
+                    riven::consts::Champion::CHO_GATH,
+                ],
+            ),
+            (
+                303513,
+                vec![
+                    riven::consts::Champion::DR_MUNDO,
+                    riven::consts::Champion::URGOT,
+                    riven::consts::Champion::JANNA,
+                    riven::consts::Champion::VIKTOR,
+                    riven::consts::Champion::ZIGGS,
+                    riven::consts::Champion::WARWICK,
+                    riven::consts::Champion::EKKO,
+                    riven::consts::Champion::BLITZCRANK,
+                    riven::consts::Champion::RENATA_GLASC,
+                    riven::consts::Champion::ZAC,
+                    riven::consts::Champion::SINGED,
+                    riven::consts::Champion::TWITCH,
+                    riven::consts::Champion::ZERI,
+                    riven::consts::Champion::JINX,
+                ],
+            ),
+        ]);
+
+        if map.contains_key(&choice) {
+            let champs_list = map.get(&choice).unwrap();
+
+            return format!(
+                "Here are the champs required to complete the challenge:\n\n{}",
+                champs_list
+                    .iter()
+                    .map(|c| format!("- {}", c.name().unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        "No idea lol".to_string()
+    }
+}
+
 pub mod groups {
-    use anyhow::{anyhow, Result};
+    use anyhow::Result;
     use rand::seq::SliceRandom;
     use rand::thread_rng;
     use regex::Regex;
@@ -11,30 +331,7 @@ pub mod groups {
     use std::{collections::HashSet, vec};
     use tracing::{error, info};
 
-    fn number_to_usize(count: &serde_json::Number) -> Result<usize> {
-        Result::Ok(match (count.as_i64(), count.as_f64(), count.as_u64()) {
-            (Some(i), None, None) => {
-                if i <= 0 {
-                    return Result::Err(anyhow!(
-                        "You should provide a positive number. Zero or less is not allowed."
-                    ));
-                } else {
-                    i.try_into().unwrap()
-                }
-            }
-            (None, Some(f), None) => {
-                if f.round() <= 0.0 {
-                    return Result::Err(anyhow!(
-                        "You should provide a positive number. Zero or less is not allowed."
-                    ));
-                } else {
-                    (f.round() as u64).try_into().unwrap()
-                }
-            }
-            (None, None, Some(u)) => u.try_into().unwrap(),
-            _ => return Result::Err(anyhow!("Unhandled state, please try again later.")),
-        })
-    }
+    use crate::commands::number_to_usize;
 
     pub fn register(
         command: &mut builder::CreateApplicationCommand,

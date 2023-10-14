@@ -154,7 +154,11 @@ impl EventHandler for Handler {
             &serenity::model::id::GuildId(DISCORD_GUILD_ID),
             &ctx.http,
             |commands| {
-                commands.create_application_command(|command| commands::groups::register(command))
+                commands
+                    .create_application_command(|command| commands::groups::register(command))
+                    .create_application_command(|command| {
+                        commands::globetrotters::register(command)
+                    })
             },
         )
         .await
@@ -167,6 +171,7 @@ impl EventHandler for Handler {
 
             let content = match command.data.name.as_str() {
                 "groups" => commands::groups::run(&ctx, &command.data.options).await,
+                "globetrotters" => commands::globetrotters::run(&ctx, &command.data.options).await,
                 _ => "not implemented :(".to_string(),
             };
 
