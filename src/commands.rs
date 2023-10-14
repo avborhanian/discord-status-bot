@@ -43,7 +43,8 @@ pub mod globetrotters {
             .description("Returns a list of champions required to complete a challenge.")
             .create_option(|option| {
                 option
-                    .description("Which challenge you want to complete")
+                    .name("challenge")
+                    .description("Which challenge/region you want to complete")
                     .kind(CommandOptionType::Integer)
                     .add_int_choice("5 Under 5' - Bandle City", 303501)
                     .add_int_choice("All Hands on Deck - Bilgewater", 303502)
