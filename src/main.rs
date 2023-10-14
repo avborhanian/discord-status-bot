@@ -11,6 +11,7 @@ use anyhow::*;
 use chrono::Datelike;
 use chrono::TimeZone;
 use chrono::Timelike;
+use dotenvy::dotenv;
 use futures::stream;
 use futures_util::StreamExt;
 use http::Method;
@@ -43,10 +44,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 mod commands;
 mod models;
-
-const DISCORD_GUILD_ID: u64 = 688199744882868236;
-const GAMES_VOICE_CHANNEL_ID: ChannelId = ChannelId(705937071641985104);
-const HIGHLIGHT_REEL_CHANNEL_ID: u64 = 876160308304039996;
 
 macro_rules! riot_api {
     ($response:expr) => {{
@@ -106,6 +103,23 @@ macro_rules! riot_api {
     }};
 }
 
+fn get_channel_id(channel_name: &str) -> Result<u64> {
+    match env::var(channel_name) {
+        Result::Ok(s) => match s.parse::<u64>() {
+            Result::Ok(id) => Ok(id),
+            Err(_) => Result::Err(anyhow!(
+                "The provided id '{}' was not a valid u64 number for {}.",
+                s,
+                channel_name
+            )),
+        },
+        Err(_) => Result::Err(anyhow!(
+            "Unable to find the channel '{}' in the environment.",
+            channel_name
+        )),
+    }
+}
+
 struct Handler {
     users: Arc<RwLock<HashMap<u64, bool>>>,
     current_status: Arc<RwLock<String>>,
@@ -132,7 +146,11 @@ impl Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: serenity::prelude::Context, _data: serenity::model::prelude::Ready) {
         info!("Ready event received");
-        if let Result::Ok(channel) = ctx.http.get_channel(*GAMES_VOICE_CHANNEL_ID.as_u64()).await {
+        if let Result::Ok(channel) = ctx
+            .http
+            .get_channel(get_channel_id("VOICE_CHANNEL_ID").unwrap())
+            .await
+        {
             info!("Games channel passed");
             if let serenity::model::prelude::Channel::Guild(guild_channel) = channel {
                 info!("It's a guild channel");
@@ -151,7 +169,7 @@ impl EventHandler for Handler {
         }
 
         serenity::model::id::GuildId::set_application_commands(
-            &serenity::model::id::GuildId(DISCORD_GUILD_ID),
+            &serenity::model::id::GuildId(get_channel_id("DISCORD_GUILD_ID").unwrap()),
             &ctx.http,
             |commands| {
                 commands
@@ -194,6 +212,7 @@ impl EventHandler for Handler {
         old: Option<serenity::model::voice::VoiceState>,
         new: serenity::model::voice::VoiceState,
     ) {
+        let voice_channel_id = ChannelId(get_channel_id("VOICE_CHANNEL_ID").unwrap());
         match (old, new.channel_id, new.member) {
             (None, None, None | Some(_)) => {
                 info!("I didn't think the None, None, None | Some(_) pattern could be reached");
@@ -202,30 +221,42 @@ impl EventHandler for Handler {
                 info!("I didn't think the None, Some(_), None pattern could be reached");
             }
             (None, Some(new_channel_id), Some(ref member)) => {
-                if new_channel_id == GAMES_VOICE_CHANNEL_ID {
+                if new_channel_id == voice_channel_id {
                     let mut users = self.users.write().await;
                     users.insert(member.user.id.0, false);
                 }
             }
             (Some(old_channel), None | Some(_), None) => {
-                if let Some(GAMES_VOICE_CHANNEL_ID) = old_channel.channel_id {
-                    if let Some(member) = old_channel.member {
-                        self.remove_user(&member).await;
+                if let Some(channel_id) = old_channel.channel_id {
+                    if voice_channel_id == channel_id {
+                        if let Some(member) = old_channel.member {
+                            self.remove_user(&member).await;
+                        }
                     }
                 }
             }
             (Some(old_channel), None, Some(member)) => {
-                if let Some(GAMES_VOICE_CHANNEL_ID) = old_channel.channel_id {
-                    self.remove_user(&member).await;
+                if let Some(channel_id) = old_channel.channel_id {
+                    if voice_channel_id == channel_id {
+                        if let Some(old_member) = old_channel.member {
+                            if old_member.user.id == member.user.id {
+                                self.remove_user(&member).await;
+                            }
+                        }
+                    }
                 }
             }
             (Some(old_channel), Some(new_channel_id), Some(ref member)) => {
-                if new_channel_id == GAMES_VOICE_CHANNEL_ID {
+                if new_channel_id == voice_channel_id {
                     let mut users = self.users.write().await;
                     users.insert(member.user.id.0, false);
-                } else if let Some(GAMES_VOICE_CHANNEL_ID) = old_channel.channel_id {
-                    if let Some(member) = old_channel.member {
-                        self.remove_user(&member).await;
+                } else if let Some(channel_id) = old_channel.channel_id {
+                    if voice_channel_id == channel_id {
+                        if let Some(old_member) = old_channel.member {
+                            if old_member.user.id == member.user.id {
+                                self.remove_user(member).await;
+                            }
+                        }
                     }
                 }
             }
@@ -281,6 +312,7 @@ fn get_start_time() -> Result<i64> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenv().expect(".env file not found");
     std::panic::set_hook(Box::new(|i| {
         error!("Panic'd: {}", i);
     }));
@@ -901,7 +933,7 @@ async fn update_discord_status(
     let map: Value = content.into();
     let owned_map = to_vec(&map.clone())?;
     let create_message = serenity::http::routing::RouteInfo::CreateMessage {
-        channel_id: GAMES_VOICE_CHANNEL_ID.0,
+        channel_id: get_channel_id("VOICE_CHANNEL_ID")?,
     };
     let mut request_builder = serenity::http::request::RequestBuilder::new(create_message);
     request_builder.body(Some(&owned_map));
@@ -920,7 +952,7 @@ async fn update_discord_status(
     );
     true_reqwest.url_mut().set_path(&format!(
         "api/v10/channels/{}/voice-status",
-        GAMES_VOICE_CHANNEL_ID.as_u64(),
+        get_channel_id("VOICE_CHANNEL_ID")?,
     ));
     *true_reqwest.method_mut() = Method::PUT;
     client.execute(true_reqwest).await?;
@@ -937,7 +969,7 @@ async fn update_highlight_reel(
         serde_json::Value::String(results.to_string()),
     );
     match discord_auth
-        .send_message(HIGHLIGHT_REEL_CHANNEL_ID, &content.into())
+        .send_message(get_channel_id("UPDATES_CHANNEL_ID")?, &content.into())
         .await
     {
         Result::Ok(message) => info!("Message id is {}", message.id),

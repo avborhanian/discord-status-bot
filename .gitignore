@@ -5,3 +5,4 @@ sqlite.db
 *.ps1
 server.log.*
 Untitled-1.py
+.env

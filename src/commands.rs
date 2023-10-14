@@ -21,7 +21,12 @@ fn number_to_usize(count: &serde_json::Number) -> Result<usize> {
             }
         }
         (None, None, Some(u)) => u.try_into().unwrap(),
-        _ => return Result::Err(anyhow!("Unhandled state, please try again later.")),
+        _ => match count.as_str().parse() {
+            Result::Ok(id) => id,
+            Result::Err(_) => {
+                return Result::Err(anyhow!("Unhandled state, please try again later."))
+            }
+        },
     })
 }
 
@@ -32,6 +37,7 @@ pub mod globetrotters {
     use serenity::model::prelude::application_command::CommandDataOption;
     use serenity::model::prelude::command::CommandOptionType;
     use serenity::prelude::Context;
+    use tracing::error;
 
     use super::number_to_usize;
 
@@ -64,15 +70,17 @@ pub mod globetrotters {
     }
 
     pub async fn run(_ctx: &Context, options: &[CommandDataOption]) -> String {
-        let choice: usize =
-            options
-                .iter()
-                .find(|o| o.name == "ignore")
-                .map_or(0, |o| match &o.value {
-                    Some(serde_json::Value::Number(s)) => number_to_usize(s).unwrap_or(0),
-                    Some(_) => 0,
-                    None => 0,
-                });
+        let choice: usize = options
+            .iter()
+            .find(|o| o.name == "challenge")
+            .map_or(0, |o| match &o.value {
+                Some(serde_json::Value::Number(s)) => number_to_usize(s).unwrap_or(0),
+                Some(s) => {
+                    error!("Didn't get a number, instead got {}", s);
+                    0
+                }
+                None => 0,
+            });
         if choice == 0 {
             return "Unable to handle the result sent for whatever reason. Bug Araam.".to_string();
         }
@@ -329,7 +337,7 @@ pub mod groups {
     use serenity::model::prelude::application_command::CommandDataOption;
     use serenity::model::prelude::command::CommandOptionType;
     use serenity::prelude::Context;
-    use std::{collections::HashSet, vec};
+    use std::{collections::HashSet, env, vec};
     use tracing::{error, info};
 
     use crate::commands::number_to_usize;
@@ -366,8 +374,19 @@ pub mod groups {
     }
 
     pub async fn run(ctx: &Context, options: &[CommandDataOption]) -> String {
+        let channel_id = match env::var("VOICE_CHANNEL_ID") {
+            Result::Ok(s) => match s.parse() {
+                Result::Ok(id) => id,
+                Err(_) => {
+                    return "The provided id was not a valid u64 number.".to_string();
+                }
+            },
+            Err(_) => {
+                return "Unable to find the voice channel.".to_string();
+            }
+        };
         info!("fetching channel info now");
-        let channel_fetch = ctx.http.get_channel(705937071641985104).await;
+        let channel_fetch = ctx.http.get_channel(channel_id).await;
         let channel;
         if let Result::Ok(c) = channel_fetch {
             info!("Channel info here: {:?}", c);
