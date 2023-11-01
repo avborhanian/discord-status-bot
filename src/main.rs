@@ -18,6 +18,7 @@ use http::Method;
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use models::*;
+use prost::Message;
 use reqwest::header;
 use riven::consts::{PlatformRoute, Queue, RegionalRoute};
 use riven::models::match_v5::Match;
@@ -44,6 +45,12 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 mod commands;
 mod models;
+
+// Include the `items` module, which is generated from items.proto.
+pub mod log_models {
+    include!(concat!(env!("OUT_DIR"), "/log_models.rs"));
+    include!(concat!(env!("OUT_DIR"), "/log_models.serde.rs"));
+}
 
 macro_rules! riot_api {
     ($response:expr) => {{
@@ -168,7 +175,7 @@ impl EventHandler for Handler {
             }
         }
 
-        serenity::model::id::GuildId::set_application_commands(
+        match serenity::model::id::GuildId::set_application_commands(
             &serenity::model::id::GuildId(get_channel_id("DISCORD_GUILD_ID").unwrap()),
             &ctx.http,
             |commands| {
@@ -180,7 +187,10 @@ impl EventHandler for Handler {
             },
         )
         .await
-        .unwrap();
+        {
+            Result::Ok(_) => {}
+            Result::Err(e) => error!("Ran into error while trying to set up commands: {}", e),
+        };
     }
 
     async fn interaction_create(&self, ctx: serenity::prelude::Context, interaction: Interaction) {
@@ -380,19 +390,7 @@ async fn main() -> Result<()> {
         let mut interval = time::interval(Duration::from_secs(5));
         let summoners = fetch_summoners()?;
         loop {
-            // TODO(araam): It's a cute idea, butttt in reality if this is empty,
-            // We should still do the check at least once (aka start of day).
-            // Then if empty still, we can then just wait 3 minutes before re-running
-            // To see if anyone joined.
-            // let discord_user_ids = {
-            //     let data = active_users.read().await;
-            //     data.keys().copied().collect::<HashSet<u64>>()
-            // };
-            let active_summoners = summoners
-                .iter()
-                // .filter(|s| discord_user_ids.contains(s.0))
-                .map(|s| s.1)
-                .collect::<HashSet<_>>();
+            let active_summoners = summoners.iter().map(|s| s.1).collect::<HashSet<_>>();
             let puuids = fetch_puuids(&active_summoners)?;
             for puuid in puuids.iter() {
                 interval.tick().await;
@@ -977,4 +975,113 @@ async fn update_highlight_reel(
     };
 
     Ok(())
+}
+
+#[allow(dead_code)]
+fn calculate_match_performance(match_info: &Match, discord_puuids: &HashSet<String>) -> Result<()> {
+    let discord_participants = match_info
+        .info
+        .participants
+        .iter()
+        .filter(|p| discord_puuids.contains(&p.puuid))
+        .collect::<Vec<_>>();
+
+    let log_models: log_models::LogModels =
+        serde_json::from_str(include_str!("log_models.json")).expect("Valid format");
+    for participant in discord_participants {
+        println!(
+            "Looking for role {} and lane {}",
+            participant.role, participant.lane,
+        );
+        let log_model = log_models
+            .models
+            .iter()
+            .find(|m| m.role == participant.role && m.lane == participant.lane)
+            .unwrap();
+        let mut score: f64 = log_model.intercept;
+        for param in log_model.params.iter() {
+            score += param.coefficient
+                * (match param.name.as_str() {
+                    "assists" => participant.assists,
+                    "goldEarned" => participant.gold_earned,
+                    "totalMinionsKilled" => participant.total_minions_killed,
+                    "wardsKilled" => participant.wards_killed,
+                    "largestKillingSpree" => participant.largest_killing_spree,
+                    "quadraKills" => participant.quadra_kills,
+                    "timeCCingOthers" => participant.time_c_cing_others,
+                    "visionScore" => participant.vision_score,
+                    "totalEnemyJungleMinionsKilled" => participant
+                        .total_enemy_jungle_minions_killed
+                        .unwrap_or_default(),
+                    "killingSprees" => participant.killing_sprees,
+                    "largestMultiKill" => participant.largest_multi_kill,
+                    "visionWardsBoughtInGame" => participant.vision_wards_bought_in_game,
+                    "totalAllyJungleMinionsKilled" => participant
+                        .total_ally_jungle_minions_killed
+                        .unwrap_or_default(),
+                    "bountyLevel" => participant.bounty_level,
+                    "dragonKills" => participant.dragon_kills,
+                    "kills" => participant.kills,
+                    "baronKills" => participant.baron_kills,
+                    "tripleKills" => participant.triple_kills,
+                    "totalUnitsHealed" => participant.total_units_healed,
+                    "deaths" => participant.deaths,
+                    "objectivesStolen" => participant.objectives_stolen,
+                    "goldSpent" => participant.gold_spent,
+                    "consumablesPurchased" => participant.consumables_purchased,
+                    "objectivesStolenAssists" => participant.objectives_stolen_assists,
+                    "doubleKills" => participant.double_kills,
+                    "wardsPlaced" => participant.wards_placed,
+                    "turretTakedowns" => participant.turret_takedowns.unwrap_or_default(),
+                    "pentaKills" => participant.penta_kills,
+                    "firstBloodAssist" => match participant.first_blood_assist {
+                        true => 1,
+                        false => 0,
+                    },
+                    "turretKills" => participant.turret_kills,
+                    "totalTimeSpentDead" => participant.total_time_spent_dead,
+                    "detectorWardsPlaced" => participant.detector_wards_placed,
+                    "totalDamageShieldedOnTeammates" => {
+                        participant.total_damage_shielded_on_teammates
+                    }
+                    _ => {
+                        return Err(anyhow!("Unhandled param: {}", param.name));
+                    }
+                } as f64)
+                / match param.name.as_str() {
+                    "firstBloodAssist" => 1.0,
+                    _ => {
+                        (match &participant.challenges {
+                            Some(challenge) => challenge.game_length.unwrap_or(30.0),
+                            None => 30.0,
+                        }) / 60.0
+                    }
+                };
+        }
+        let probability = 1. / (1. + (-score).exp());
+        println!(
+            "For participant {}, probability was {}",
+            participant.summoner_name, probability
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use riven::models::match_v5::Match;
+
+    use crate::calculate_match_performance;
+
+    #[test]
+    fn does_calculate_match_performance() {
+        let match_: Match = serde_json::from_str(include_str!("../tests/NA1_4802938104.json"))
+            .expect("Valid Format");
+        let discord_puuids = HashSet::from([String::from(
+            "N0druvX0j969WpG6Py5LBI2OctCB-ZCDhqAR0fjjBn8yzjWjaJFmJEjZQh1X09evWBO9JDpBe3JOEg",
+        )]);
+        calculate_match_performance(&match_, &discord_puuids).unwrap();
+    }
 }

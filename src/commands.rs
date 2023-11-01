@@ -338,7 +338,7 @@ pub mod groups {
     use serenity::model::prelude::command::CommandOptionType;
     use serenity::prelude::Context;
     use std::{collections::HashSet, env, vec};
-    use tracing::{error, info};
+    use tracing::{debug, error};
 
     use crate::commands::number_to_usize;
 
@@ -385,22 +385,22 @@ pub mod groups {
                 return "Unable to find the voice channel.".to_string();
             }
         };
-        info!("fetching channel info now");
+        debug!("fetching channel debug now");
         let channel_fetch = ctx.http.get_channel(channel_id).await;
         let channel;
         if let Result::Ok(c) = channel_fetch {
-            info!("Channel info here: {:?}", c);
+            debug!("Channel debug here: {:?}", c);
             channel = c;
         } else {
-            info!("Voice channel missing");
+            debug!("Voice channel missing");
             return "Unable to find the voice channel.".to_string();
         };
         let active_members: Vec<Member> = match channel {
             serenity::model::prelude::Channel::Guild(guild_channel) => {
-                info!("Guild channel info: {:?}", guild_channel);
+                debug!("Guild channel debug: {:?}", guild_channel);
                 match guild_channel.members(ctx.cache.as_ref()).await {
                     Result::Ok(m) => {
-                        info!("List of members: {:?}", m);
+                        debug!("List of members: {:?}", m);
                         m
                     }
                     Result::Err(e) => {
@@ -410,12 +410,12 @@ pub mod groups {
                 }
             }
             c => {
-                info!("Just not a guild channel - was {}", c);
+                debug!("Just not a guild channel - was {}", c);
                 vec![]
             }
         };
         if active_members.is_empty() {
-            info!("Unable to determine who to remove from the groups");
+            debug!("Unable to determine who to remove from the groups");
         }
 
         let re = Regex::new(r"<@(\d+)>").unwrap();
@@ -495,8 +495,8 @@ pub mod groups {
         let mut members_to_group = members_to_group.clone();
         members_to_group.shuffle(rng);
 
-        info!("List of members is {:?}", members_to_group);
-        info!(
+        debug!("List of members is {:?}", members_to_group);
+        debug!(
             "Index is calculated as {}",
             members_to_group.len().div_ceil(2)
         );
@@ -626,6 +626,6 @@ mod tests {
             4,
             &mut rng,
         );
-        assert_eq!("Group 1:\n\n<@9> <@8> <@7> <@6> <@12>\n\nGroup 2:\n\n<@2> <@14> <@1> <@19> <@10>\n\nGroup 3:\n\n<@13> <@5> <@17> <@16> <@18>\n\nGroup 4:\n\n<@11> <@15> <@20> <@4> <@3", value);
+        assert_eq!("Group 1:\n\n<@9> <@8> <@7> <@6> <@12>\n\nGroup 2:\n\n<@2> <@14> <@1> <@19> <@10>\n\nGroup 3:\n\n<@13> <@5> <@17> <@16> <@18>\n\nGroup 4:\n\n<@11> <@15> <@20> <@4> <@3>", value);
     }
 }
