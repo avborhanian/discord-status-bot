@@ -31,6 +31,7 @@ jobs:
     - name: Build
       uses: docker/build-push-action@v5
       with:
+        context: .github/image
         tags: arm-unknown-linux-gnueabihf:protoc
         
     - name: Build binary
