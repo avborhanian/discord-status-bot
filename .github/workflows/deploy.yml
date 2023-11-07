@@ -12,10 +12,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - uses: arduino/setup-protoc@v2
     - uses: actions/checkout@v3
     - uses: Swatinem/rust-cache@v2
       with:
         cache-on-failure: "false"
+
+    - name: Shell check protoc
+      shell: bash
+      run: echo $PROTOC
         
     - name: Build binary
       uses: houseabsolute/actions-rust-cross@v0
