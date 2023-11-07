@@ -1,5 +1,4 @@
 FROM ghcr.io/cross-rs/arm-unknown-linux-gnueabihf:main
 ARG DEBIAN_FRONTEND=noninteractive
-ENV PROTOC_VERSION=22.0
 
 RUN apt-get update && apt install -qy protobuf-compiler
