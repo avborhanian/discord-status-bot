@@ -33,7 +33,7 @@ jobs:
       with:
         context: .github/workflows/image
         push: true
-        tags: arm-unknown-linux-gnueabihf:protoc
+        tags: avbor/avbor:protoc
         
     - name: Build binary
       uses: houseabsolute/actions-rust-cross@v0
