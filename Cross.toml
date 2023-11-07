@@ -1,4 +1,2 @@
-[build.env]
-passthrough = [
-  "PROTOC"
-]
+[target.arm-unknown-linux-gnueabihf]
+image = "arm-unknown-linux-gnueabihf"
