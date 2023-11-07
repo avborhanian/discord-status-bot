@@ -953,7 +953,13 @@ async fn update_discord_status(
         get_channel_id("VOICE_CHANNEL_ID")?,
     ));
     *true_reqwest.method_mut() = Method::PUT;
-    client.execute(true_reqwest).await?;
+    let response = client.execute(true_reqwest).await;
+    match response {
+        Result::Ok(_) => {}
+        Result::Err(e) => {
+            error!("Ran into an error while trying to update the status: {}", e);
+        }
+    }
     Ok(())
 }
 
