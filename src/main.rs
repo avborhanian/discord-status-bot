@@ -18,7 +18,6 @@ use http::Method;
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use models::*;
-use prost::Message;
 use reqwest::header;
 use riven::consts::{PlatformRoute, Queue, RegionalRoute};
 use riven::models::match_v5::Match;
@@ -195,7 +194,10 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: serenity::prelude::Context, interaction: Interaction) {
         if let Interaction::ApplicationCommand(command) = interaction {
-            info!("Received command interaction: {:#?}", command);
+            info!(
+                "Received command interaction: {}",
+                command.data.name.as_str()
+            );
 
             let content = match command.data.name.as_str() {
                 "groups" => commands::groups::run(&ctx, &command.data.options).await,
