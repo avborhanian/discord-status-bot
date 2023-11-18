@@ -385,11 +385,9 @@ pub mod groups {
                 return "Unable to find the voice channel.".to_string();
             }
         };
-        debug!("fetching channel debug now");
         let channel_fetch = ctx.http.get_channel(channel_id).await;
         let channel;
         if let Result::Ok(c) = channel_fetch {
-            debug!("Channel debug here: {:?}", c);
             channel = c;
         } else {
             debug!("Voice channel missing");
@@ -397,12 +395,8 @@ pub mod groups {
         };
         let active_members: Vec<Member> = match channel {
             serenity::model::prelude::Channel::Guild(guild_channel) => {
-                debug!("Guild channel debug: {:?}", guild_channel);
                 match guild_channel.members(ctx.cache.as_ref()).await {
-                    Result::Ok(m) => {
-                        debug!("List of members: {:?}", m);
-                        m
-                    }
+                    Result::Ok(m) => m,
                     Result::Err(e) => {
                         error!("Error encountered while fetching members: {:?}", e);
                         vec![]
