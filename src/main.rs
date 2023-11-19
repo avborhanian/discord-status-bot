@@ -225,6 +225,16 @@ impl EventHandler for Handler {
         new: serenity::model::voice::VoiceState,
     ) {
         let voice_channel_id = ChannelId(get_channel_id("VOICE_CHANNEL_ID").unwrap());
+        info!(
+            "Pattern we're checking is: ({}, {}, {})",
+            if old.is_some() { "Some" } else { "None" },
+            if new.channel_id.is_some() {
+                "Some"
+            } else {
+                "None"
+            },
+            if new.member.is_some() { "Some" } else { "None" }
+        );
         match (old, new.channel_id, new.member) {
             (None, None, None | Some(_)) => {
                 info!("I didn't think the None, None, None | Some(_) pattern could be reached");
