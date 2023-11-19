@@ -283,6 +283,10 @@ impl EventHandler for Handler {
                 }
             }
         }
+        info!(
+            "After checking, the count is now {}",
+            (self.users.read().await).len()
+        );
     }
 }
 
