@@ -489,7 +489,14 @@ pub mod groups {
         let mut members_to_group = members_to_group.clone();
         members_to_group.shuffle(rng);
 
-        debug!("List of members is {:?}", members_to_group);
+        debug!(
+            "List of members is {:?}",
+            &members_to_group
+                .iter()
+                .map(|m| m.user.name.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         debug!(
             "Index is calculated as {}",
             members_to_group.len().div_ceil(2)
