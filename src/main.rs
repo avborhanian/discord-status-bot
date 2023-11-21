@@ -427,7 +427,7 @@ async fn main() -> Result<()> {
                 );
                 match (current_date < get_start_time()?, matches_fetch) {
                     (true, _) => {
-                        info!("It's a new day, time to scan histories at least once.");
+                        info!("It's a new day, time to scan histories at least once. Current day was {}, now it's {}", current_date, get_start_time().unwrap());
                         match check_match_history(&riot_api, &discord_client, &current_status).await
                         {
                             Result::Ok(_) => {}
@@ -437,7 +437,7 @@ async fn main() -> Result<()> {
                         current_date = start_time;
                     }
                     (_, Result::Ok(match_list)) if !match_list.is_empty() => {
-                        info!("Some matches were found, scan all histories now.");
+                        info!("Some matches were found, scan all histories now. Current time set to {}", start_time);
                         match check_match_history(&riot_api, &discord_client, &current_status).await
                         {
                             Result::Ok(_) => {}
