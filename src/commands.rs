@@ -519,9 +519,9 @@ pub mod groups {
 }
 
 pub mod register {
-    use anyhow::Result;
     use riven::RiotApi;
     use serenity::builder;
+    use serenity::model::application::interaction::application_command::CommandDataOptionValue;
     use serenity::model::prelude::application_command::CommandDataOption;
     use serenity::model::prelude::command::CommandOptionType;
     use serenity::prelude::Context;
@@ -554,24 +554,16 @@ pub mod register {
             })
     }
 
-    pub async fn run(ctx: &Context, options: &[CommandDataOption]) -> String {
+    pub async fn run(_ctx: &Context, options: &[CommandDataOption]) -> String {
         let riot_api_key: &str = &env::var("RIOT_API_TOKEN").unwrap();
         let riot_api = RiotApi::new(riot_api_key);
-        let guild_id: u64 = match env::var("DISCORD_GUILD_ID") {
-            Result::Ok(s) => match s.parse() {
-                Result::Ok(id) => id,
-                Err(_) => {
-                    return "The provided id was not a valid u64 number.".to_string();
-                }
-            },
-            Err(_) => {
-                return "Unable to find the guild channel.".to_string();
-            }
-        };
 
-        let user_id = match options.iter().find(|o| o.name == "user") {
-            Some(user_option) => match user_option.value.as_ref().unwrap().as_u64() {
-                Some(id) => id,
+        let user = match options.iter().find(|o| o.name == "user") {
+            Some(user_option) => match &user_option.resolved {
+                Some(value) => match value {
+                    CommandDataOptionValue::User(user, _) => user,
+                    _ => return "Expected a user, found something else.".to_string(),
+                },
                 None => {
                     return format!("Unable to find the user id. Only saw {:?}", user_option)
                         .to_string()
@@ -630,19 +622,18 @@ pub mod register {
                 .unwrap(),
         };
 
-        let member = ctx.http.get_member(guild_id, user_id).await.unwrap();
         let connection = rusqlite::Connection::open("sqlite.db").unwrap();
         let mut statement = connection
             .prepare("INSERT INTO User (DiscordUsername, SummonerName, DiscordId, DiscordDisplayName) VALUES (?1, ?2, ?3, ?4);").unwrap();
         statement
             .execute([
-                &member.user.name,
+                &user.name,
                 &match &account {
                     GameId::RiotId(name, tag) => format!("{}#{}", name, tag),
                     GameId::SummonerName(name) => name.to_string(),
                 },
-                &member.user.id.as_u64().to_string(),
-                &member.display_name().to_string(),
+                &user.id.as_u64().to_string(),
+                &user.name,
             ])
             .unwrap();
         let mut statement = connection
