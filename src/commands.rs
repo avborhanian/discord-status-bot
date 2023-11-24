@@ -518,6 +518,148 @@ pub mod groups {
     }
 }
 
+pub mod register {
+    use anyhow::Result;
+    use riven::RiotApi;
+    use serenity::builder;
+    use serenity::model::prelude::application_command::CommandDataOption;
+    use serenity::model::prelude::command::CommandOptionType;
+    use serenity::prelude::Context;
+    use std::env;
+
+    enum GameId {
+        SummonerName(String),
+        RiotId(String, String),
+    }
+
+    pub fn register(
+        command: &mut builder::CreateApplicationCommand,
+    ) -> &mut builder::CreateApplicationCommand {
+        command
+            .name("register")
+            .description("Adds a new user to the database.")
+            .create_option(|option| {
+                option
+                    .name("user")
+                    .description("The Discord user to add")
+                    .kind(CommandOptionType::User)
+                    .required(true)
+            })
+            .create_option(|option| {
+                option
+                    .name("summoner")
+                    .description("The summoner name / riot id.")
+                    .kind(CommandOptionType::String)
+                    .required(true)
+            })
+    }
+
+    pub async fn run(ctx: &Context, options: &[CommandDataOption]) -> String {
+        let riot_api_key: &str = &env::var("RIOT_API_TOKEN").unwrap();
+        let riot_api = RiotApi::new(riot_api_key);
+        let guild_id: u64 = match env::var("DISCORD_GUILD_ID") {
+            Result::Ok(s) => match s.parse() {
+                Result::Ok(id) => id,
+                Err(_) => {
+                    return "The provided id was not a valid u64 number.".to_string();
+                }
+            },
+            Err(_) => {
+                return "Unable to find the guild channel.".to_string();
+            }
+        };
+
+        let user_id = match options.iter().find(|o| o.name == "user") {
+            Some(user_option) => match user_option.value.as_ref().unwrap().as_u64() {
+                Some(id) => id,
+                None => return "Unable to find the user id.".to_string(),
+            },
+            None => {
+                return "Looks like no user id specified.".to_string();
+            }
+        };
+
+        let account: GameId = match options.iter().find(|o| o.name == "summoner") {
+            Some(account_option) => match account_option.value.as_ref().unwrap().as_str() {
+                Some(name) => {
+                    let text = name.trim();
+                    if text.is_empty() {
+                        return "No name specified".to_string();
+                    }
+                    if text.contains("#") {
+                        let mut parts = text.split("#");
+                        GameId::RiotId(
+                            parts.next().unwrap().to_string(),
+                            parts.next().unwrap().to_string(),
+                        )
+                    } else {
+                        GameId::SummonerName(text.to_string())
+                    }
+                }
+                None => return "No name specified".to_string(),
+            },
+            None => return "No name specified".to_string(),
+        };
+
+        let member_info = match &account {
+            GameId::RiotId(name, tag) => {
+                let account = riot_api
+                    .account_v1()
+                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
+                    .await
+                    .unwrap();
+                match account {
+                    Some(account) => riot_api
+                        .summoner_v4()
+                        .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
+                        .await
+                        .unwrap(),
+                    None => {
+                        return "Unable to find the matching account".to_string();
+                    }
+                }
+            }
+            GameId::SummonerName(name) => riot_api
+                .summoner_v4()
+                .get_by_summoner_name(riven::consts::PlatformRoute::NA1, &name)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+
+        let member = ctx.http.get_member(guild_id, user_id).await.unwrap();
+        let connection = rusqlite::Connection::open("sqlite.db").unwrap();
+        let mut statement = connection
+            .prepare("INSERT INTO User (DiscordUsername, SummonerName, DiscordId, DiscordDisplayName) VALUES (?1, ?2, ?3, ?4);").unwrap();
+        statement
+            .execute([
+                &member.user.name,
+                &match &account {
+                    GameId::RiotId(name, tag) => format!("{}#{}", name, tag),
+                    GameId::SummonerName(name) => name.to_string(),
+                },
+                &member.user.id.as_u64().to_string(),
+                &member.display_name().to_string(),
+            ])
+            .unwrap();
+        let mut statement = connection
+            .prepare("INSERT INTO Summoner (Id, AccountId, Puuid, Name) VALUES (?1, ?2, ?3, ?4);")
+            .unwrap();
+        statement
+            .execute([
+                member_info.id,
+                member_info.account_id,
+                member_info.puuid,
+                match &account {
+                    GameId::RiotId(name, tag) => format!("{}#{}", name, tag),
+                    GameId::SummonerName(name) => name.to_string(),
+                },
+            ])
+            .unwrap();
+        return "".to_string();
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

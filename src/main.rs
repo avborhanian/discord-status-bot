@@ -183,6 +183,7 @@ impl EventHandler for Handler {
                     .create_application_command(|command| {
                         commands::globetrotters::register(command)
                     })
+                    .create_application_command(|command| commands::register::register(command))
             },
         )
         .await
@@ -202,8 +203,14 @@ impl EventHandler for Handler {
             let content = match command.data.name.as_str() {
                 "groups" => commands::groups::run(&ctx, &command.data.options).await,
                 "globetrotters" => commands::globetrotters::run(&ctx, &command.data.options).await,
+                "register" => commands::register::run(&ctx, &command.data.options).await,
                 _ => "not implemented :(".to_string(),
             };
+
+            if command.data.name.as_str() == "register" {
+                info!("Register response: {}", content);
+                return;
+            }
 
             if let Err(why) = command
                 .create_interaction_response(&ctx.http, |response| {
