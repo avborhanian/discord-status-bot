@@ -572,7 +572,10 @@ pub mod register {
         let user_id = match options.iter().find(|o| o.name == "user") {
             Some(user_option) => match user_option.value.as_ref().unwrap().as_u64() {
                 Some(id) => id,
-                None => return "Unable to find the user id.".to_string(),
+                None => {
+                    return format!("Unable to find the user id. Only saw {:?}", user_option)
+                        .to_string()
+                }
             },
             None => {
                 return "Looks like no user id specified.".to_string();
