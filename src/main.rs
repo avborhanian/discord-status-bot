@@ -432,19 +432,20 @@ async fn main() -> Result<()> {
                         )
                         .await
                 );
-                match (current_date < get_start_time()?, matches_fetch) {
+                let new_start_time = get_start_time()?;
+                match (current_date < new_start_time, matches_fetch) {
                     (true, _) => {
-                        info!("It's a new day, time to scan histories at least once. Current day was {}, now it's {}", current_date, get_start_time().unwrap());
+                        info!("It's a new day, time to scan histories at least once. Current day was {}, now it's {}", current_date, new_start_time);
                         match check_match_history(&riot_api, &discord_client, &current_status).await
                         {
                             Result::Ok(_) => {}
                             Result::Err(e) => error!("{}", e),
                         }
                         start_time = chrono::Local::now().timestamp();
-                        current_date = start_time;
+                        current_date = new_start_time;
                     }
                     (_, Result::Ok(match_list)) if !match_list.is_empty() => {
-                        info!("Some matches were found, scan all histories now. Current time set to {}", start_time);
+                        info!("Some matches were found, scan all histories now. Current time set to {}. Current date is {}", start_time, current_date);
                         match check_match_history(&riot_api, &discord_client, &current_status).await
                         {
                             Result::Ok(_) => {}
