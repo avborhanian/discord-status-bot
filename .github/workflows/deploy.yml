@@ -65,4 +65,4 @@ jobs:
         username: ${{ secrets.USERNAME }}
         key: ${{ secrets.KEY }}
         port: ${{ secrets.PORT }}
-        script: cd ${{secrets.TARGET_DIR}} && ./start_job.sh
+        script: cd ${{secrets.TARGET_DIR}} && sudo ./start_job.sh
