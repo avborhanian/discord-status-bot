@@ -454,7 +454,7 @@ async fn main() -> Result<()> {
                         start_time = chrono::Local::now().timestamp();
                     }
                     (false, Result::Ok(_)) => {
-                        println!("Made a fetch, no results found");
+                        info!("Made a fetch, no results found");
                     }
                     (_, Result::Err(e)) => error!("Hit an error while fetching: {}", e),
                 }
