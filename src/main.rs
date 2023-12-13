@@ -442,6 +442,7 @@ async fn main() -> Result<()> {
                             Result::Err(e) => error!("{}", e),
                         }
                         start_time = chrono::Local::now().timestamp();
+                        info!("Also setting start time to {}", start_time);
                         current_date = new_start_time;
                     }
                     (_, Result::Ok(match_list)) if !match_list.is_empty() => {
@@ -452,10 +453,9 @@ async fn main() -> Result<()> {
                             Result::Err(e) => error!("{}", e),
                         }
                         start_time = chrono::Local::now().timestamp();
+                        info!("Also setting start time to {}", start_time);
                     }
-                    (false, Result::Ok(_)) => {
-                        info!("Made a fetch, no results found");
-                    }
+                    (false, Result::Ok(_)) => {}
                     (_, Result::Err(e)) => error!("Hit an error while fetching: {}", e),
                 }
             }
