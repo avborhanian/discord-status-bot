@@ -30,6 +30,11 @@ fn number_to_usize(count: &serde_json::Number) -> Result<usize> {
     })
 }
 
+enum GameId {
+    SummonerName(String),
+    RiotId(String, String),
+}
+
 pub mod globetrotters {
     use std::collections::HashMap;
 
@@ -527,10 +532,7 @@ pub mod register {
     use serenity::prelude::Context;
     use std::env;
 
-    enum GameId {
-        SummonerName(String),
-        RiotId(String, String),
-    }
+    use super::GameId;
 
     pub fn register(
         command: &mut builder::CreateApplicationCommand,
@@ -651,6 +653,113 @@ pub mod register {
             ])
             .unwrap();
         return "".to_string();
+    }
+}
+
+pub mod clash {
+    use anyhow::{anyhow, Result};
+    use riven::RiotApi;
+    use serenity::builder;
+    use serenity::model::prelude::application_command::CommandDataOption;
+    use serenity::model::prelude::command::CommandOptionType;
+    use serenity::prelude::Context;
+    use std::env;
+
+    use super::GameId;
+
+    pub fn register(
+        command: &mut builder::CreateApplicationCommand,
+    ) -> &mut builder::CreateApplicationCommand {
+        command
+            .name("clash")
+            .description("Looks up clash team info based on a player on the enemy team.")
+            .create_option(|option| {
+                option
+                    .name("summoner")
+                    .description("The summoner name / riot id.")
+                    .kind(CommandOptionType::String)
+                    .required(true)
+            })
+    }
+
+    pub async fn run(_ctx: &Context, options: &[CommandDataOption]) -> Result<String> {
+        let riot_api_key: &str = &env::var("RIOT_API_TOKEN").unwrap();
+        let riot_api = RiotApi::new(riot_api_key);
+
+        let account: GameId = match options.iter().find(|o| o.name == "summoner") {
+            Some(account_option) => match account_option.value.as_ref().unwrap().as_str() {
+                Some(name) => {
+                    let text = name.trim();
+                    if text.is_empty() {
+                        return Err(anyhow!("No name specified".to_string()));
+                    }
+                    if text.contains("#") {
+                        let mut parts = text.split("#");
+                        GameId::RiotId(
+                            parts.next().unwrap().to_string(),
+                            parts.next().unwrap().to_string(),
+                        )
+                    } else {
+                        GameId::SummonerName(text.to_string())
+                    }
+                }
+                None => return Err(anyhow!("No name specified".to_string())),
+            },
+            None => return Err(anyhow!("No name specified".to_string())),
+        };
+
+        let member_info = match &account {
+            GameId::RiotId(name, tag) => {
+                let account = riot_api
+                    .account_v1()
+                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
+                    .await
+                    .unwrap();
+                match account {
+                    Some(account) => riot_api
+                        .summoner_v4()
+                        .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
+                        .await
+                        .unwrap(),
+                    None => {
+                        return Err(anyhow!("Unable to find the matching account".to_string()));
+                    }
+                }
+            }
+            GameId::SummonerName(name) => riot_api
+                .summoner_v4()
+                .get_by_summoner_name(riven::consts::PlatformRoute::NA1, &name)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+
+        let clash_players = riot_api
+            .clash_v1()
+            .get_players_by_summoner(riven::consts::PlatformRoute::NA1, &member_info.id)
+            .await?;
+        let clash_tournaments = riot_api
+            .clash_v1()
+            .get_tournaments(riven::consts::PlatformRoute::NA1)
+            .await?;
+        clash_tournaments.iter().filter(|t| {
+            t.schedule
+                .iter()
+                .any(|phase| phase.start_time <= chrono::Local::now().timestamp_micros())
+        });
+        let team_ids = clash_players
+            .iter()
+            .filter(|p| p.team_id.is_some())
+            .map(|player| player.team_id.as_ref().unwrap())
+            .map(|team_id| async {
+                let team_fetch = riot_api
+                    .clash_v1()
+                    .get_team_by_id(riven::consts::PlatformRoute::NA1, team_id)
+                    .await
+                    .unwrap();
+            });
+
+        Ok("".to_string())
     }
 }
 

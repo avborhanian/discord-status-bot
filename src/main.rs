@@ -405,7 +405,7 @@ async fn main() -> Result<()> {
     );
     let discord_events = client.start();
 
-    let forever = task::spawn(async move {
+    let forever: task::JoinHandle<std::prelude::v1::Result<(), Error>> = task::spawn(async move {
         let discord_client = discord_client.clone();
         let current_status = current_status.clone();
         let mut start_time = 0;
@@ -455,15 +455,24 @@ async fn main() -> Result<()> {
                         start_time = chrono::Local::now().timestamp();
                         info!("Also setting start time to {}", start_time);
                     }
-                    (false, Result::Ok(_)) => {}
+                    (false, Result::Ok(_)) => {
+                        info!("No real results found");
+                    }
                     (_, Result::Err(e)) => error!("Hit an error while fetching: {}", e),
                 }
             }
         }
     });
 
-    discord_events.await?;
-    forever.await?
+    match forever.await {
+        Result::Ok(s) => info!("Finished? {:?}", s),
+        Result::Err(e) => error!("Some error occured here. {:?}", e),
+    };
+    match discord_events.await {
+        Result::Ok(s) => info!("Finished? {:?}", s),
+        Result::Err(e) => error!("Some error occured here. {:?}", e),
+    };
+    Ok(())
 }
 
 fn update_match(
