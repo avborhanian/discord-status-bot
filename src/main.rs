@@ -463,12 +463,12 @@ async fn main() -> Result<()> {
             }
         }
     });
-
-    match forever.await {
+    match discord_events.await {
         Result::Ok(s) => info!("Finished? {:?}", s),
         Result::Err(e) => error!("Some error occured here. {:?}", e),
     };
-    match discord_events.await {
+
+    match forever.await {
         Result::Ok(s) => info!("Finished? {:?}", s),
         Result::Err(e) => error!("Some error occured here. {:?}", e),
     };
