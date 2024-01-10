@@ -403,7 +403,12 @@ async fn main() -> Result<()> {
             .client(http_client)
             .build(),
     );
-    let discord_events = client.start();
+    let discord_events = tokio::spawn(async move {
+        match client.start().await {
+            Result::Ok(s) => Result::Ok(s),
+            Result::Err(e) => Result::Err(anyhow!(e)),
+        }
+    });
 
     let forever: task::JoinHandle<std::prelude::v1::Result<(), Error>> = task::spawn(async move {
         let discord_client = discord_client.clone();
@@ -463,12 +468,8 @@ async fn main() -> Result<()> {
             }
         }
     });
-    match discord_events.await {
-        Result::Ok(s) => info!("Finished? {:?}", s),
-        Result::Err(e) => error!("Some error occured here. {:?}", e),
-    };
 
-    match forever.await {
+    match futures::future::try_join_all([discord_events, forever]).await {
         Result::Ok(s) => info!("Finished? {:?}", s),
         Result::Err(e) => error!("Some error occured here. {:?}", e),
     };
