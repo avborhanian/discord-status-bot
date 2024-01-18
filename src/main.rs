@@ -12,6 +12,8 @@ use chrono::Datelike;
 use chrono::TimeZone;
 use chrono::Timelike;
 use dotenvy::dotenv;
+use futures::future::FutureExt;
+use futures::select;
 use futures::stream;
 use futures_util::StreamExt;
 use http::Method;
@@ -469,7 +471,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    match futures::future::try_join_all([discord_events, forever]).await {
+    match select! {
+        a_res = discord_events.fuse() => a_res.into(),
+        b_res = forever.fuse() => b_res.into()
+    } {
         Result::Ok(s) => info!("Finished? {:?}", s),
         Result::Err(e) => error!("Some error occured here. {:?}", e),
     };
