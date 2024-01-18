@@ -1,3 +1,4 @@
+#![feature(convert_float_to_int)]
 use core::panic;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -7,7 +8,7 @@ use std::time::Duration;
 
 use crate::models::MatchInfo;
 use anyhow::Result;
-use anyhow::*;
+use anyhow::{anyhow, Error, Ok};
 use chrono::Datelike;
 use chrono::TimeZone;
 use chrono::Timelike;
@@ -19,7 +20,7 @@ use futures_util::StreamExt;
 use http::Method;
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
-use models::*;
+use models::Score;
 use reqwest::header;
 use riven::consts::{PlatformRoute, Queue, RegionalRoute};
 use riven::models::match_v5::Match;
@@ -141,7 +142,7 @@ impl Handler {
             let message = self.current_status.read().await.to_string();
             info!("Len is 0, going to update the status to {}", message);
             match update_discord_status(&message, None).await {
-                Result::Ok(_) => {}
+                Result::Ok(()) => {}
                 Err(e) => error!("Error while updating: {}", e),
             }
         } else {
@@ -204,7 +205,7 @@ impl EventHandler for Handler {
 
             let content = match command.data.name.as_str() {
                 "groups" => commands::groups::run(&ctx, &command.data.options).await,
-                "globetrotters" => commands::globetrotters::run(&ctx, &command.data.options).await,
+                "globetrotters" => commands::globetrotters::run(&ctx, &command.data.options),
                 "register" => commands::register::run(&ctx, &command.data.options).await,
                 _ => "not implemented :(".to_string(),
             };
@@ -303,7 +304,7 @@ impl EventHandler for Handler {
 async fn fetch_summoner_info(riot_api: &RiotApi) -> Result<()> {
     let summoners = fetch_summoners()?;
 
-    for summoner_name in summoners.iter() {
+    for summoner_name in &summoners {
         let maybe_summoner: Option<Summoner> = riot_api!(
             riot_api
                 .summoner_v4()
@@ -311,7 +312,7 @@ async fn fetch_summoner_info(riot_api: &RiotApi) -> Result<()> {
                 .await
         )?;
         if let Some(summoner) = maybe_summoner {
-            update_summoner(&summoner)?
+            update_summoner(&summoner)?;
         } else {
             info!(
                 "No summoner information was found for name {}",
@@ -378,7 +379,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let active_users: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
-    let current_status: Arc<RwLock<String>> = Arc::new(RwLock::new(String::from("")));
+    let current_status: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
 
     // Login with a bot token from the environment
     let token = env::var("DISCORD_BOT_TOKEN").expect("token");
@@ -422,7 +423,7 @@ async fn main() -> Result<()> {
         loop {
             let active_summoners = summoners.iter().map(|s| s.1).collect::<HashSet<_>>();
             let puuids = fetch_puuids(&active_summoners)?;
-            for puuid in puuids.iter() {
+            for puuid in &puuids {
                 interval.tick().await;
                 let matches_fetch: Result<Vec<String>> = riot_api!(
                     riot_api
@@ -445,7 +446,7 @@ async fn main() -> Result<()> {
                         info!("It's a new day, time to scan histories at least once. Current day was {}, now it's {}", current_date, new_start_time);
                         match check_match_history(&riot_api, &discord_client, &current_status).await
                         {
-                            Result::Ok(_) => {}
+                            Result::Ok(()) => {}
                             Result::Err(e) => error!("{}", e),
                         }
                         start_time = chrono::Local::now().timestamp();
@@ -456,7 +457,7 @@ async fn main() -> Result<()> {
                         info!("Some matches were found, scan all histories now. Current time set to {}. Current date is {}", start_time, current_date);
                         match check_match_history(&riot_api, &discord_client, &current_status).await
                         {
-                            Result::Ok(_) => {}
+                            Result::Ok(()) => {}
                             Result::Err(e) => error!("{}", e),
                         }
                         start_time = chrono::Local::now().timestamp();
@@ -472,8 +473,8 @@ async fn main() -> Result<()> {
     });
 
     match select! {
-        a_res = discord_events.fuse() => a_res.into(),
-        b_res = forever.fuse() => b_res.into()
+        a_res = discord_events.fuse() => a_res,
+        b_res = forever.fuse() => b_res
     } {
         Result::Ok(s) => info!("Finished? {:?}", s),
         Result::Err(e) => error!("Some error occured here. {:?}", e),
@@ -559,7 +560,9 @@ fn fetch_summoners() -> Result<HashMap<u64, String>> {
             row.get(1).unwrap(),
         ))
     })?;
-    Ok(query.map(|r| r.unwrap()).collect::<HashMap<u64, String>>())
+    Ok(query
+        .map(std::result::Result::unwrap)
+        .collect::<HashMap<u64, String>>())
 }
 
 async fn fetch_seen_events(
@@ -577,8 +580,7 @@ async fn fetch_seen_events(
     };
     let connection = rusqlite::Connection::open("sqlite.db")?;
     let mut statement = connection.prepare(&format!(
-        "SELECT id, queue_id, win, IFNULL(end_timestamp, 0), MatchInfo FROM match WHERE id IN ({});",
-        match_id_string
+        "SELECT id, queue_id, win, IFNULL(end_timestamp, 0), MatchInfo FROM match WHERE id IN ({match_id_string});"
     ))?;
     let mut seen_matches: HashMap<String, MatchInfo> = HashMap::new();
     statement
@@ -675,7 +677,7 @@ async fn check_match_history(
         }
         if seen_matches.contains_key(&match_id) {
             if let Some(match_info) = seen_matches.get(&match_id) {
-                let queue_id = Queue::try_from(match_info.queue_id.parse::<u16>()?)?;
+                let queue_id = Queue::from(match_info.queue_id.parse::<u16>()?);
                 let game_score = queue_scores.entry(queue_id).or_insert(Score {
                     wins: 0,
                     games: 0,
@@ -700,12 +702,9 @@ async fn check_match_history(
                 .get_match(RegionalRoute::AMERICAS, &match_id)
                 .await
         )?;
-        let match_info = match response {
-            Some(m) => m,
-            None => {
-                error!("Unable to find match id {}", match_id);
-                continue;
-            }
+        let Some(match_info) = response else {
+            error!("Unable to find match id {}", match_id);
+            continue;
         };
 
         update_match_info(
@@ -802,12 +801,9 @@ fn update_match_info(
     pentakillers: &mut Vec<(i64, String)>,
     start_time: i64,
 ) -> Result<()> {
-    let game_end_timestamp = match match_info.info.game_end_timestamp {
-        Some(x) => x,
-        None => {
-            info!("Found the match, but can't get a end timestamp. So continuing.");
-            return Result::Ok(());
-        }
+    let Some(game_end_timestamp) = match_info.info.game_end_timestamp else {
+        info!("Found the match, but can't get a end timestamp. So continuing.");
+        return Result::Ok(());
     };
     if game_end_timestamp < start_time {
         return Result::Ok(());
@@ -827,7 +823,7 @@ fn update_match_info(
     game_score.games += 1;
 
     let queue_id: i64 = {
-        let id: u16 = match_info.info.queue_id.try_into()?;
+        let id: u16 = match_info.info.queue_id.into();
         id.into()
     };
 
@@ -839,7 +835,7 @@ fn update_match_info(
         .unwrap()
         .team_id;
 
-    match match_info
+    if match_info
         .info
         .teams
         .iter()
@@ -847,29 +843,26 @@ fn update_match_info(
         .unwrap()
         .win
     {
-        true => {
-            game_score.wins += 1;
-            update_match(
-                &match_info.metadata.match_id,
-                queue_id,
-                true,
-                game_end_timestamp,
-                match_info,
-            )?
-        }
-        false => {
-            if game_score.warmup < 2 && game_score.wins < 1 {
-                game_score.warmup += 1;
-                game_score.games -= 1;
-            };
-            update_match(
-                &match_info.metadata.match_id,
-                queue_id,
-                false,
-                game_end_timestamp,
-                match_info,
-            )?;
-        }
+        game_score.wins += 1;
+        update_match(
+            &match_info.metadata.match_id,
+            queue_id,
+            true,
+            game_end_timestamp,
+            match_info,
+        )?;
+    } else {
+        if game_score.warmup < 2 && game_score.wins < 1 {
+            game_score.warmup += 1;
+            game_score.games -= 1;
+        };
+        update_match(
+            &match_info.metadata.match_id,
+            queue_id,
+            false,
+            game_end_timestamp,
+            match_info,
+        )?;
     };
 
     if match_info.info.queue_id != Queue::HOWLING_ABYSS_5V5_ARAM {
@@ -940,7 +933,7 @@ async fn check_pentakill_info(
                 formatted_names,
                 names.first().unwrap().replace(' ', "%20"),
                 game_id
-            ))
+            ));
         }
 
         update_highlight_reel(
@@ -952,7 +945,7 @@ async fn check_pentakill_info(
             ),
             discord_auth,
         )
-        .await?
+        .await?;
     }
 
     Ok(())
@@ -1046,9 +1039,9 @@ fn calculate_match_performance(match_info: &Match, discord_puuids: &HashSet<Stri
             .find(|m| m.role == participant.role && m.lane == participant.lane)
             .unwrap();
         let mut score: f64 = log_model.intercept;
-        for param in log_model.params.iter() {
+        for param in &log_model.params {
             score += param.coefficient
-                * (match param.name.as_str() {
+                * f64::from(match param.name.as_str() {
                     "assists" => participant.assists,
                     "goldEarned" => participant.gold_earned,
                     "totalMinionsKilled" => participant.total_minions_killed,
@@ -1081,10 +1074,7 @@ fn calculate_match_performance(match_info: &Match, discord_puuids: &HashSet<Stri
                     "wardsPlaced" => participant.wards_placed,
                     "turretTakedowns" => participant.turret_takedowns.unwrap_or_default(),
                     "pentaKills" => participant.penta_kills,
-                    "firstBloodAssist" => match participant.first_blood_assist {
-                        true => 1,
-                        false => 0,
-                    },
+                    "firstBloodAssist" => i32::from(participant.first_blood_assist),
                     "turretKills" => participant.turret_kills,
                     "totalTimeSpentDead" => participant.total_time_spent_dead,
                     "detectorWardsPlaced" => participant.detector_wards_placed,
@@ -1094,7 +1084,7 @@ fn calculate_match_performance(match_info: &Match, discord_puuids: &HashSet<Stri
                     _ => {
                         return Err(anyhow!("Unhandled param: {}", param.name));
                     }
-                } as f64)
+                })
                 / match param.name.as_str() {
                     "firstBloodAssist" => 1.0,
                     _ => {

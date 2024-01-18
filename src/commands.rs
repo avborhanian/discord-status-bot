@@ -7,17 +7,21 @@ fn number_to_usize(count: &serde_json::Number) -> Result<usize> {
                 return Result::Err(anyhow!(
                     "You should provide a positive number. Zero or less is not allowed."
                 ));
-            } else {
-                i.try_into().unwrap()
             }
+            i.try_into().unwrap()
         }
         (None, Some(f), None) => {
             if f.round() <= 0.0 {
                 return Result::Err(anyhow!(
                     "You should provide a positive number. Zero or less is not allowed."
                 ));
-            } else {
-                (f.round() as u64).try_into().unwrap()
+            }
+            unsafe {
+                f.round()
+                    .abs()
+                    .to_int_unchecked::<u64>()
+                    .try_into()
+                    .unwrap()
             }
         }
         (None, None, Some(u)) => u.try_into().unwrap(),
@@ -57,24 +61,24 @@ pub mod globetrotters {
                     .name("challenge")
                     .description("Which challenge/region you want to complete")
                     .kind(CommandOptionType::Integer)
-                    .add_int_choice("5 Under 5' - Bandle City", 303501)
-                    .add_int_choice("All Hands on Deck - Bilgewater", 303502)
-                    .add_int_choice("FOR DEMACIA - Demacia", 303503)
-                    .add_int_choice("Ice, Ice, Baby - the Freljord", 303504)
-                    .add_int_choice("Everybody was Wuju Fighting - Ionia", 303505)
-                    .add_int_choice("Elemental, My Dear Watson - Ixtal", 303506)
-                    .add_int_choice("Strength Above All - Noxus", 303507)
-                    .add_int_choice("Calculated - Piltover", 303508)
-                    .add_int_choice("Spooky Scary Skeletons - the Shadow Isles", 303509)
-                    .add_int_choice("The Sun Disc Never Sets - Shurima", 303510)
-                    .add_int_choice("Peak Performance - Targon", 303511)
-                    .add_int_choice("(Inhuman Screeching Sounds) - the Void", 303512)
-                    .add_int_choice("Chemtech Comrades - Zaun", 303513)
+                    .add_int_choice("5 Under 5' - Bandle City", 303_501)
+                    .add_int_choice("All Hands on Deck - Bilgewater", 303_502)
+                    .add_int_choice("FOR DEMACIA - Demacia", 303_503)
+                    .add_int_choice("Ice, Ice, Baby - the Freljord", 303_504)
+                    .add_int_choice("Everybody was Wuju Fighting - Ionia", 303_505)
+                    .add_int_choice("Elemental, My Dear Watson - Ixtal", 303_506)
+                    .add_int_choice("Strength Above All - Noxus", 303_507)
+                    .add_int_choice("Calculated - Piltover", 303_508)
+                    .add_int_choice("Spooky Scary Skeletons - the Shadow Isles", 303_509)
+                    .add_int_choice("The Sun Disc Never Sets - Shurima", 303_510)
+                    .add_int_choice("Peak Performance - Targon", 303_511)
+                    .add_int_choice("(Inhuman Screeching Sounds) - the Void", 303_512)
+                    .add_int_choice("Chemtech Comrades - Zaun", 303_513)
                     .required(true)
             })
     }
 
-    pub async fn run(_ctx: &Context, options: &[CommandDataOption]) -> String {
+    pub fn run(_ctx: &Context, options: &[CommandDataOption]) -> String {
         let choice: usize = options
             .iter()
             .find(|o| o.name == "challenge")
@@ -92,7 +96,7 @@ pub mod globetrotters {
 
         let map = HashMap::from([
             (
-                303501,
+                303_501,
                 vec![
                     riven::consts::Champion::RUMBLE,
                     riven::consts::Champion::VEX,
@@ -112,7 +116,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303502,
+                303_502,
                 vec![
                     riven::consts::Champion::TWISTED_FATE,
                     riven::consts::Champion::ILLAOI,
@@ -127,7 +131,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303503,
+                303_503,
                 vec![
                     riven::consts::Champion::LUX,
                     riven::consts::Champion::GALIO,
@@ -143,7 +147,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303504,
+                303_504,
                 [
                     riven::consts::Champion::OLAF,
                     riven::consts::Champion::ANIVIA,
@@ -163,7 +167,7 @@ pub mod globetrotters {
                 .to_vec(),
             ),
             (
-                303505,
+                303_505,
                 vec![
                     riven::consts::Champion::LEE_SIN,
                     riven::consts::Champion::SHEN,
@@ -189,7 +193,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303506,
+                303_506,
                 vec![
                     riven::consts::Champion::NEEKO,
                     riven::consts::Champion::QIYANA,
@@ -201,7 +205,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303507,
+                303_507,
                 vec![
                     riven::consts::Champion::CASSIOPEIA,
                     riven::consts::Champion::LE_BLANC,
@@ -220,7 +224,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303508,
+                303_508,
                 vec![
                     riven::consts::Champion::EZREAL,
                     riven::consts::Champion::SERAPHINE,
@@ -234,7 +238,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303509,
+                303_509,
                 vec![
                     riven::consts::Champion::YORICK,
                     riven::consts::Champion::GWEN,
@@ -251,7 +255,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303510,
+                303_510,
                 vec![
                     riven::consts::Champion::AMUMU,
                     riven::consts::Champion::K_SANTE,
@@ -269,7 +273,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303511,
+                303_511,
                 vec![
                     riven::consts::Champion::SORAKA,
                     riven::consts::Champion::PANTHEON,
@@ -282,7 +286,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303512,
+                303_512,
                 vec![
                     riven::consts::Champion::KOG_MAW,
                     riven::consts::Champion::KAI_SA,
@@ -296,7 +300,7 @@ pub mod globetrotters {
                 ],
             ),
             (
-                303513,
+                303_513,
                 vec![
                     riven::consts::Champion::DR_MUNDO,
                     riven::consts::Champion::URGOT,
@@ -429,12 +433,11 @@ pub mod groups {
             }))
             .map(|c| c.extract())
         {
-            ids_to_ignore.insert(match user_id.parse::<u64>() {
-                Result::Ok(id) => id,
-                Err(_) => {
-                    error!("Was unable to parse the user id {}", user_id);
-                    0
-                }
+            ids_to_ignore.insert(if let Result::Ok(id) = user_id.parse::<u64>() {
+                id
+            } else {
+                error!("Was unable to parse the user id {user_id}");
+                0
             });
         }
 
@@ -443,8 +446,7 @@ pub mod groups {
             .find(|o| o.name == "number_of_groups")
             .and_then(|o| match &o.value {
                 Some(serde_json::Value::Number(n)) => Some(n),
-                Some(_) => None,
-                None => None,
+                Some(_) | None => None,
             });
 
         let max_users = options
@@ -452,8 +454,7 @@ pub mod groups {
             .find(|o| o.name == "max_users")
             .and_then(|o| match &o.value {
                 Some(serde_json::Value::Number(n)) => Some(n),
-                Some(_) => None,
-                None => None,
+                Some(_) | None => None,
             });
 
         let members_to_group = active_members
@@ -483,15 +484,15 @@ pub mod groups {
             }
         };
 
-        generate_groups(members_to_group, total_groups, &mut thread_rng())
+        generate(&members_to_group, total_groups, &mut thread_rng())
     }
 
-    pub fn generate_groups<R: rand::RngCore>(
-        members_to_group: Vec<Member>,
+    pub fn generate<R: rand::RngCore>(
+        members_to_group: &[Member],
         number_of_groups: usize,
         rng: &mut R,
     ) -> String {
-        let mut members_to_group = members_to_group.clone();
+        let mut members_to_group = members_to_group.to_owned();
         members_to_group.shuffle(rng);
 
         let mut results = Vec::new();
@@ -567,7 +568,7 @@ pub mod register {
                     _ => return "Expected a user, found something else.".to_string(),
                 },
                 None => {
-                    return format!("Unable to find the user id. Only saw {:?}", user_option)
+                    return format!("Unable to find the user id. Only saw {user_option:?}")
                         .to_string()
                 }
             },
@@ -583,8 +584,8 @@ pub mod register {
                     if text.is_empty() {
                         return "No name specified".to_string();
                     }
-                    if text.contains("#") {
-                        let mut parts = text.split("#");
+                    if text.contains('#') {
+                        let mut parts = text.split('#');
                         GameId::RiotId(
                             parts.next().unwrap().to_string(),
                             parts.next().unwrap().to_string(),
@@ -602,7 +603,7 @@ pub mod register {
             GameId::RiotId(name, tag) => {
                 let account = riot_api
                     .account_v1()
-                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
+                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, name, tag)
                     .await
                     .unwrap();
                 match account {
@@ -618,7 +619,7 @@ pub mod register {
             }
             GameId::SummonerName(name) => riot_api
                 .summoner_v4()
-                .get_by_summoner_name(riven::consts::PlatformRoute::NA1, &name)
+                .get_by_summoner_name(riven::consts::PlatformRoute::NA1, name)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -631,7 +632,7 @@ pub mod register {
             .execute([
                 &user.name,
                 &match &account {
-                    GameId::RiotId(name, tag) => format!("{}#{}", name, tag),
+                    GameId::RiotId(name, tag) => format!("{name}#{tag}"),
                     GameId::SummonerName(name) => name.to_string(),
                 },
                 &user.id.as_u64().to_string(),
@@ -647,12 +648,12 @@ pub mod register {
                 member_info.account_id,
                 member_info.puuid,
                 match &account {
-                    GameId::RiotId(name, tag) => format!("{}#{}", name, tag),
+                    GameId::RiotId(name, tag) => format!("{name}#{tag}"),
                     GameId::SummonerName(name) => name.to_string(),
                 },
             ])
             .unwrap();
-        return "".to_string();
+        String::new()
     }
 }
 
@@ -667,6 +668,7 @@ pub mod clash {
 
     use super::GameId;
 
+    #[allow(dead_code)]
     pub fn register(
         command: &mut builder::CreateApplicationCommand,
     ) -> &mut builder::CreateApplicationCommand {
@@ -682,6 +684,7 @@ pub mod clash {
             })
     }
 
+    #[allow(dead_code)]
     pub async fn run(_ctx: &Context, options: &[CommandDataOption]) -> Result<String> {
         let riot_api_key: &str = &env::var("RIOT_API_TOKEN").unwrap();
         let riot_api = RiotApi::new(riot_api_key);
@@ -693,8 +696,8 @@ pub mod clash {
                     if text.is_empty() {
                         return Err(anyhow!("No name specified".to_string()));
                     }
-                    if text.contains("#") {
-                        let mut parts = text.split("#");
+                    if text.contains('#') {
+                        let mut parts = text.split('#');
                         GameId::RiotId(
                             parts.next().unwrap().to_string(),
                             parts.next().unwrap().to_string(),
@@ -712,7 +715,7 @@ pub mod clash {
             GameId::RiotId(name, tag) => {
                 let account = riot_api
                     .account_v1()
-                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
+                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, name, tag)
                     .await
                     .unwrap();
                 match account {
@@ -728,7 +731,7 @@ pub mod clash {
             }
             GameId::SummonerName(name) => riot_api
                 .summoner_v4()
-                .get_by_summoner_name(riven::consts::PlatformRoute::NA1, &name)
+                .get_by_summoner_name(riven::consts::PlatformRoute::NA1, name)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -742,24 +745,23 @@ pub mod clash {
             .clash_v1()
             .get_tournaments(riven::consts::PlatformRoute::NA1)
             .await?;
-        clash_tournaments.iter().filter(|t| {
+        let _ = clash_tournaments.iter().filter(|t| {
             t.schedule
                 .iter()
                 .any(|phase| phase.start_time <= chrono::Local::now().timestamp_micros())
         });
-        let team_ids = clash_players
+        let _team_ids = clash_players
             .iter()
-            .filter(|p| p.team_id.is_some())
-            .map(|player| player.team_id.as_ref().unwrap())
+            .filter_map(|player| player.team_id.as_ref())
             .map(|team_id| async {
-                let team_fetch = riot_api
+                let _team_fetch = riot_api
                     .clash_v1()
                     .get_team_by_id(riven::consts::PlatformRoute::NA1, team_id)
                     .await
                     .unwrap();
             });
 
-        Ok("".to_string())
+        Ok(String::new())
     }
 }
 

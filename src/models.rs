@@ -11,5 +11,6 @@ pub struct MatchInfo {
     pub queue_id: String,
     pub win: bool,
     pub end_timestamp: chrono::NaiveDateTime,
+    #[allow(clippy::struct_field_names)]
     pub match_info: Option<Match>,
 }
