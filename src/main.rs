@@ -1,4 +1,3 @@
-#![feature(convert_float_to_int)]
 use core::panic;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -463,9 +462,7 @@ async fn main() -> Result<()> {
                         start_time = chrono::Local::now().timestamp();
                         info!("Also setting start time to {}", start_time);
                     }
-                    (false, Result::Ok(_)) => {
-                        info!("No real results found");
-                    }
+                    (false, Result::Ok(_)) => {}
                     (_, Result::Err(e)) => error!("Hit an error while fetching: {}", e),
                 }
             }
