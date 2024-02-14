@@ -680,6 +680,13 @@ async fn check_match_history(
                     games: 0,
                     warmup: 0,
                 });
+                if let Some(info) = &match_info.match_info {
+                    if let Some(participant) = info.info.participants.first() {
+                        if participant.game_ended_in_early_surrender {
+                            continue;
+                        }
+                    }
+                }
                 game_score.games += 1;
                 if match_info.win {
                     game_score.wins += 1;
@@ -817,7 +824,16 @@ fn update_match_info(
             games: 0,
             warmup: 0,
         });
-    game_score.games += 1;
+
+    let early_surrender = match_info
+        .info
+        .participants
+        .first()
+        .unwrap()
+        .game_ended_in_early_surrender;
+    if !early_surrender {
+        game_score.games += 1;
+    }
 
     let queue_id: i64 = {
         let id: u16 = match_info.info.queue_id.into();
@@ -840,7 +856,9 @@ fn update_match_info(
         .unwrap()
         .win
     {
-        game_score.wins += 1;
+        if !early_surrender {
+            game_score.wins += 1;
+        }
         update_match(
             &match_info.metadata.match_id,
             queue_id,
@@ -849,7 +867,7 @@ fn update_match_info(
             match_info,
         )?;
     } else {
-        if game_score.warmup < 2 && game_score.wins < 1 {
+        if game_score.warmup < 2 && game_score.wins < 1 && !early_surrender {
             game_score.warmup += 1;
             game_score.games -= 1;
         };
