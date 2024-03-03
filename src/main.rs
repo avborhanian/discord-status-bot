@@ -660,6 +660,7 @@ async fn check_match_history(
 
     let seen_matches = fetch_seen_events(&matches).await?;
     let mut pentakillers = Vec::new();
+    let mut dom_earners = Vec::new();
 
     let mut match_list = {
         let list = matches.lock().await;
@@ -717,11 +718,13 @@ async fn check_match_history(
             &queue_ids,
             &puuids,
             &mut pentakillers,
+            &mut dom_earners,
             start_time,
         )?;
     }
 
     check_pentakill_info(pentakillers, discord_client).await?;
+    check_doms_info(dom_earners, discord_client).await?;
 
     let mut queue_scores_msgs = queue_scores
         .iter()
@@ -803,6 +806,7 @@ fn update_match_info(
     queue_ids: &HashMap<Queue, &str>,
     puuids: &HashSet<String>,
     pentakillers: &mut Vec<(i64, String)>,
+    dom_earners: &mut Vec<(i64, String)>,
     start_time: i64,
 ) -> Result<()> {
     let Some(game_end_timestamp) = match_info.info.game_end_timestamp else {
@@ -879,6 +883,16 @@ fn update_match_info(
             match_info,
         )?;
     };
+
+    dom_earners.extend(
+        match_info
+            .info
+            .participants
+            .iter()
+            .filter(|p| puuids.clone().contains(&p.puuid))
+            .filter(|p| p.kills == 5 && p.assists == 5 && p.deaths == 5)
+            .map(|p| (match_info.info.game_id, p.summoner_name.clone())),
+    );
 
     if match_info.info.queue_id != Queue::HOWLING_ABYSS_5V5_ARAM {
         pentakillers.extend(
@@ -957,6 +971,83 @@ async fn check_pentakill_info(
                 names,
                 if len > 1 { "s" } else { "" },
                 pentakill_links.join("\n")
+            ),
+            discord_auth,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn check_doms_info(
+    mut dom_earners: Vec<(i64, String)>,
+    discord_auth: &Arc<serenity::http::Http>,
+) -> Result<()> {
+    if !dom_earners.is_empty() {
+        let user_info = fetch_discord_usernames()?;
+        let mut dom_earners_by_name: Vec<_> = dom_earners
+            .iter()
+            .map(|s| format!("<@{}>", *user_info.get(&s.1.to_lowercase()).unwrap()))
+            .collect::<HashSet<_>>()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        dom_earners_by_name.sort();
+        dom_earners.sort();
+
+        let mut dom_games: HashMap<i64, Vec<String>> = HashMap::new();
+        for (game_id, name) in dom_earners {
+            let game_info = dom_games.entry(game_id).or_default();
+            game_info.push(name);
+        }
+
+        let len = dom_earners_by_name.len();
+        let names: String = match len {
+            1 => dom_earners_by_name.first().unwrap().to_string(),
+            2 => format!(
+                "{} and {}",
+                dom_earners_by_name.first().unwrap(),
+                dom_earners_by_name.last().unwrap()
+            ),
+            _ => format!(
+                "{}, and {}",
+                dom_earners_by_name[0..len - 2].join(", "),
+                dom_earners_by_name.last().unwrap()
+            ),
+        };
+
+        let mut dom_links = Vec::new();
+
+        for (game_id, names) in dom_games {
+            let formatted_names: String = match len {
+                1 => names.first().unwrap().to_string(),
+                2 => format!("{} and {}", names.first().unwrap(), names.last().unwrap()),
+                _ => format!(
+                    "{}, and {}",
+                    names[0..len - 2].join(", "),
+                    names.last().unwrap()
+                ),
+            };
+            dom_links.push(format!(
+                "[{}'s dom game here](https://blitz.gg/lol/match/na1/{}/{})",
+                formatted_names,
+                names.first().unwrap().replace(' ', "%20"),
+                game_id
+            ));
+        }
+
+        update_highlight_reel("🚨 SOMEONE JUST GOT DOMS 🚨", discord_auth).await?;
+        update_highlight_reel(
+            "https://tenor.com/view/dominos-dominos-pizza-pizza-dominos-guy-gif-7521435",
+            discord_auth,
+        )
+        .await?;
+        update_highlight_reel(
+            &format!(
+                "{} just earned doms! Here's their games:\n{}",
+                names,
+                dom_links.join("\n")
             ),
             discord_auth,
         )

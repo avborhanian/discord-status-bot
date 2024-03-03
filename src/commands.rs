@@ -771,7 +771,7 @@ mod tests {
     use rand::{rngs::SmallRng, SeedableRng};
     use serenity::model::prelude::Member;
 
-    use crate::commands::groups::generate_groups;
+    use crate::commands::groups::generate;
 
     fn member(id: u64, nick_name: &str) -> Member {
         serde_json::from_str(&format!(
@@ -795,8 +795,8 @@ mod tests {
     #[test]
     fn splits_two_users_evenly() {
         let mut rng = SmallRng::seed_from_u64(528);
-        let value = generate_groups(
-            vec![member(123, "Test User"), member(234, "Test User 2")],
+        let value = generate(
+            &vec![member(123, "Test User"), member(234, "Test User 2")],
             2,
             &mut rng,
         );
@@ -805,9 +805,9 @@ mod tests {
 
     #[test]
     fn splits_three_users_into_two_groups() {
-        let mut rng = SmallRng::seed_from_u64(528);
-        let value = generate_groups(
-            vec![
+        let mut rng: SmallRng = SmallRng::seed_from_u64(528);
+        let value = generate(
+            &vec![
                 member(123, "Test User"),
                 member(234, "Test User 2"),
                 member(345, "Test User 3"),
@@ -821,8 +821,8 @@ mod tests {
     #[test]
     fn warns_if_too_many_groups() {
         let mut rng = SmallRng::seed_from_u64(528);
-        let value = generate_groups(
-            vec![
+        let value = generate(
+            &vec![
                 member(123, "Test User"),
                 member(234, "Test User 2"),
                 member(345, "Test User 3"),
@@ -836,8 +836,8 @@ mod tests {
     #[test]
     fn splits_into_more_than_two_groups() {
         let mut rng = SmallRng::seed_from_u64(528);
-        let value = generate_groups(
-            vec![
+        let value = generate(
+            &vec![
                 member(123, "Test User"),
                 member(234, "Test User 2"),
                 member(345, "Test User 3"),
@@ -854,8 +854,8 @@ mod tests {
     #[test]
     fn splitting_20_players_into_4_groups() {
         let mut rng = SmallRng::seed_from_u64(528);
-        let value = generate_groups(
-            (1..21)
+        let value = generate(
+            &(1..21)
                 .map(|i| member(i, &format!("Test User {}", i)))
                 .collect::<Vec<_>>(),
             4,
