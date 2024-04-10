@@ -728,6 +728,7 @@ async fn check_match_history(
 
     let mut queue_scores_msgs = queue_scores
         .iter()
+        .filter(|(_, score)| score.games > 0 || score.warmup > 0)
         .map(|(queue_id, score)| {
             let game_mode = queue_ids.get(queue_id).unwrap();
             if score.warmup > 0 && score.games == 0 && *queue_id != Queue::SUMMONERS_RIFT_CLASH {
