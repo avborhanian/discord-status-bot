@@ -656,7 +656,7 @@ async fn check_match_history(
                             continue;
                         }
                     }
-                    if info.info.queue_id == Queue::RINGS_OF_WRATH_ARENA_CHERRY_GAMES {
+                    if info.info.queue_id == Queue::ARENA_2V2V2V2_CHERRY {
                         game_score.games += 1;
                         // We instead need to do top finishes/wins/games.
                         let mut seen_uuids = HashSet::new();
@@ -718,7 +718,7 @@ async fn check_match_history(
         .filter(|(_, score)| score.games > 0 || score.warmup > 0)
         .map(|(queue_id, score)| {
             let game_mode = queue_ids.get(queue_id).unwrap();
-            if *queue_id == Queue::RINGS_OF_WRATH_ARENA_CHERRY_GAMES {
+            if *queue_id == Queue::ARENA_2V2V2V2_CHERRY {
                 return format!(
                     "{game_mode}::\u{2006}{}-{}-{}",
                     score.wins,
@@ -851,7 +851,7 @@ fn update_match_info(
         .unwrap()
         .team_id;
 
-    if match_info.info.queue_id == Queue::RINGS_OF_WRATH_ARENA_CHERRY_GAMES {
+    if match_info.info.queue_id == Queue::ARENA_2V2V2V2_CHERRY {
         // We instead need to do top finishes/wins/games.
         let mut seen_uuids = HashSet::new();
         for participant in match_info.info.participants.iter() {
