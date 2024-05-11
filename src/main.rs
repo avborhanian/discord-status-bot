@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::models::MatchInfo;
 use anyhow::Result;
 use anyhow::{anyhow, Error, Ok};
+use chrono::DateTime;
 use chrono::Datelike;
 use chrono::TimeZone;
 use chrono::Timelike;
@@ -185,7 +186,8 @@ impl EventHandler for Handler {
                     .create_application_command(|command| {
                         commands::globetrotters::register(command)
                     })
-                    .create_application_command(|command| commands::register::register(command))
+                // TODO: Re-enable once register fixed.
+                // .create_application_command(|command| commands::register::register(command))
             },
         )
         .await
@@ -205,7 +207,8 @@ impl EventHandler for Handler {
             let content = match command.data.name.as_str() {
                 "groups" => commands::groups::run(&ctx, &command.data.options).await,
                 "globetrotters" => commands::globetrotters::run(&ctx, &command.data.options),
-                "register" => commands::register::run(&ctx, &command.data.options).await,
+                // TODO: Re-enable once register fixed.
+                // "register" => commands::register::run(&ctx, &command.data.options).await,
                 _ => "not implemented :(".to_string(),
             };
 
@@ -297,29 +300,6 @@ impl EventHandler for Handler {
             (self.users.read().await).len()
         );
     }
-}
-
-#[allow(dead_code)]
-async fn fetch_summoner_info(riot_api: &RiotApi) -> Result<()> {
-    let summoners = fetch_summoners()?;
-
-    for summoner_name in &summoners {
-        let maybe_summoner: Option<Summoner> = riot_api!(
-            riot_api
-                .summoner_v4()
-                .get_by_summoner_name(PlatformRoute::NA1, summoner_name.1)
-                .await
-        )?;
-        if let Some(summoner) = maybe_summoner {
-            update_summoner(&summoner)?;
-        } else {
-            info!(
-                "No summoner information was found for name {}",
-                summoner_name.1
-            );
-        }
-    }
-    Ok(())
 }
 
 fn get_start_time() -> Result<i64> {
@@ -535,19 +515,6 @@ fn fetch_puuids(summoners: &HashSet<&String>) -> Result<HashSet<String>> {
     Ok(puuids)
 }
 
-fn update_summoner(summoner: &Summoner) -> Result<()> {
-    let connection = rusqlite::Connection::open("sqlite.db")?;
-    let mut statement = connection
-        .prepare("UPDATE Summoner SET id = ?1, accountid = ?2, puuid = ?3 WHERE Name = ?4;")?;
-    statement.execute([
-        &summoner.id,
-        &summoner.account_id,
-        &summoner.puuid,
-        &summoner.name,
-    ])?;
-    Ok(())
-}
-
 fn fetch_summoners() -> Result<HashMap<u64, String>> {
     let connection = rusqlite::Connection::open("sqlite.db")?;
     let mut statement = connection.prepare("SELECT DiscordId, SummonerName FROM USER;")?;
@@ -612,6 +579,7 @@ async fn check_match_history(
         (Queue::SUMMONERS_RIFT_5V5_RANKED_FLEX, "Flex"),
         (Queue::HOWLING_ABYSS_5V5_ARAM, "ARAM"),
         (Queue::SUMMONERS_RIFT_CLASH, "Clash"),
+        (Queue::RINGS_OF_WRATH_ARENA_CHERRY_GAMES, "Arena"),
     ]);
     let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
     let start_time = get_start_time()?;
@@ -680,11 +648,30 @@ async fn check_match_history(
                     wins: 0,
                     games: 0,
                     warmup: 0,
+                    top_finishes: 0,
                 });
                 if let Some(info) = &match_info.match_info {
                     if let Some(participant) = info.info.participants.first() {
                         if participant.game_ended_in_early_surrender {
                             continue;
+                        }
+                    }
+                    if info.info.queue_id == Queue::RINGS_OF_WRATH_ARENA_CHERRY_GAMES {
+                        game_score.games += 1;
+                        // We instead need to do top finishes/wins/games.
+                        let mut seen_uuids = HashSet::new();
+                        for participant in info.info.participants.iter() {
+                            if puuids.contains(&participant.puuid) {
+                                let position = participant.placement.unwrap();
+                                if seen_uuids.insert(position) {
+                                    if position <= 4 {
+                                        game_score.top_finishes += 1;
+                                    }
+                                    if position == 1 {
+                                        game_score.wins += 1;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -731,7 +718,17 @@ async fn check_match_history(
         .filter(|(_, score)| score.games > 0 || score.warmup > 0)
         .map(|(queue_id, score)| {
             let game_mode = queue_ids.get(queue_id).unwrap();
-            if score.warmup > 0 && score.games == 0 && *queue_id != Queue::SUMMONERS_RIFT_CLASH {
+            if *queue_id == Queue::RINGS_OF_WRATH_ARENA_CHERRY_GAMES {
+                return format!(
+                    "{game_mode}::\u{2006}{}-{}-{}",
+                    score.wins,
+                    score.top_finishes - score.wins,
+                    score.games - score.top_finishes
+                );
+            } else if score.warmup > 0
+                && score.games == 0
+                && *queue_id != Queue::SUMMONERS_RIFT_CLASH
+            {
                 return format!("{game_mode}: 🏃");
             }
             format!(
@@ -828,6 +825,7 @@ fn update_match_info(
             wins: 0,
             games: 0,
             warmup: 0,
+            top_finishes: 0,
         });
 
     let early_surrender = match_info
@@ -853,7 +851,30 @@ fn update_match_info(
         .unwrap()
         .team_id;
 
-    if match_info
+    if match_info.info.queue_id == Queue::RINGS_OF_WRATH_ARENA_CHERRY_GAMES {
+        // We instead need to do top finishes/wins/games.
+        let mut seen_uuids = HashSet::new();
+        for participant in match_info.info.participants.iter() {
+            if puuids.contains(&participant.puuid) {
+                let position = participant.placement.unwrap();
+                if seen_uuids.insert(position) {
+                    if position <= 4 {
+                        game_score.top_finishes += 1;
+                    }
+                    if position == 1 {
+                        game_score.wins += 1;
+                    }
+                }
+            }
+        }
+        update_match(
+            &match_info.metadata.match_id,
+            queue_id,
+            false,
+            game_end_timestamp,
+            match_info,
+        )?;
+    } else if match_info
         .info
         .teams
         .iter()
