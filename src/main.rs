@@ -720,7 +720,7 @@ async fn check_match_history(
             let game_mode = queue_ids.get(queue_id).unwrap();
             if *queue_id == Queue::ARENA_2V2V2V2_CHERRY {
                 return format!(
-                    "{game_mode}::\u{2006}{}-{}-{}",
+                    "{game_mode}:\u{2006}{}-{}-{}",
                     score.wins,
                     score.top_finishes - score.wins,
                     score.games - score.top_finishes
