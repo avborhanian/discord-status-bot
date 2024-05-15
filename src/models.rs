@@ -5,6 +5,7 @@ pub struct Score {
     pub games: u32,
     pub warmup: u32,
     pub top_finishes: u32,
+    pub bottom_finishes: u32,
 }
 
 pub struct MatchInfo {

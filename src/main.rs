@@ -649,6 +649,7 @@ async fn check_match_history(
                     games: 0,
                     warmup: 0,
                     top_finishes: 0,
+                    bottom_finishes: 0,
                 });
                 if let Some(info) = &match_info.match_info {
                     if let Some(participant) = info.info.participants.first() {
@@ -664,11 +665,13 @@ async fn check_match_history(
                             if puuids.contains(&participant.puuid) {
                                 let position = participant.placement.unwrap();
                                 if seen_uuids.insert(position) {
-                                    if position <= 4 {
-                                        game_score.top_finishes += 1;
-                                    }
                                     if position == 1 {
                                         game_score.wins += 1;
+                                    }
+                                    if position <= 4 {
+                                        game_score.top_finishes += 1;
+                                    } else {
+                                        game_score.bottom_finishes += 1;
                                     }
                                 }
                             }
@@ -723,7 +726,7 @@ async fn check_match_history(
                     "{game_mode}:\u{2006}{}-{}-{}",
                     score.wins,
                     score.top_finishes - score.wins,
-                    score.games - score.top_finishes
+                    score.bottom_finishes,
                 );
             } else if score.warmup > 0
                 && score.games == 0
@@ -826,6 +829,7 @@ fn update_match_info(
             games: 0,
             warmup: 0,
             top_finishes: 0,
+            bottom_finishes: 0,
         });
 
     let early_surrender = match_info
@@ -858,11 +862,13 @@ fn update_match_info(
             if puuids.contains(&participant.puuid) {
                 let position = participant.placement.unwrap();
                 if seen_uuids.insert(position) {
-                    if position <= 4 {
-                        game_score.top_finishes += 1;
-                    }
                     if position == 1 {
                         game_score.wins += 1;
+                    }
+                    if position <= 4 {
+                        game_score.top_finishes += 1;
+                    } else {
+                        game_score.bottom_finishes += 1;
                     }
                 }
             }
