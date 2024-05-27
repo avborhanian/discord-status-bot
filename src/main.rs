@@ -667,8 +667,7 @@ async fn check_match_history(
                                 if seen_uuids.insert(position) {
                                     if position == 1 {
                                         game_score.wins += 1;
-                                    }
-                                    if position <= 4 {
+                                    } else if position <= 4 {
                                         game_score.top_finishes += 1;
                                     } else {
                                         game_score.bottom_finishes += 1;
@@ -724,9 +723,7 @@ async fn check_match_history(
             if *queue_id == Queue::ARENA_2V2V2V2_CHERRY {
                 return format!(
                     "{game_mode}:\u{2006}{}-{}-{}",
-                    score.wins,
-                    score.top_finishes - score.wins,
-                    score.bottom_finishes,
+                    score.wins, score.top_finishes, score.bottom_finishes,
                 );
             } else if score.warmup > 0
                 && score.games == 0
@@ -864,8 +861,7 @@ fn update_match_info(
                 if seen_uuids.insert(position) {
                     if position == 1 {
                         game_score.wins += 1;
-                    }
-                    if position <= 4 {
+                    } else if position <= 4 {
                         game_score.top_finishes += 1;
                     } else {
                         game_score.bottom_finishes += 1;
