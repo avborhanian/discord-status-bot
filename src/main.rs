@@ -151,7 +151,7 @@ impl Handler {
     }
 }
 
-fn mode_score(queue_id: Queue, score: Score) -> String {
+fn mode_score(queue_id: &Queue, score: &Score) -> String {
     if *queue_id == Queue::ARENA_2V2V2V2_CHERRY {
         return format!(
             "{}\u{2006}-\u{2006}{}\u{2006}-\u{2006}{}",
