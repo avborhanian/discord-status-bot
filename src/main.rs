@@ -151,6 +151,22 @@ impl Handler {
     }
 }
 
+fn mode_score(queue_id: Queue, score: Score) -> String {
+    if *queue_id == Queue::ARENA_2V2V2V2_CHERRY {
+        return format!(
+            "{}\u{2006}-\u{2006}{}\u{2006}-\u{2006}{}",
+            score.wins, score.top_finishes, score.bottom_finishes,
+        );
+    } else if score.warmup > 0 && score.games == 0 && *queue_id != Queue::SUMMONERS_RIFT_CLASH {
+        return format!("🏃");
+    }
+    format!(
+        "{}\u{2006}-\u{2006}{}",
+        score.wins,
+        score.games - score.wins
+    )
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: serenity::prelude::Context, _data: serenity::model::prelude::Ready) {
@@ -720,22 +736,7 @@ async fn check_match_history(
         .filter(|(_, score)| score.games > 0 || score.warmup > 0)
         .map(|(queue_id, score)| {
             let game_mode = queue_ids.get(queue_id).unwrap();
-            if *queue_id == Queue::ARENA_2V2V2V2_CHERRY {
-                return format!(
-                    "{game_mode}:\u{2006}{}-{}-{}",
-                    score.wins, score.top_finishes, score.bottom_finishes,
-                );
-            } else if score.warmup > 0
-                && score.games == 0
-                && *queue_id != Queue::SUMMONERS_RIFT_CLASH
-            {
-                return format!("{game_mode}: 🏃");
-            }
-            format!(
-                "{game_mode}:\u{2006}{}\u{2006}-\u{2006}{}",
-                score.wins,
-                score.games - score.wins
-            )
+            return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
         })
         .collect::<Vec<_>>();
     queue_scores_msgs.sort();
@@ -749,17 +750,7 @@ async fn check_match_history(
                 .iter()
                 .map(|(queue_id, score)| {
                     let game_mode = queue_ids.get(queue_id).unwrap();
-                    if score.warmup > 0
-                        && score.games == 0
-                        && *queue_id != Queue::SUMMONERS_RIFT_CLASH
-                    {
-                        return format!("{game_mode}: 🏃");
-                    }
-                    format!(
-                        "{game_mode}:\u{2006}{}\u{2006}-\u{2006}{}",
-                        score.wins,
-                        score.games - score.wins
-                    )
+                    return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
                 })
                 .collect::<Vec<_>>();
             queue_scores_msgs.sort();
@@ -777,17 +768,7 @@ async fn check_match_history(
                         .next()
                         .unwrap()
                         .to_uppercase();
-                    if score.warmup > 0
-                        && score.games == 0
-                        && *queue_id != Queue::SUMMONERS_RIFT_CLASH
-                    {
-                        return format!("{game_mode}: 🏃");
-                    }
-                    format!(
-                        "{game_mode}:\u{2006}{}\u{2006}-\u{2006}{}",
-                        score.wins,
-                        score.games - score.wins
-                    )
+                    return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
                 })
                 .collect::<Vec<_>>();
             queue_scores_msgs.sort();
