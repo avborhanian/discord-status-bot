@@ -9,9 +9,8 @@ use crate::models::MatchInfo;
 use anyhow::Result;
 use anyhow::{anyhow, Error, Ok};
 use chrono::DateTime;
-use chrono::Datelike;
-use chrono::TimeZone;
 use chrono::Timelike;
+use chrono::{Datelike, TimeZone};
 use dotenvy::dotenv;
 use futures::future::FutureExt;
 use futures::select;
@@ -22,17 +21,15 @@ use http::Method;
 use jemallocator::Jemalloc;
 use models::Score;
 use reqwest::header;
-use riven::consts::{PlatformRoute, Queue, RegionalRoute};
+use riven::consts::{Queue, RegionalRoute};
 use riven::models::match_v5::Match;
-use riven::models::summoner_v4::Summoner;
 use riven::RiotApi;
 use serde_json::to_vec;
 use serde_json::Value;
 use serenity::async_trait;
-use serenity::model::id::ChannelId;
-use serenity::model::prelude::Interaction;
 use serenity::model::prelude::InteractionResponseType;
 use serenity::model::prelude::Member;
+use serenity::model::{id::ChannelId, prelude::Interaction};
 use serenity::prelude::*;
 use tokio::sync::Mutex;
 use tokio::task;
@@ -567,8 +564,7 @@ async fn fetch_seen_events(
                 id: row.get(0).unwrap(),
                 queue_id: row.get(1).unwrap(),
                 win: row.get::<usize, String>(2).unwrap() == "true",
-                end_timestamp: chrono::NaiveDateTime::from_timestamp_millis(row.get(3).unwrap())
-                    .unwrap(),
+                end_timestamp: DateTime::from_timestamp_millis(row.get(3).unwrap()).unwrap(),
                 match_info: serde_json::from_str(&row.get::<usize, String>(4).unwrap()).unwrap(),
             })
         })?

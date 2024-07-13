@@ -1,3 +1,4 @@
+use chrono::Utc;
 use riven::models::match_v5::Match;
 
 pub struct Score {
@@ -12,7 +13,8 @@ pub struct MatchInfo {
     pub id: String,
     pub queue_id: String,
     pub win: bool,
-    pub end_timestamp: chrono::NaiveDateTime,
+    #[allow(dead_code)]
+    pub end_timestamp: chrono::DateTime<Utc>,
     #[allow(clippy::struct_field_names)]
     pub match_info: Option<Match>,
 }
