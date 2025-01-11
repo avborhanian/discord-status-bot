@@ -587,7 +587,7 @@ async fn check_match_history(
         (Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo"),
         (Queue::SUMMONERS_RIFT_5V5_BLIND_PICK, "Blind"),
         (Queue::SUMMONERS_RIFT_5V5_RANKED_FLEX, "Flex"),
-        (Queue::SUMMONERS_RIFT_NORMAL_QUICKPLAY, "Quickplay"),
+        (Queue::SUMMONERS_RIFT_NORMAL_SWIFTPLAY, "Swiftplay"),
         (Queue::HOWLING_ABYSS_5V5_ARAM, "ARAM"),
         (Queue::SUMMONERS_RIFT_CLASH, "Clash"),
         (Queue::ARENA_2V2V2V2_CHERRY, "Arena"),
@@ -737,7 +737,7 @@ async fn check_match_history(
     queue_scores_msgs.sort();
     let mut results = queue_scores_msgs.join("\u{2006}|\u{2006}");
     if queue_scores.is_empty() {
-        results = String::from("No group rift games yet!");
+        results = String::from("No LoL games yet!");
     } else {
         // We're too long, so need to do some tricks to shorten the length.
         if results.chars().collect::<Vec<char>>().len() > 40 {
@@ -756,13 +756,17 @@ async fn check_match_history(
             queue_scores_msgs = queue_scores
                 .iter()
                 .map(|(queue_id, score)| {
-                    let game_mode = queue_ids
-                        .get(queue_id)
-                        .unwrap()
-                        .chars()
-                        .next()
-                        .unwrap()
-                        .to_uppercase();
+                    let game_mode = if queue_ids.get(queue_id) == "Swiftplay" {
+                        "SW"
+                    } else {
+                        queue_ids
+                            .get(queue_id)
+                            .unwrap()
+                            .chars()
+                            .next()
+                            .unwrap()
+                            .to_uppercase()
+                    };
                     return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
                 })
                 .collect::<Vec<_>>();
