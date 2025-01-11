@@ -756,16 +756,17 @@ async fn check_match_history(
             queue_scores_msgs = queue_scores
                 .iter()
                 .map(|(queue_id, score)| {
-                    let game_mode = if queue_ids.get(queue_id) == "Swiftplay" {
-                        "SW"
+                    let game_mode = if let Some(&"Swiftplay") = queue_ids.get(queue_id) {
+                        "Sw"
                     } else {
-                        queue_ids
+                        &queue_ids
                             .get(queue_id)
                             .unwrap()
                             .chars()
                             .next()
                             .unwrap()
                             .to_uppercase()
+                            .collect::<String>()
                     };
                     return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
                 })
