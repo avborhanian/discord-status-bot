@@ -16,7 +16,6 @@ use futures::future::FutureExt;
 use futures::select;
 use futures::stream;
 use futures_util::StreamExt;
-use http::Method;
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use models::Score;
@@ -24,10 +23,10 @@ use reqwest::header;
 use riven::consts::{Queue, RegionalRoute};
 use riven::models::match_v5::Match;
 use riven::RiotApi;
-use serde_json::to_vec;
-use serde_json::Value;
+use serenity::all::CreateInteractionResponse;
+use serenity::all::CreateInteractionResponseMessage;
+use serenity::all::CreateMessage;
 use serenity::async_trait;
-use serenity::model::prelude::InteractionResponseType;
 use serenity::model::prelude::Member;
 use serenity::model::{id::ChannelId, prelude::Interaction};
 use serenity::prelude::*;
@@ -109,10 +108,10 @@ macro_rules! riot_api {
     }};
 }
 
-fn get_channel_id(channel_name: &str) -> Result<u64> {
+fn get_channel_id(channel_name: &str) -> Result<ChannelId> {
     match env::var(channel_name) {
         Result::Ok(s) => match s.parse::<u64>() {
-            Result::Ok(id) => Ok(id),
+            Result::Ok(id) => Ok(id.into()),
             Err(_) => Result::Err(anyhow!(
                 "The provided id '{}' was not a valid u64 number for {}.",
                 s,
@@ -129,16 +128,17 @@ fn get_channel_id(channel_name: &str) -> Result<u64> {
 struct Handler {
     users: Arc<RwLock<HashMap<u64, bool>>>,
     current_status: Arc<RwLock<String>>,
+    discord_auth: Arc<serenity::http::Http>,
 }
 
 impl Handler {
     async fn remove_user(&self, member: &Member) {
         let mut users = self.users.write().await;
-        users.remove(&member.user.id.0);
+        users.remove(&member.user.id.get());
         if users.len() == 0 {
             let message = self.current_status.read().await.to_string();
             info!("Len is 0, going to update the status to {}", message);
-            match update_discord_status(&message, None).await {
+            match update_discord_status(&message, None, &self.discord_auth).await {
                 Result::Ok(()) => {}
                 Err(e) => error!("Error while updating: {}", e),
             }
@@ -176,11 +176,11 @@ impl EventHandler for Handler {
             info!("Games channel passed");
             if let serenity::model::prelude::Channel::Guild(guild_channel) = channel {
                 info!("It's a guild channel");
-                if let Result::Ok(members) = guild_channel.members(ctx.cache).await {
+                if let Result::Ok(members) = guild_channel.members(ctx.cache) {
                     info!("We found members");
                     let mut users = self.users.write().await;
                     for member in members {
-                        users.insert(*member.user.id.as_u64(), false);
+                        users.insert(member.user.id.get(), false);
                     }
                 }
                 info!(
@@ -190,17 +190,14 @@ impl EventHandler for Handler {
             }
         }
 
-        match serenity::model::id::GuildId::set_application_commands(
-            &serenity::model::id::GuildId(get_channel_id("DISCORD_GUILD_ID").unwrap()),
+        match serenity::model::id::GuildId::set_commands(
+            serenity::model::id::GuildId::from(get_channel_id("DISCORD_GUILD_ID").unwrap().get()),
             &ctx.http,
-            |commands| {
-                commands
-                    .create_application_command(|command| commands::groups::register(command))
-                    .create_application_command(|command| {
-                        commands::globetrotters::register(command)
-                    })
-                    .create_application_command(|command| commands::register::register(command))
-            },
+            vec![
+                commands::groups::register(),
+                commands::globetrotters::register(),
+                commands::register::register(),
+            ],
         )
         .await
         {
@@ -210,7 +207,7 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: serenity::prelude::Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
+        if let Interaction::Command(command) = interaction {
             info!(
                 "Received command interaction: {}",
                 command.data.name.as_str()
@@ -229,11 +226,12 @@ impl EventHandler for Handler {
             }
 
             if let Err(why) = command
-                .create_interaction_response(&ctx.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.content(content))
-                })
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new().content(content.clone()),
+                    ),
+                )
                 .await
             {
                 info!("Cannot respond to slash command: {}", why);
@@ -247,7 +245,7 @@ impl EventHandler for Handler {
         old: Option<serenity::model::voice::VoiceState>,
         new: serenity::model::voice::VoiceState,
     ) {
-        let voice_channel_id = ChannelId(get_channel_id("VOICE_CHANNEL_ID").unwrap());
+        let voice_channel_id = ChannelId::from(get_channel_id("VOICE_CHANNEL_ID").unwrap());
         info!(
             "Pattern we're checking is: ({}, {}, {})",
             if old.is_some() { "Some" } else { "None" },
@@ -268,7 +266,7 @@ impl EventHandler for Handler {
             (None, Some(new_channel_id), Some(ref member)) => {
                 if new_channel_id == voice_channel_id {
                     let mut users = self.users.write().await;
-                    users.insert(member.user.id.0, false);
+                    users.insert(member.user.id.get(), false);
                 }
             }
             (Some(old_channel), None | Some(_), None) => {
@@ -294,7 +292,7 @@ impl EventHandler for Handler {
             (Some(old_channel), Some(new_channel_id), Some(ref member)) => {
                 if new_channel_id == voice_channel_id {
                     let mut users = self.users.write().await;
-                    users.insert(member.user.id.0, false);
+                    users.insert(member.user.id.get(), false);
                 } else if let Some(channel_id) = old_channel.channel_id {
                     if voice_channel_id == channel_id {
                         if let Some(old_member) = old_channel.member {
@@ -377,14 +375,6 @@ async fn main() -> Result<()> {
         | GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::GUILD_MESSAGES;
-    let handler = Handler {
-        users: active_users.clone(),
-        current_status: current_status.clone(),
-    };
-    let mut client = Client::builder(&token, intents)
-        .event_handler(handler)
-        .await
-        .expect("Error creating client");
 
     let http_client = reqwest::Client::builder()
         .use_rustls_tls()
@@ -396,6 +386,15 @@ async fn main() -> Result<()> {
             .client(http_client)
             .build(),
     );
+    let handler = Handler {
+        users: active_users.clone(),
+        current_status: current_status.clone(),
+        discord_auth: discord_client.clone(),
+    };
+    let mut client = Client::builder(&token, intents)
+        .event_handler(handler)
+        .await
+        .expect("Error creating client");
     let discord_events = tokio::spawn(async move {
         match client.start().await {
             Result::Ok(s) => Result::Ok(s),
@@ -776,7 +775,7 @@ async fn check_match_history(
         }
     }
 
-    update_discord_status(&results, Some(current_status)).await
+    update_discord_status(&results, Some(current_status), discord_client).await
 }
 
 fn update_match_info(
@@ -1065,6 +1064,7 @@ async fn check_doms_info(
 async fn update_discord_status(
     results: &str,
     current_status: Option<&Arc<RwLock<String>>>,
+    discord_auth: &Arc<serenity::http::Http>,
 ) -> Result<()> {
     if let Some(current_status) = current_status {
         let mut s = current_status.write().await;
@@ -1073,38 +1073,11 @@ async fn update_discord_status(
     }
     let mut content = serde_json::Map::new();
     content.insert(String::from("status"), results.to_string().into());
-    let map: Value = content.into();
-    let owned_map = to_vec(&map.clone())?;
-    let create_message = serenity::http::routing::RouteInfo::CreateMessage {
-        channel_id: get_channel_id("VOICE_CHANNEL_ID")?,
-    };
-    let mut request_builder = serenity::http::request::RequestBuilder::new(create_message);
-    request_builder.body(Some(&owned_map));
-    let mut request = request_builder.build();
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .connection_verbose(true)
-        .build()?;
-    let token = format!("Bot {}", env::var("DISCORD_BOT_TOKEN")?);
-    let mut true_reqwest = request.build(&client, &token, None).await?.build()?;
-    true_reqwest.headers_mut().append(
-        header::HeaderName::from_lowercase(b"x-super-properties")?,
-        header::HeaderValue::from_static(
-            "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzExNi4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTE2LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiJodHRwczovL3d3dy5nb29nbGUuY29tLyIsInJlZmVycmluZ19kb21haW4iOiJ3d3cuZ29vZ2xlLmNvbSIsInNlYXJjaF9lbmdpbmUiOiJnb29nbGUiLCJyZWZlcnJlcl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVsZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6MjI2MjIwLCJjbGllbnRfZXZlbnRfc291cmNlIjpudWxsfQ==",
-        ),
-    );
-    true_reqwest.url_mut().set_path(&format!(
-        "api/v10/channels/{}/voice-status",
-        get_channel_id("VOICE_CHANNEL_ID")?,
-    ));
-    *true_reqwest.method_mut() = Method::PUT;
-    let response = client.execute(true_reqwest).await;
-    match response {
-        Result::Ok(_) => {}
-        Result::Err(e) => {
-            error!("Ran into an error while trying to update the status: {}", e);
-        }
-    }
+
+    discord_auth
+        .edit_voice_status(get_channel_id("VOICE_CHANNEL_ID")?, &content, None)
+        .await?;
+
     Ok(())
 }
 
@@ -1112,13 +1085,13 @@ async fn update_highlight_reel(
     results: &str,
     discord_auth: &Arc<serenity::http::Http>,
 ) -> Result<()> {
-    let mut content = serde_json::Map::new();
-    content.insert(
-        String::from("content"),
-        serde_json::Value::String(results.to_string()),
-    );
+    let message = CreateMessage::new().content(results.to_string());
     match discord_auth
-        .send_message(get_channel_id("UPDATES_CHANNEL_ID")?, &content.into())
+        .send_message(
+            get_channel_id("UPDATES_CHANNEL_ID")?,
+            vec![],
+            (&message).into(),
+        )
         .await
     {
         Result::Ok(message) => info!("Message id is {}", message.id),
@@ -1197,12 +1170,13 @@ fn calculate_match_performance(match_info: &Match, discord_puuids: &HashSet<Stri
                     }
                 })
                 / match param.name.as_str() {
-                    "firstBloodAssist" => 1.0,
+                    "firstBloodAssist" => 1.0f64,
                     _ => {
                         (match &participant.challenges {
                             Some(challenge) => challenge.game_length.unwrap_or(30.0),
                             None => 30.0,
-                        }) / 60.0
+                        }) as f64
+                            / 60.0f64
                     }
                 };
         }

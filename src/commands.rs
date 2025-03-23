@@ -1,37 +1,11 @@
 use anyhow::{anyhow, Result};
 
-fn number_to_usize(count: &serde_json::Number) -> Result<usize> {
-    Result::Ok(match (count.as_i64(), count.as_f64(), count.as_u64()) {
-        (Some(i), None, None) => {
-            if i <= 0 {
-                return Result::Err(anyhow!(
-                    "You should provide a positive number. Zero or less is not allowed."
-                ));
-            }
-            i.try_into().unwrap()
-        }
-        (None, Some(f), None) => {
-            if f.round() <= 0.0 {
-                return Result::Err(anyhow!(
-                    "You should provide a positive number. Zero or less is not allowed."
-                ));
-            }
-            unsafe {
-                f.round()
-                    .abs()
-                    .to_int_unchecked::<u64>()
-                    .try_into()
-                    .unwrap()
-            }
-        }
-        (None, None, Some(u)) => u.try_into().unwrap(),
-        _ => match count.as_str().parse() {
-            Result::Ok(id) => id,
-            Result::Err(_) => {
-                return Result::Err(anyhow!("Unhandled state, please try again later."))
-            }
-        },
-    })
+fn f64_to_usize(value: f64) -> Result<usize> {
+    let result = value.round() as usize;
+    if (result as f64) != value {
+        return Result::Err(anyhow!("The provided value was not a whole number."));
+    }
+    Result::Ok(result)
 }
 
 enum GameId {
@@ -40,42 +14,39 @@ enum GameId {
 }
 
 pub mod globetrotters {
-    use std::collections::HashMap;
-
+    use serenity::all::CommandDataOptionValue;
+    use serenity::all::CreateCommandOption;
     use serenity::builder;
-    use serenity::model::prelude::application_command::CommandDataOption;
-    use serenity::model::prelude::command::CommandOptionType;
+    use serenity::model::application::CommandDataOption;
+    use serenity::model::application::CommandOptionType;
     use serenity::prelude::Context;
+    use std::collections::HashMap;
     use tracing::error;
 
-    use super::number_to_usize;
-
-    pub fn register(
-        command: &mut builder::CreateApplicationCommand,
-    ) -> &mut builder::CreateApplicationCommand {
-        command
-            .name("globetrotters")
+    pub fn register() -> builder::CreateCommand {
+        builder::CreateCommand::new("globetrotters")
             .description("Returns a list of champions required to complete a challenge.")
-            .create_option(|option| {
-                option
-                    .name("challenge")
-                    .description("Which challenge/region you want to complete")
-                    .kind(CommandOptionType::Integer)
-                    .add_int_choice("5 Under 5' - Bandle City", 303_501)
-                    .add_int_choice("All Hands on Deck - Bilgewater", 303_502)
-                    .add_int_choice("FOR DEMACIA - Demacia", 303_503)
-                    .add_int_choice("Ice, Ice, Baby - the Freljord", 303_504)
-                    .add_int_choice("Everybody was Wuju Fighting - Ionia", 303_505)
-                    .add_int_choice("Elemental, My Dear Watson - Ixtal", 303_506)
-                    .add_int_choice("Strength Above All - Noxus", 303_507)
-                    .add_int_choice("Calculated - Piltover", 303_508)
-                    .add_int_choice("Spooky Scary Skeletons - the Shadow Isles", 303_509)
-                    .add_int_choice("The Sun Disc Never Sets - Shurima", 303_510)
-                    .add_int_choice("Peak Performance - Targon", 303_511)
-                    .add_int_choice("(Inhuman Screeching Sounds) - the Void", 303_512)
-                    .add_int_choice("Chemtech Comrades - Zaun", 303_513)
-                    .required(true)
-            })
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "challenge",
+                    "Which challenge/region you want to complete",
+                )
+                .add_int_choice("5 Under 5' - Bandle City", 303_501)
+                .add_int_choice("All Hands on Deck - Bilgewater", 303_502)
+                .add_int_choice("FOR DEMACIA - Demacia", 303_503)
+                .add_int_choice("Ice, Ice, Baby - the Freljord", 303_504)
+                .add_int_choice("Everybody was Wuju Fighting - Ionia", 303_505)
+                .add_int_choice("Elemental, My Dear Watson - Ixtal", 303_506)
+                .add_int_choice("Strength Above All - Noxus", 303_507)
+                .add_int_choice("Calculated - Piltover", 303_508)
+                .add_int_choice("Spooky Scary Skeletons - the Shadow Isles", 303_509)
+                .add_int_choice("The Sun Disc Never Sets - Shurima", 303_510)
+                .add_int_choice("Peak Performance - Targon", 303_511)
+                .add_int_choice("(Inhuman Screeching Sounds) - the Void", 303_512)
+                .add_int_choice("Chemtech Comrades - Zaun", 303_513)
+                .required(true),
+            )
     }
 
     pub fn run(_ctx: &Context, options: &[CommandDataOption]) -> String {
@@ -83,12 +54,12 @@ pub mod globetrotters {
             .iter()
             .find(|o| o.name == "challenge")
             .map_or(0, |o| match &o.value {
-                Some(serde_json::Value::Number(s)) => number_to_usize(s).unwrap_or(0),
-                Some(s) => {
-                    error!("Didn't get a number, instead got {}", s);
+                CommandDataOptionValue::Number(s) => s.floor() as usize,
+                CommandDataOptionValue::Integer(s) => usize::try_from(*s).unwrap_or(0),
+                unknown_option => {
+                    error!("Didn't get a number, instead got {:?}", unknown_option);
                     0
                 }
-                None => 0,
             });
         if choice == 0 {
             return "Unable to handle the result sent for whatever reason. Bug Araam.".to_string();
@@ -349,45 +320,31 @@ pub mod groups {
     use rand::seq::SliceRandom;
     use rand::thread_rng;
     use regex::Regex;
+    use serenity::all::CommandDataOption;
+    use serenity::all::CommandDataOptionValue;
+    use serenity::all::CreateCommand;
+    use serenity::all::CreateCommandOption;
     use serenity::builder;
+    use serenity::model::application::CommandOptionType;
     use serenity::model::guild::Member;
-    use serenity::model::prelude::application_command::CommandDataOption;
-    use serenity::model::prelude::command::CommandOptionType;
     use serenity::prelude::Context;
     use std::{collections::HashSet, env, vec};
     use tracing::{debug, error};
 
-    use crate::commands::number_to_usize;
+    use super::f64_to_usize;
 
-    pub fn register(
-        command: &mut builder::CreateApplicationCommand,
-    ) -> &mut builder::CreateApplicationCommand {
-        command
-            .name("groups")
+    pub fn register() -> builder::CreateCommand {
+        CreateCommand::new("groups")
             .description(
                 "Generates random groups, based on the people currently in the Games channel.",
             )
-            .create_option(|option| {
-                option
-                    .name("ignore")
-                    .description("The users to ignore")
-                    .kind(CommandOptionType::String)
+            .add_option(CreateCommandOption::new(CommandOptionType::String, "ignore", "The users to ignore")
                     .required(false)
-            })
-            .create_option(|option| {
-                option
-                    .name("number_of_groups")
-                    .description("The amount of groups to create. Can't use with option max users.")
-                    .kind(CommandOptionType::Number)
-                    .required(false)
-            })
-            .create_option(|option| {
-                option
-                    .name("max_users")
-                    .description("The maximum amount of users in a group. Can't use with option number of groups.")
-                    .kind(CommandOptionType::Number)
-                    .required(false)
-            })
+        )
+            .add_option(CreateCommandOption::new(CommandOptionType::Number, "number_of_groups", "The amount of groups to create. Can't use with option max users.")
+                    .required(false))
+            .add_option(CreateCommandOption::new(CommandOptionType::Number, "max_users", "The maximum amount of users in a group. Can't use with option number of groups.")
+                    .required(false))
     }
 
     pub async fn run(ctx: &Context, options: &[CommandDataOption]) -> String {
@@ -412,7 +369,7 @@ pub mod groups {
         };
         let active_members: Vec<Member> = match channel {
             serenity::model::prelude::Channel::Guild(guild_channel) => {
-                match guild_channel.members(ctx.cache.as_ref()).await {
+                match guild_channel.members(ctx.cache.as_ref()) {
                     Result::Ok(m) => m,
                     Result::Err(e) => {
                         error!("Error encountered while fetching members: {:?}", e);
@@ -434,9 +391,8 @@ pub mod groups {
         for (_, [user_id]) in
             re.captures_iter(options.iter().find(|o| o.name == "ignore").map_or("", |o| {
                 match &o.value {
-                    Some(serde_json::Value::String(s)) => s,
-                    Some(_) => "",
-                    None => todo!(),
+                    CommandDataOptionValue::String(s) => &s,
+                    _ => "",
                 }
             }))
             .map(|c| c.extract())
@@ -453,31 +409,31 @@ pub mod groups {
             .iter()
             .find(|o| o.name == "number_of_groups")
             .and_then(|o| match &o.value {
-                Some(serde_json::Value::Number(n)) => Some(n),
-                Some(_) | None => None,
+                CommandDataOptionValue::Number(n) => Some(n),
+                _ => None,
             });
 
         let max_users = options
             .iter()
             .find(|o| o.name == "max_users")
             .and_then(|o| match &o.value {
-                Some(serde_json::Value::Number(n)) => Some(n),
-                Some(_) | None => None,
+                CommandDataOptionValue::Number(n) => Some(n),
+                _ => None,
             });
 
         let members_to_group = active_members
             .into_iter()
-            .filter(|member| !ids_to_ignore.contains(member.user.id.as_u64()))
+            .filter(|member| !ids_to_ignore.contains(&member.user.id.get()))
             .collect::<Vec<Member>>();
 
         let total_groups: usize = match (number_of_groups, max_users) {
             (None, None) => 2,
-            (Some(count), None) => match number_to_usize(count) {
+            (Some(count), None) => match f64_to_usize(*count) {
                 Result::Ok(i) => i,
                 Result::Err(e) => return e.to_string(),
             },
             (None, Some(count)) => {
-                let mut max_users_per_group = match number_to_usize(count) {
+                let mut max_users_per_group = match f64_to_usize(*count) {
                     Result::Ok(i) => i,
                     Result::Err(e) => return e.to_string(),
                 };
@@ -522,7 +478,7 @@ pub mod groups {
             results.push(
                 members
                     .iter()
-                    .map(|m| format!("<@{}>", m.user.id.as_u64()))
+                    .map(|m| format!("<@{}>", m.user.id.get()))
                     .collect::<Vec<_>>()
                     .join(" "),
             );
@@ -534,60 +490,56 @@ pub mod groups {
 
 pub mod register {
     use riven::RiotApi;
+    use serenity::all::CommandDataOption;
+    use serenity::all::CommandDataOptionValue;
+    use serenity::all::CreateCommandOption;
     use serenity::builder;
-    use serenity::model::application::interaction::application_command::CommandDataOptionValue;
-    use serenity::model::prelude::application_command::CommandDataOption;
-    use serenity::model::prelude::command::CommandOptionType;
+    use serenity::model::application::CommandOptionType;
     use serenity::prelude::Context;
     use std::env;
 
     use super::GameId;
 
-    pub fn register(
-        command: &mut builder::CreateApplicationCommand,
-    ) -> &mut builder::CreateApplicationCommand {
-        command
-            .name("register")
+    pub fn register() -> builder::CreateCommand {
+        builder::CreateCommand::new("register")
             .description("Adds a new user to the database.")
-            .create_option(|option| {
-                option
-                    .name("user")
-                    .description("The Discord user to add")
-                    .kind(CommandOptionType::User)
-                    .required(true)
-            })
-            .create_option(|option| {
-                option
-                    .name("summoner")
-                    .description("The summoner name / riot id.")
-                    .kind(CommandOptionType::String)
-                    .required(true)
-            })
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::User,
+                    "user",
+                    "The Discord user to add",
+                )
+                .required(true),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "summoner",
+                    "The summoner name / riot id.",
+                )
+                .required(true),
+            )
     }
 
-    pub async fn run(_ctx: &Context, options: &[CommandDataOption]) -> String {
+    pub async fn run(ctx: &Context, options: &[CommandDataOption]) -> String {
         let riot_api_key: &str = &env::var("RIOT_API_TOKEN").unwrap();
         let riot_api = RiotApi::new(riot_api_key);
 
-        let user = match options.iter().find(|o| o.name == "user") {
-            Some(user_option) => match &user_option.resolved {
-                Some(value) => match value {
-                    CommandDataOptionValue::User(user, _) => user,
-                    _ => return "Expected a user, found something else.".to_string(),
-                },
-                None => {
-                    return format!("Unable to find the user id. Only saw {user_option:?}")
-                        .to_string()
-                }
+        let user_id = match options.iter().find(|o| o.name == "user") {
+            Some(user_option) => match &user_option.value {
+                CommandDataOptionValue::User(user) => *user,
+                _ => return "Expected a user, found something else.".to_string(),
             },
             None => {
                 return "Looks like no user id specified.".to_string();
             }
         };
 
+        let user = ctx.http.get_user(user_id).await.unwrap();
+
         let account: GameId = match options.iter().find(|o| o.name == "summoner") {
-            Some(account_option) => match account_option.value.as_ref().unwrap().as_str() {
-                Some(name) => {
+            Some(account_option) => match &account_option.value {
+                CommandDataOptionValue::String(name) => {
                     let text = name.trim();
                     if text.is_empty() {
                         return "No name specified".to_string();
@@ -602,7 +554,7 @@ pub mod register {
                         GameId::SummonerName(text.to_string())
                     }
                 }
-                None => return "No name specified".to_string(),
+                _ => return "No name specified".to_string(),
             },
             None => return "No name specified".to_string(),
         };
@@ -611,7 +563,7 @@ pub mod register {
             GameId::RiotId(name, tag) => {
                 let account = riot_api
                     .account_v1()
-                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, name, tag)
+                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
                     .await
                     .unwrap();
                 match account {
@@ -627,7 +579,7 @@ pub mod register {
             }
             GameId::SummonerName(name) => riot_api
                 .summoner_v4()
-                .get_by_account_id(riven::consts::PlatformRoute::NA1, name)
+                .get_by_account_id(riven::consts::PlatformRoute::NA1, &name)
                 .await
                 .unwrap(),
         };
@@ -642,7 +594,7 @@ pub mod register {
                     GameId::RiotId(name, tag) => format!("{name}#{tag}"),
                     GameId::SummonerName(name) => name.to_string(),
                 },
-                &user.id.as_u64().to_string(),
+                &user.id.get().to_string(),
                 &user.name,
             ])
             .unwrap();
@@ -668,21 +620,21 @@ pub mod register {
 //     use anyhow::{anyhow, Result};
 //     use riven::RiotApi;
 //     use serenity::builder;
-//     use serenity::model::prelude::application_command::CommandDataOption;
-//     use serenity::model::prelude::command::CommandOptionType;
+//     use serenity::model::application::CommandDataOption;
+//     use serenity::model::application::CommandOptionType;
 //     use serenity::prelude::Context;
 //     use std::env;
 
 //     use super::GameId;
 
 //     #[allow(dead_code)]
-//     pub fn register(
-//         command: &mut builder::CreateApplicationCommand,
-//     ) -> &mut builder::CreateApplicationCommand {
-//         command
+//     pub fn register() -> builder::CreateCommand {
+//         command: &mut builder::CreateCommand,
+//     ) -> &mut builder::CreateCommand {
+//         &mut command
 //             .name("clash")
 //             .description("Looks up clash team info based on a player on the enemy team.")
-//             .create_option(|option| {
+//             .add_option(|option: CreateCommandOption| {
 //                 option
 //                     .name("summoner")
 //                     .description("The summoner name / riot id.")
