@@ -1,6 +1,7 @@
 use chrono::Utc;
 use riven::models::match_v5::Match;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Score {
     pub wins: u32,
     pub games: u32,

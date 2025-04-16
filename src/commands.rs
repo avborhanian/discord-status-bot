@@ -316,6 +316,7 @@ pub mod globetrotters {
 }
 
 pub mod groups {
+    use crate::Config;
     use anyhow::Result;
     use rand::seq::SliceRandom;
     use rand::thread_rng;
@@ -328,7 +329,8 @@ pub mod groups {
     use serenity::model::application::CommandOptionType;
     use serenity::model::guild::Member;
     use serenity::prelude::Context;
-    use std::{collections::HashSet, env, vec};
+    use std::sync::Arc;
+    use std::{collections::HashSet, vec};
     use tracing::{debug, error};
 
     use super::f64_to_usize;
@@ -347,19 +349,8 @@ pub mod groups {
                     .required(false))
     }
 
-    pub async fn run(ctx: &Context, options: &[CommandDataOption]) -> String {
-        let channel_id = match env::var("VOICE_CHANNEL_ID") {
-            Result::Ok(s) => match s.parse() {
-                Result::Ok(id) => id,
-                Err(_) => {
-                    return "The provided id was not a valid u64 number.".to_string();
-                }
-            },
-            Err(_) => {
-                return "Unable to find the voice channel.".to_string();
-            }
-        };
-        let channel_fetch = ctx.http.get_channel(channel_id).await;
+    pub async fn run(ctx: &Context, options: &[CommandDataOption], config: Arc<Config>) -> String {
+        let channel_fetch = ctx.http.get_channel(config.voice_channel_id).await;
         let channel;
         if let Result::Ok(c) = channel_fetch {
             channel = c;
@@ -489,6 +480,7 @@ pub mod groups {
 }
 
 pub mod register {
+    use crate::Config;
     use riven::RiotApi;
     use serenity::all::CommandDataOption;
     use serenity::all::CommandDataOptionValue;
@@ -496,7 +488,7 @@ pub mod register {
     use serenity::builder;
     use serenity::model::application::CommandOptionType;
     use serenity::prelude::Context;
-    use std::env;
+    use std::sync::Arc;
 
     use super::GameId;
 
@@ -521,9 +513,8 @@ pub mod register {
             )
     }
 
-    pub async fn run(ctx: &Context, options: &[CommandDataOption]) -> String {
-        let riot_api_key: &str = &env::var("RIOT_API_TOKEN").unwrap();
-        let riot_api = RiotApi::new(riot_api_key);
+    pub async fn run(ctx: &Context, options: &[CommandDataOption], config: Arc<Config>) -> String {
+        let riot_api = RiotApi::new(&config.riot_api_token);
 
         let user_id = match options.iter().find(|o| o.name == "user") {
             Some(user_option) => match &user_option.value {
@@ -623,7 +614,6 @@ pub mod register {
 //     use serenity::model::application::CommandDataOption;
 //     use serenity::model::application::CommandOptionType;
 //     use serenity::prelude::Context;
-//     use std::env;
 
 //     use super::GameId;
 

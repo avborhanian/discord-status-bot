@@ -2,12 +2,13 @@ use core::panic;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::models::MatchInfo;
 use anyhow::Result;
-use anyhow::{anyhow, Error, Ok};
+use anyhow::{anyhow, Context, Error, Ok}; // Added Context
 use chrono::DateTime;
 use chrono::Timelike;
 use chrono::{Datelike, TimeZone};
@@ -16,26 +17,27 @@ use futures::future::FutureExt;
 use futures::select;
 use futures::stream;
 use futures_util::StreamExt;
+use http::HeaderValue;
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use models::Score;
-use reqwest::header;
+use riven::consts::Team;
 use riven::consts::{Queue, RegionalRoute};
 use riven::models::match_v5::Match;
 use riven::RiotApi;
 use serenity::all::CreateInteractionResponse;
 use serenity::all::CreateInteractionResponseMessage;
 use serenity::all::CreateMessage;
+use serenity::all::GuildId;
 use serenity::async_trait;
 use serenity::model::prelude::Member;
 use serenity::model::{id::ChannelId, prelude::Interaction};
 use serenity::prelude::*;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock; // Added RwLock explicitly
 use tokio::task;
 use tokio::time;
 use tracing::{error, info};
-use tracing_subscriber::filter;
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{filter, prelude::*, Layer};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -48,6 +50,65 @@ mod models;
 pub mod log_models {
     include!(concat!(env!("OUT_DIR"), "/log_models.rs"));
     include!(concat!(env!("OUT_DIR"), "/log_models.serde.rs"));
+}
+
+#[derive(Debug, Clone)]
+struct Config {
+    riot_api_token: String,
+    discord_bot_token: String,
+    voice_channel_id: ChannelId,
+    updates_channel_id: ChannelId,
+    discord_guild_id: GuildId,
+    log_path: PathBuf,
+    db_path: PathBuf,
+}
+
+fn load_config() -> Result<Config> {
+    dotenv().ok();
+
+    let riot_api_token = env::var("RIOT_API_TOKEN").context("Missing RIOT_API_TOKEN")?;
+    let discord_bot_token = env::var("DISCORD_BOT_TOKEN").context("Missing DISCORD_BOT_TOKEN")?;
+
+    let voice_channel_id_u64 = env::var("VOICE_CHANNEL_ID")
+        .context("Missing VOICE_CHANNEL_ID")?
+        .parse::<u64>()
+        .context("Invalid VOICE_CHANNEL_ID (must be u64)")?;
+    let voice_channel_id = ChannelId::from(voice_channel_id_u64);
+
+    let updates_channel_id_u64 = env::var("UPDATES_CHANNEL_ID")
+        .context("Missing UPDATES_CHANNEL_ID")?
+        .parse::<u64>()
+        .context("Invalid UPDATES_CHANNEL_ID (must be u64)")?;
+    let updates_channel_id = ChannelId::from(updates_channel_id_u64);
+
+    let discord_guild_id_u64 = env::var("DISCORD_GUILD_ID")
+        .context("Missing DISCORD_GUILD_ID")?
+        .parse::<u64>()
+        .context("Invalid DISCORD_GUILD_ID (must be u64)")?;
+    let discord_guild_id = GuildId::from(discord_guild_id_u64);
+
+    let log_path_str = env::var("LOG_PATH").unwrap_or_else(|_| {
+        if cfg!(target_os = "linux") {
+            "/var/logs/discord"
+        } else {
+            "."
+        }
+        .to_string()
+    });
+    let log_path = PathBuf::from(log_path_str);
+
+    let db_path_str = env::var("DB_PATH").unwrap_or_else(|_| "sqlite.db".to_string());
+    let db_path = PathBuf::from(db_path_str);
+
+    Ok(Config {
+        riot_api_token,
+        discord_bot_token,
+        voice_channel_id,
+        updates_channel_id,
+        discord_guild_id,
+        log_path,
+        db_path,
+    })
 }
 
 macro_rules! riot_api {
@@ -75,7 +136,7 @@ macro_rules! riot_api {
                                 (String::from_utf8(
                                     r.headers()
                                         .get("retry-after")
-                                        .unwrap_or(&header::HeaderValue::from_str("2").unwrap())
+                                        .unwrap_or(&HeaderValue::from_str("2").unwrap())
                                         .as_bytes()
                                         .to_vec(),
                                 )
@@ -108,27 +169,11 @@ macro_rules! riot_api {
     }};
 }
 
-fn get_channel_id(channel_name: &str) -> Result<ChannelId> {
-    match env::var(channel_name) {
-        Result::Ok(s) => match s.parse::<u64>() {
-            Result::Ok(id) => Ok(id.into()),
-            Err(_) => Result::Err(anyhow!(
-                "The provided id '{}' was not a valid u64 number for {}.",
-                s,
-                channel_name
-            )),
-        },
-        Err(_) => Result::Err(anyhow!(
-            "Unable to find the channel '{}' in the environment.",
-            channel_name
-        )),
-    }
-}
-
 struct Handler {
     users: Arc<RwLock<HashMap<u64, bool>>>,
     current_status: Arc<RwLock<String>>,
     discord_auth: Arc<serenity::http::Http>,
+    config: Arc<Config>, // Add config here
 }
 
 impl Handler {
@@ -138,7 +183,14 @@ impl Handler {
         if users.len() == 0 {
             let message = self.current_status.read().await.to_string();
             info!("Len is 0, going to update the status to {}", message);
-            match update_discord_status(&message, None, &self.discord_auth).await {
+            match update_discord_status(
+                &message,
+                None,
+                &self.discord_auth,
+                self.config.voice_channel_id,
+            )
+            .await
+            {
                 Result::Ok(()) => {}
                 Err(e) => error!("Error while updating: {}", e),
             }
@@ -168,11 +220,7 @@ fn mode_score(queue_id: &Queue, score: &Score) -> String {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: serenity::prelude::Context, _data: serenity::model::prelude::Ready) {
         info!("Ready event received");
-        if let Result::Ok(channel) = ctx
-            .http
-            .get_channel(get_channel_id("VOICE_CHANNEL_ID").unwrap())
-            .await
-        {
+        if let Result::Ok(channel) = ctx.http.get_channel(self.config.voice_channel_id).await {
             info!("Games channel passed");
             if let serenity::model::prelude::Channel::Guild(guild_channel) = channel {
                 info!("It's a guild channel");
@@ -191,7 +239,7 @@ impl EventHandler for Handler {
         }
 
         match serenity::model::id::GuildId::set_commands(
-            serenity::model::id::GuildId::from(get_channel_id("DISCORD_GUILD_ID").unwrap().get()),
+            self.config.discord_guild_id,
             &ctx.http,
             vec![
                 commands::groups::register(),
@@ -214,9 +262,13 @@ impl EventHandler for Handler {
             );
 
             let content = match command.data.name.as_str() {
-                "groups" => commands::groups::run(&ctx, &command.data.options).await,
+                "groups" => {
+                    commands::groups::run(&ctx, &command.data.options, self.config.clone()).await
+                }
                 "globetrotters" => commands::globetrotters::run(&ctx, &command.data.options),
-                "register" => commands::register::run(&ctx, &command.data.options).await,
+                "register" => {
+                    commands::register::run(&ctx, &command.data.options, self.config.clone()).await
+                }
                 _ => "not implemented :(".to_string(),
             };
 
@@ -245,7 +297,8 @@ impl EventHandler for Handler {
         old: Option<serenity::model::voice::VoiceState>,
         new: serenity::model::voice::VoiceState,
     ) {
-        let voice_channel_id = ChannelId::from(get_channel_id("VOICE_CHANNEL_ID").unwrap());
+        // Use config for channel ID
+        let voice_channel_id = self.config.voice_channel_id;
         info!(
             "Pattern we're checking is: ({}, {}, {})",
             if old.is_some() { "Some" } else { "None" },
@@ -317,10 +370,12 @@ fn get_start_time() -> Result<i64> {
         datetime = match datetime.checked_sub_days(chrono::naive::Days::new(1)) {
             Some(d) => d,
             None => {
-                return Err(anyhow!("Unable to sub day"));
+                // Use context for better error message
+                return Err(anyhow!("Unable to subtract day from current time"));
             }
         }
     }
+    // Use context for better error message if unwrap fails (though unlikely here)
     datetime = chrono::Local
         .with_ymd_and_hms(
             datetime.date_naive().year(),
@@ -330,29 +385,28 @@ fn get_start_time() -> Result<i64> {
             0,
             0,
         )
-        .unwrap();
+        .single() // Handle ambiguity (e.g., DST change)
+        .context("Failed to construct start time")?;
     Result::Ok(datetime.timestamp())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().expect(".env file not found");
+    // Load config first
+    let config = load_config().context("Failed to load configuration")?;
+    let config_arc = Arc::new(config.clone()); // Clone for Arc
+
     std::panic::set_hook(Box::new(|i| {
         error!("Panic'd: {}", i);
     }));
-    let riot_api_key: &str = &env::var("RIOT_API_TOKEN")?;
-    let riot_api = RiotApi::new(riot_api_key);
-    let file_appender = tracing_appender::rolling::daily(
-        if cfg!(target_os = "linux") {
-            "/var/logs/discord"
-        } else {
-            "./"
-        },
-        "server.log",
-    );
+
+    // Use config for Riot API key
+    let riot_api = RiotApi::new(&config.riot_api_token);
+
+    // Use config for log path
+    let file_appender = tracing_appender::rolling::daily(&config.log_path, "server.log");
     let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
     let console_layer = console_subscriber::ConsoleLayer::builder()
-        // set the address the server is bound to
         .server_addr(([0, 0, 0, 0], 5555))
         .spawn();
 
@@ -366,11 +420,11 @@ async fn main() -> Result<()> {
                 })),
         )
         .init();
+
     let active_users: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
     let current_status: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
 
-    // Login with a bot token from the environment
-    let token = env::var("DISCORD_BOT_TOKEN").expect("token");
+    // Use config for Discord bot token
     let intents = GatewayIntents::non_privileged()
         | GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MEMBERS
@@ -381,41 +435,91 @@ async fn main() -> Result<()> {
         .connection_verbose(true)
         .build()?;
     let discord_client = Arc::new(
-        serenity::http::HttpBuilder::new(&token)
+        serenity::http::HttpBuilder::new(&config.discord_bot_token)
             .ratelimiter_disabled(true)
             .client(http_client)
             .build(),
     );
+
     let handler = Handler {
-        users: active_users.clone(),
+        users: active_users.clone(), // Keep cloning Arcs
         current_status: current_status.clone(),
         discord_auth: discord_client.clone(),
+        config: config_arc.clone(),
     };
-    let mut client = Client::builder(&token, intents)
+
+    let mut client = Client::builder(&config.discord_bot_token, intents)
         .event_handler(handler)
         .await
-        .expect("Error creating client");
+        .context("Error creating Discord client")?;
+
     let discord_events = tokio::spawn(async move {
-        match client.start().await {
-            Result::Ok(s) => Result::Ok(s),
-            Result::Err(e) => Result::Err(anyhow!(e)),
-        }
+        client
+            .start()
+            .await
+            .map_err(|e| anyhow!("Discord client error: {}", e)) // Convert Serenity error
     });
 
-    let forever: task::JoinHandle<std::prelude::v1::Result<(), Error>> = task::spawn(async move {
-        let discord_client = discord_client.clone();
-        let current_status = current_status.clone();
-        let mut start_time = 0;
-        let mut current_date = 0;
-        let mut interval = time::interval(Duration::from_secs(5));
-        let summoners = fetch_summoners()?;
+    // --- Background Task ---
+    // Clone necessary Arcs and config values for the background task
+    let background_config = config_arc.clone();
+    let background_riot_api = Arc::new(riot_api); // Put RiotApi in Arc if needed across awaits
+    let background_discord_client = discord_client.clone();
+    let background_current_status = current_status.clone();
+    // let background_active_users = active_users.clone(); // Not currently used in loop, but if needed
+
+    let forever: task::JoinHandle<Result<()>> = task::spawn(async move {
+        let mut start_time = get_start_time().unwrap_or_else(|e| {
+            error!(
+                "Failed to get initial start time: {}. Using current time.",
+                e
+            );
+            chrono::Local::now().timestamp()
+        });
+        let mut current_date = start_time; // Initialize current_date based on initial start_time logic
+        let mut interval = time::interval(Duration::from_secs(5)); // Consider making interval configurable
+
+        // Use config for DB path
+        let db_path = &background_config.db_path;
+        let summoners = fetch_summoners(db_path)?;
+        let active_summoner_names = summoners.values().cloned().collect::<HashSet<_>>(); // Collect names for puuid fetch
+
         loop {
-            let active_summoners = summoners.iter().map(|s| s.1).collect::<HashSet<_>>();
-            let puuids = fetch_puuids(&active_summoners)?;
+            // Fetch PUUIDs based on currently known summoners
+            // Note: This doesn't automatically pick up newly registered summoners until restart
+            // Consider refetching summoners periodically or triggering an update on registration
+            let puuids = fetch_puuids(db_path, &active_summoner_names)?;
+
+            // Check for new day *before* iterating PUUIDs
+            let new_start_time = get_start_time()?;
+            let is_new_day = current_date < new_start_time;
+
+            if is_new_day {
+                info!("It's a new day, time to scan histories at least once. Current day was {}, now it's {}", current_date, new_start_time);
+                match check_match_history(
+                    &background_riot_api,
+                    &background_discord_client,
+                    &background_current_status,
+                    &background_config,
+                )
+                .await
+                {
+                    Result::Ok(()) => {}
+                    Result::Err(e) => error!("Error during daily history check: {}", e),
+                }
+                start_time = chrono::Local::now().timestamp(); // Reset scan window start
+                info!(
+                    "Daily check done. Setting scan start time to {}",
+                    start_time
+                );
+                current_date = new_start_time; // Update the date marker
+            }
+
+            let mut found_new_matches = false;
             for puuid in &puuids {
-                interval.tick().await;
+                interval.tick().await; // Rate limit per PUUID check
                 let matches_fetch: Result<Vec<String>> = riot_api!(
-                    riot_api
+                    background_riot_api // Use the API client from the closure
                         .match_v5()
                         .get_match_ids_by_puuid(
                             RegionalRoute::AMERICAS,
@@ -423,163 +527,238 @@ async fn main() -> Result<()> {
                             None,
                             None,
                             None,
-                            Some(start_time),
+                            Some(start_time), // Check only since last scan OR daily reset
                             None,
                             None,
                         )
                         .await
                 );
-                let new_start_time = get_start_time()?;
-                match (current_date < new_start_time, matches_fetch) {
-                    (true, _) => {
-                        info!("It's a new day, time to scan histories at least once. Current day was {}, now it's {}", current_date, new_start_time);
-                        match check_match_history(&riot_api, &discord_client, &current_status).await
-                        {
-                            Result::Ok(()) => {}
-                            Result::Err(e) => error!("{}", e),
-                        }
-                        start_time = chrono::Local::now().timestamp();
-                        info!("Also setting start time to {}", start_time);
-                        current_date = new_start_time;
+
+                match matches_fetch {
+                    Result::Ok(match_list) if !match_list.is_empty() => {
+                        info!(
+                            "Found {} new match(es) for a user since timestamp {}. Triggering full scan.",
+                            match_list.len(),
+                            start_time
+                        );
+                        found_new_matches = true;
+                        break; // Found matches for one user, no need to check others, proceed to full scan
                     }
-                    (_, Result::Ok(match_list)) if !match_list.is_empty() => {
-                        info!("Some matches were found, scan all histories now. Current time set to {}. Current date is {}", start_time, current_date);
-                        match check_match_history(&riot_api, &discord_client, &current_status).await
-                        {
-                            Result::Ok(()) => {}
-                            Result::Err(e) => error!("{}", e),
-                        }
-                        start_time = chrono::Local::now().timestamp();
-                        info!("Also setting start time to {}", start_time);
+                    Result::Ok(_) => { /* No new matches for this user */ }
+                    Result::Err(e) => {
+                        error!("Hit an error while fetching matches for {}: {}", puuid, e)
                     }
-                    (false, Result::Ok(_)) => {}
-                    (_, Result::Err(e)) => error!("Hit an error while fetching: {}", e),
                 }
             }
+
+            // If new matches were found for *any* user, run the full history check
+            if found_new_matches {
+                match check_match_history(
+                    &background_riot_api,
+                    &background_discord_client,
+                    &background_current_status,
+                    &background_config,
+                )
+                .await
+                {
+                    Result::Ok(()) => {}
+                    Result::Err(e) => error!("Error during triggered history check: {}", e),
+                }
+                start_time = chrono::Local::now().timestamp(); // Reset scan window start after processing
+                info!(
+                    "Triggered check done. Setting scan start time to {}",
+                    start_time
+                );
+            }
+
+            // If it wasn't a new day and no new matches were found, just wait for the next interval cycle
+            if !is_new_day && !found_new_matches {
+                interval.tick().await; // Ensure we wait at least the interval duration even if loop was fast
+            }
         }
+        // This loop runs forever, so Ok(()) might not be reached unless there's a panic/error
+        // Ok(())
     });
 
+    // --- Main Select Loop ---
     match select! {
-        a_res = discord_events.fuse() => a_res,
-        b_res = forever.fuse() => b_res
+        // Make sure results are handled correctly
+        a_res = discord_events.fuse() => {
+            error!("Discord client task finished unexpectedly.");
+            a_res? // Propagate potential JoinError
+        },
+        b_res = forever.fuse() => {
+            error!("Background check task finished unexpectedly.");
+            b_res? // Propagate potential JoinError
+        }
     } {
-        Result::Ok(s) => info!("Finished? {:?}", s),
-        Result::Err(e) => error!("Some error occured here. {:?}", e),
-    };
-    Ok(())
+        Result::Ok(res) => {
+            // This block might not be reachable if tasks loop forever
+            info!("A task finished successfully? {:?}", res);
+            Ok(res) // Return the inner Result<()>
+        }
+        Result::Err(e) => {
+            error!("A critical task failed: {:?}", e);
+            Err(e) // Propagate the anyhow::Error
+        }
+    }
 }
 
+// --- Database Functions (Accept db_path) ---
+
 fn update_match(
+    db_path: &PathBuf,
     match_id: &String,
     queue_id: i64,
     is_win: bool,
     end_timestamp: i64,
     match_info: &Match,
 ) -> Result<()> {
-    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
     let mut statement = connection
         .prepare("INSERT OR IGNORE INTO match (id, queue_id, win, end_timestamp, MatchInfo) VALUES (?1, ?2, ?3, ?4, ?5);")?;
-    statement.execute([
+    statement.execute(rusqlite::params![
+        // Use params! macro for clarity
         match_id,
-        &queue_id.to_string(),
-        &is_win.to_string(),
-        &end_timestamp.to_string(),
+        queue_id,
+        is_win, // rusqlite handles bool conversion
+        end_timestamp,
         &serde_json::to_string(match_info)?,
     ])?;
     Ok(())
 }
 
-fn fetch_discord_usernames() -> Result<HashMap<String, String>> {
+fn fetch_discord_usernames(db_path: &PathBuf) -> Result<HashMap<String, String>> {
     let mut summoner_map: HashMap<String, String> = HashMap::new();
-    let connection = rusqlite::Connection::open("sqlite.db")?;
+    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
     let mut statement = connection.prepare("SELECT DiscordId, LOWER(summonerName) FROM User")?;
-    statement
-        .query_map([], |row| {
-            let discord_id: String = row.get(0).unwrap();
-            let summoner = row.get(1).unwrap();
-            Result::Ok((discord_id, summoner))
-        })?
-        .for_each(|result| {
-            let (discord_id, summoner) = result.unwrap();
-            summoner_map.insert(summoner, discord_id);
-        });
+    let mut rows = statement.query([])?; // Use query instead of query_map for simpler iteration
+
+    while let Some(row) = rows.next()? {
+        let discord_id: String = row.get(0)?; // Use ? for error handling
+        let summoner: String = row.get(1)?;
+        summoner_map.insert(summoner, discord_id);
+    }
     Ok(summoner_map)
 }
 
-fn fetch_puuids(summoners: &HashSet<&String>) -> Result<HashSet<String>> {
-    let mut puuids = HashSet::new();
-    let connection = rusqlite::Connection::open("sqlite.db")?;
-    let mut statement = connection.prepare(&format!(
-        "SELECT puuid FROM summoner WHERE name in ({})",
-        summoners
-            .iter()
-            .map(|name| format!("'{name}'"))
-            .collect::<Vec<_>>()
-            .join(",")
-    ))?;
-    statement
-        .query_map([], |row| row.get(0))?
-        .for_each(|result| {
-            puuids.insert(result.unwrap());
-        });
+fn fetch_puuids(db_path: &PathBuf, summoner_names: &HashSet<String>) -> Result<HashSet<String>> {
+    if summoner_names.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
+
+    // Use parameterized query
+    let placeholders: String = summoner_names
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT puuid FROM summoner WHERE name IN ({})",
+        placeholders
+    );
+    let mut statement = connection.prepare(&sql)?;
+
+    // Convert HashSet<String> to Vec<&str> for binding
+    let params_vec: Vec<&str> = summoner_names.iter().map(|s| s.as_str()).collect();
+
+    let puuids = statement
+        .query_map(rusqlite::params_from_iter(params_vec), |row| row.get(0))?
+        .collect::<Result<HashSet<String>, _>>()?; // Collect results directly into HashSet
+
     Ok(puuids)
 }
 
-fn fetch_summoners() -> Result<HashMap<u64, String>> {
-    let connection = rusqlite::Connection::open("sqlite.db")?;
+fn fetch_summoners(db_path: &PathBuf) -> Result<HashMap<u64, String>> {
+    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
     let mut statement = connection.prepare("SELECT DiscordId, SummonerName FROM USER;")?;
-    let query = statement.query_map([], |row| {
-        Result::Ok((
-            row.get::<usize, String>(0).unwrap().parse::<u64>().unwrap(),
-            row.get(1).unwrap(),
-        ))
-    })?;
-    Ok(query
-        .map(std::result::Result::unwrap)
-        .collect::<HashMap<u64, String>>())
+    let mut summoners = HashMap::new();
+    let mut rows = statement.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let discord_id_str: String = row.get(0)?;
+        let summoner_name: String = row.get(1)?;
+        let discord_id = discord_id_str
+            .parse::<u64>()
+            .with_context(|| format!("Failed to parse DiscordId '{}' as u64", discord_id_str))?;
+        summoners.insert(discord_id, summoner_name);
+    }
+    Ok(summoners)
 }
 
 async fn fetch_seen_events(
-    matches: &Arc<Mutex<HashMap<String, u8>>>,
+    db_path: &PathBuf,
+    match_ids: &Vec<String>,
 ) -> Result<HashMap<String, MatchInfo>> {
-    let match_id_string = {
-        matches
-            .lock()
-            .await
-            .clone()
-            .into_keys()
-            .map(|id| format!("'{id}'"))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let connection = rusqlite::Connection::open("sqlite.db")?;
-    let mut statement = connection.prepare(&format!(
-        "SELECT id, queue_id, win, IFNULL(end_timestamp, 0), MatchInfo FROM match WHERE id IN ({match_id_string});"
-    ))?;
+    if match_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
+
+    // Use parameterized query
+    let placeholders = match_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, queue_id, win, IFNULL(end_timestamp, 0), MatchInfo FROM match WHERE id IN ({})",
+        placeholders
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(match_ids);
+
     let mut seen_matches: HashMap<String, MatchInfo> = HashMap::new();
-    statement
-        .query_map([], |row| {
-            Result::Ok(MatchInfo {
-                id: row.get(0).unwrap(),
-                queue_id: row.get(1).unwrap(),
-                win: row.get::<usize, String>(2).unwrap() == "true",
-                end_timestamp: DateTime::from_timestamp_millis(row.get(3).unwrap()).unwrap(),
-                match_info: serde_json::from_str(&row.get::<usize, String>(4).unwrap()).unwrap(),
-            })
-        })?
-        .for_each(|result| {
-            let match_info = result.unwrap();
-            seen_matches
-                .entry(match_info.id.clone())
-                .or_insert(match_info);
-        });
+    let rows = statement.query_map(params, |row| {
+        let id: String = row.get(0)?;
+        let queue_id: i64 = row.get(1)?;
+        let win: bool = row.get(2)?; // Read bool directly
+        let timestamp_ms: i64 = row.get(3)?;
+        let match_info_str: Option<String> = row.get(4)?; // Handle potentially NULL MatchInfo
+
+        let end_timestamp = DateTime::from_timestamp_millis(timestamp_ms)
+            .ok_or_else(|| rusqlite::Error::InvalidQuery)?; // Handle potential timestamp error
+
+        // Handle potentially null or invalid JSON
+        let match_info: Option<Match> = match match_info_str {
+            Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| {
+                error!("Failed to parse MatchInfo JSON for match {}: {}", id, e);
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+            _ => None,
+        };
+
+        Result::Ok(MatchInfo {
+            id,
+            queue_id: queue_id.to_string(),
+            win,
+            end_timestamp,
+            match_info,
+        })
+    })?;
+
+    for result in rows {
+        match result {
+            std::result::Result::Ok(match_info) => {
+                seen_matches.insert(match_info.id.clone(), match_info);
+            }
+            Err(e) => {
+                // Log error but continue processing other rows if possible
+                error!("Error processing row in fetch_seen_events: {}", e);
+            }
+        }
+    }
     Ok(seen_matches)
 }
+
+// --- Core Logic Functions (Accept config or relevant parts) ---
 
 async fn check_match_history(
     riot_api: &RiotApi,
     discord_client: &Arc<serenity::http::Http>,
     current_status: &Arc<RwLock<String>>,
+    config: &Config,
 ) -> Result<()> {
     let queue_ids: HashMap<Queue, &str> = HashMap::from([
         (Queue::SUMMONERS_RIFT_5V5_DRAFT_PICK, "Draft"),
@@ -593,13 +772,14 @@ async fn check_match_history(
     ]);
     let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
     let start_time = get_start_time()?;
+    let db_path = &config.db_path; // Get DB path from config
 
-    let summoner_info = fetch_summoners()?;
-    let summoners = summoner_info.values().collect::<HashSet<_>>();
-    let puuids = fetch_puuids(&summoners)?;
+    let summoner_info = fetch_summoners(db_path)?;
+    let summoner_names = summoner_info.values().cloned().collect::<HashSet<_>>();
+    let puuids = fetch_puuids(db_path, &summoner_names)?;
 
-    let matches: Arc<Mutex<HashMap<String, u8>>> = Arc::new(Mutex::new(HashMap::new()));
-
+    // Use a simple Vec to collect all match IDs, then deduplicate
+    let mut all_match_ids: Vec<String> = Vec::new();
     let matches_requests = stream::iter(puuids.clone())
         .map(|puuid| async move {
             riot_api!(
@@ -618,167 +798,278 @@ async fn check_match_history(
                     .await
             )
         })
-        .buffer_unordered(5);
-    let matches_list: Vec<_> = matches_requests.collect().await;
+        .buffer_unordered(5); // Consider making buffer size configurable
 
-    let iter = matches_list.iter();
-    for result in iter {
+    let matches_list: Vec<Result<Vec<String>>> = matches_requests.collect().await;
+
+    for result in matches_list {
         match result {
             Result::Ok(match_ids) => {
-                let mut lock = matches.lock().await;
-                for match_id in match_ids {
-                    *lock.entry(match_id.to_string()).or_insert(0) += 1;
-                }
+                all_match_ids.extend(match_ids);
             }
             Result::Err(e) => {
-                return Err(anyhow!("Encountered error: {:?}", e));
+                // Log error but continue processing other PUUIDs
+                error!("Error fetching match IDs for a PUUID: {:?}", e);
             }
         }
     }
 
-    let seen_matches = fetch_seen_events(&matches).await?;
+    // Deduplicate and sort match IDs
+    let mut unique_match_ids: Vec<String> = all_match_ids
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    unique_match_ids.sort(); // Sort for consistent processing order
+
+    if unique_match_ids.is_empty() {
+        info!("No relevant matches found since start time {}", start_time);
+        // Update status to "No games" if it wasn't already, maybe?
+        // Or just return early if no matches need processing.
+        // Let's update the status to ensure it reflects reality if empty.
+        let results = String::from("No LoL games yet!");
+        update_discord_status(
+            &results,
+            Some(current_status),
+            discord_client,
+            config.voice_channel_id,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Fetch info only for matches we haven't processed yet
+    let seen_matches = fetch_seen_events(db_path, &unique_match_ids).await?;
     let mut pentakillers = Vec::new();
     let mut dom_earners = Vec::new();
 
-    let mut match_list = {
-        let list = matches.lock().await;
-        let result = list.keys().cloned().collect::<Vec<_>>();
-        result
-    };
-    match_list.sort();
-    for match_id in match_list {
-        // Only one of our players in this game, skip the score.
-        if matches.lock().await.get(&match_id).unwrap() == &1 {
-            continue;
+    let mut matches_to_fetch_details = Vec::new();
+    for match_id in &unique_match_ids {
+        if let Some(match_info) = seen_matches.get(match_id) {
+            // Process already seen match for score calculation
+            process_seen_match_score(match_info, &mut queue_scores, &puuids)?;
+        } else {
+            // Add to list of matches needing full details
+            matches_to_fetch_details.push(match_id.clone());
         }
-        if seen_matches.contains_key(&match_id) {
-            if let Some(match_info) = seen_matches.get(&match_id) {
-                let queue_id = Queue::from(match_info.queue_id.parse::<u16>()?);
-                let game_score = queue_scores.entry(queue_id).or_insert(Score {
-                    wins: 0,
-                    games: 0,
-                    warmup: 0,
-                    top_finishes: 0,
-                    bottom_finishes: 0,
-                });
-                if let Some(info) = &match_info.match_info {
-                    if let Some(participant) = info.info.participants.first() {
-                        if participant.game_ended_in_early_surrender {
-                            continue;
-                        }
-                    }
-                    if info.info.queue_id == Queue::ARENA_2V2V2V2_CHERRY {
-                        game_score.games += 1;
-                        // We instead need to do top finishes/wins/games.
-                        let mut seen_uuids = HashSet::new();
-                        for participant in info.info.participants.iter() {
-                            if puuids.contains(&participant.puuid) {
-                                let position = participant.placement.unwrap();
-                                if seen_uuids.insert(position) {
-                                    if position == 1 {
-                                        game_score.wins += 1;
-                                    } else if position <= 4 {
-                                        game_score.top_finishes += 1;
-                                    } else {
-                                        game_score.bottom_finishes += 1;
-                                    }
-                                }
+    }
+
+    // Fetch details for unseen matches concurrently
+    let match_detail_requests = stream::iter(matches_to_fetch_details)
+        .map(|match_id| async move {
+            let result = riot_api!(
+                riot_api
+                    .match_v5()
+                    .get_match(RegionalRoute::AMERICAS, &match_id)
+                    .await
+            );
+            Ok((match_id, result)) // Return ID along with result
+        })
+        .buffer_unordered(10); // Adjust buffer size as needed
+
+    let match_details: Vec<(String, Result<Option<Match>, Error>)> = match_detail_requests
+        .collect::<Vec<Result<(String, Result<Option<Match>, Error>), Error>>>()
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+
+    for (match_id, result) in match_details {
+        match result {
+            Result::Ok(Some(match_info)) => {
+                // Process the newly fetched match details
+                update_match_info(
+                    db_path,
+                    &match_info,
+                    &mut queue_scores,
+                    &queue_ids,
+                    &puuids,
+                    &mut pentakillers,
+                    &mut dom_earners,
+                    start_time,
+                )?;
+            }
+            Result::Ok(None) => {
+                error!("Riot API returned Ok(None) for match id {}", match_id);
+            }
+            Result::Err(e) => {
+                error!("Failed to fetch details for match {}: {:?}", match_id, e);
+            }
+        }
+    }
+
+    check_pentakill_info(pentakillers, discord_client, config).await?;
+    check_doms_info(dom_earners, discord_client, config).await?;
+
+    let status_message = generate_status_message(&queue_scores, &queue_ids);
+
+    update_discord_status(
+        &status_message,
+        Some(current_status),
+        discord_client,
+        config.voice_channel_id,
+    )
+    .await
+}
+
+fn process_seen_match_score(
+    match_info: &MatchInfo,
+    queue_scores: &mut HashMap<Queue, Score>,
+    puuids: &HashSet<String>,
+) -> Result<()> {
+    let queue_id;
+    if let Some(info) = &match_info.match_info {
+        queue_id = info.info.queue_id;
+    } else {
+        return Ok(());
+    }
+
+    let game_score = queue_scores.entry(queue_id).or_insert_with(Score::default);
+
+    let early_surrender = match &match_info.match_info {
+        Some(info) => info
+            .info
+            .participants
+            .first()
+            .map_or(false, |p| p.game_ended_in_early_surrender),
+        None => false,
+    };
+
+    if early_surrender {
+        return Ok(());
+    }
+
+    if queue_id == Queue::ARENA_2V2V2V2_CHERRY {
+        game_score.games += 1;
+        if let Some(info) = &match_info.match_info {
+            let mut seen_placements = HashSet::new();
+            for participant in info.info.participants.iter() {
+                if puuids.contains(&participant.puuid) {
+                    if let Some(position) = participant.placement {
+                        if seen_placements.insert(position) {
+                            if position == 1 {
+                                game_score.wins += 1;
+                            }
+                            if position <= 4 {
+                                game_score.top_finishes += 1;
+                            } else {
+                                game_score.bottom_finishes += 1;
                             }
                         }
                     }
                 }
-                game_score.games += 1;
-                if match_info.win {
-                    game_score.wins += 1;
-                } else if game_score.warmup < 2
-                    && game_score.wins < 1
-                    && queue_id != Queue::SUMMONERS_RIFT_CLASH
-                {
-                    game_score.warmup += 1;
-                    game_score.games -= 1;
-                }
-                continue;
             }
+        } else {
+            error!(
+                "Cannot calculate Arena score for seen match {} without details.",
+                match_info.id
+            );
         }
-        let response = riot_api!(
-            riot_api
-                .match_v5()
-                .get_match(RegionalRoute::AMERICAS, &match_id)
-                .await
-        )?;
-        let Some(match_info) = response else {
-            error!("Unable to find match id {}", match_id);
-            continue;
-        };
-
-        update_match_info(
-            &match_info,
-            &mut queue_scores,
-            &queue_ids,
-            &puuids,
-            &mut pentakillers,
-            &mut dom_earners,
-            start_time,
-        )?;
+    } else {
+        game_score.games += 1;
+        if match_info.win {
+            game_score.wins += 1;
+        } else if game_score.warmup < 2
+            && game_score.wins == 0
+            && queue_id != Queue::SUMMONERS_RIFT_CLASH
+        {
+            game_score.warmup += 1;
+            game_score.games -= 1;
+        }
     }
 
-    check_pentakill_info(pentakillers, discord_client).await?;
-    check_doms_info(dom_earners, discord_client).await?;
+    Ok(())
+}
 
-    let mut queue_scores_msgs = queue_scores
+fn generate_status_message(
+    queue_scores: &HashMap<Queue, Score>,
+    queue_ids: &HashMap<Queue, &str>,
+) -> String {
+    if queue_scores.is_empty() || queue_scores.values().all(|s| s.games == 0 && s.warmup == 0) {
+        return String::from("No LoL games yet!");
+    }
+
+    let mut queue_scores_msgs: Vec<_> = queue_scores
         .iter()
         .filter(|(_, score)| score.games > 0 || score.warmup > 0)
-        .map(|(queue_id, score)| {
-            let game_mode = queue_ids.get(queue_id).unwrap();
-            return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
+        .filter_map(|(queue_id, score)| {
+            queue_ids.get(queue_id).map(|&game_mode| {
+                (
+                    game_mode,
+                    format!("{}:\u{2006}{}", game_mode, mode_score(queue_id, score)),
+                )
+            })
         })
-        .collect::<Vec<_>>();
-    queue_scores_msgs.sort();
-    let mut results = queue_scores_msgs.join("\u{2006}|\u{2006}");
-    if queue_scores.is_empty() {
-        results = String::from("No LoL games yet!");
-    } else {
-        // We're too long, so need to do some tricks to shorten the length.
-        if results.chars().collect::<Vec<char>>().len() > 40 {
-            queue_scores_msgs = queue_scores
-                .iter()
-                .map(|(queue_id, score)| {
-                    let game_mode = queue_ids.get(queue_id).unwrap();
-                    return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
-                })
-                .collect::<Vec<_>>();
-            queue_scores_msgs.sort();
-            results = queue_scores_msgs.join("\u{2006}|\u{2006}");
-        }
-        // We're still too long, so need to do some tricks to shorten the length.
-        if results.chars().collect::<Vec<char>>().len() > 40 {
-            queue_scores_msgs = queue_scores
-                .iter()
-                .map(|(queue_id, score)| {
-                    let game_mode = if let Some(&"Swiftplay") = queue_ids.get(queue_id) {
-                        "Sw"
-                    } else {
-                        &queue_ids
-                            .get(queue_id)
-                            .unwrap()
-                            .chars()
-                            .next()
-                            .unwrap()
-                            .to_uppercase()
-                            .collect::<String>()
-                    };
-                    return format!("{game_mode}:\u{2006}{}", mode_score(queue_id, score));
-                })
-                .collect::<Vec<_>>();
-            queue_scores_msgs.sort();
-            results = queue_scores_msgs.join("\u{2006}|\u{2006}");
-        }
+        .collect();
+    queue_scores_msgs.sort_by(|a, b| a.0.cmp(b.0)); // Sort by game mode name
+
+    let mut results = queue_scores_msgs
+        .iter()
+        .map(|(_, msg)| msg.clone())
+        .collect::<Vec<_>>()
+        .join("\u{2006}|\u{2006}");
+
+    const MAX_STATUS_LEN: usize = 40; // Define max length as constant
+
+    if results.chars().count() <= MAX_STATUS_LEN {
+        return results;
     }
 
-    update_discord_status(&results, Some(current_status), discord_client).await
+    queue_scores_msgs = queue_scores
+        .iter()
+        .filter(|(_, score)| score.games > 0 || score.warmup > 0)
+        .filter_map(|(queue_id, score)| {
+            queue_ids.get(queue_id).map(|&game_mode| {
+                let short_mode = if game_mode == "Swiftplay" {
+                    "Swift"
+                } else {
+                    game_mode
+                };
+                (
+                    game_mode,
+                    format!("{}:\u{2006}{}", short_mode, mode_score(queue_id, score)),
+                )
+            })
+        })
+        .collect();
+    queue_scores_msgs.sort_by(|a, b| a.0.cmp(b.0));
+    results = queue_scores_msgs
+        .iter()
+        .map(|(_, msg)| msg.clone())
+        .collect::<Vec<_>>()
+        .join("\u{2006}|\u{2006}");
+
+    if results.chars().count() <= MAX_STATUS_LEN {
+        return results;
+    }
+
+    queue_scores_msgs = queue_scores
+        .iter()
+        .filter(|(_, score)| score.games > 0 || score.warmup > 0)
+        .filter_map(|(queue_id, score)| {
+            queue_ids.get(queue_id).and_then(|&game_mode| {
+                game_mode.chars().next().map(|initial| {
+                    let short_mode = initial.to_uppercase().to_string();
+                    (
+                        game_mode,
+                        format!("{}:\u{2006}{}", short_mode, mode_score(queue_id, score)),
+                    )
+                })
+            })
+        })
+        .collect();
+    queue_scores_msgs.sort_by(|a, b| a.0.cmp(b.0));
+    results = queue_scores_msgs
+        .iter()
+        .map(|(_, msg)| msg.clone())
+        .collect::<Vec<_>>()
+        .join("\u{2006}|\u{2006}");
+
+    results
 }
 
 fn update_match_info(
+    db_path: &PathBuf,
     match_info: &Match,
     queue_scores: &mut HashMap<Queue, Score>,
     queue_ids: &HashMap<Queue, &str>,
@@ -788,112 +1079,141 @@ fn update_match_info(
     start_time: i64,
 ) -> Result<()> {
     let Some(game_end_timestamp) = match_info.info.game_end_timestamp else {
-        info!("Found the match, but can't get a end timestamp. So continuing.");
-        return Result::Ok(());
+        info!(
+            "Match {} has no game_end_timestamp. Skipping.",
+            match_info.metadata.match_id
+        );
+        return Ok(());
     };
+
     if game_end_timestamp < start_time {
-        return Result::Ok(());
+        info!(
+            "Match {} ended before start_time {}. Skipping.",
+            match_info.metadata.match_id, start_time
+        );
+        return Ok(());
     }
 
     if !queue_ids.contains_key(&match_info.info.queue_id) {
-        return Result::Ok(());
+        info!(
+            "Match {} has untracked queue ID {}. Skipping.",
+            match_info.metadata.match_id, match_info.info.queue_id
+        );
+        return Ok(());
     }
 
     let game_score = queue_scores
         .entry(match_info.info.queue_id)
-        .or_insert(Score {
-            wins: 0,
-            games: 0,
-            warmup: 0,
-            top_finishes: 0,
-            bottom_finishes: 0,
-        });
+        .or_insert_with(Score::default);
 
     let early_surrender = match_info
         .info
         .participants
         .first()
-        .unwrap()
-        .game_ended_in_early_surrender;
-    if !early_surrender {
-        game_score.games += 1;
+        .map_or(false, |p| p.game_ended_in_early_surrender);
+
+    if early_surrender {
+        info!(
+            "Match {} ended in early surrender. Skipping score update.",
+            match_info.metadata.match_id
+        );
+        let queue_id: i64 = u16::from(match_info.info.queue_id).into();
+        update_match(
+            db_path,
+            &match_info.metadata.match_id,
+            queue_id,
+            false,
+            game_end_timestamp,
+            match_info,
+        )?;
+        return Ok(());
     }
 
-    let queue_id: i64 = {
-        let id: u16 = match_info.info.queue_id.into();
-        id.into()
-    };
-
-    let team_id = match_info
+    let our_team_id = match match_info
         .info
         .participants
         .iter()
-        .find(|p| puuids.clone().contains(&p.puuid))
-        .unwrap()
-        .team_id;
+        .find(|p| puuids.contains(&p.puuid))
+    {
+        Some(p) => p.team_id,
+        None => {
+            error!(
+                "Could not find any tracked PUUIDs in match {}. Skipping score update.",
+                match_info.metadata.match_id
+            );
+            return Ok(());
+        }
+    };
+
+    let queue_id: i64 = u16::from(match_info.info.queue_id).into();
+    let mut is_win = false;
 
     if match_info.info.queue_id == Queue::ARENA_2V2V2V2_CHERRY {
-        // We instead need to do top finishes/wins/games.
-        let mut seen_uuids = HashSet::new();
+        game_score.games += 1;
+        let mut seen_placements = HashSet::new();
         for participant in match_info.info.participants.iter() {
             if puuids.contains(&participant.puuid) {
-                let position = participant.placement.unwrap();
-                if seen_uuids.insert(position) {
-                    if position == 1 {
-                        game_score.wins += 1;
-                    } else if position <= 4 {
-                        game_score.top_finishes += 1;
-                    } else {
-                        game_score.bottom_finishes += 1;
+                if let Some(position) = participant.placement {
+                    if seen_placements.insert(position) {
+                        if position == 1 {
+                            is_win = true;
+                            game_score.wins += 1;
+                        }
+                        if position <= 4 {
+                            game_score.top_finishes += 1;
+                        } else {
+                            game_score.bottom_finishes += 1;
+                        }
                     }
                 }
             }
         }
-        update_match(
-            &match_info.metadata.match_id,
-            queue_id,
-            false,
-            game_end_timestamp,
-            match_info,
-        )?;
-    } else if match_info
-        .info
-        .teams
-        .iter()
-        .find(|t| t.team_id == team_id)
-        .unwrap()
-        .win
-    {
-        if !early_surrender {
-            game_score.wins += 1;
-        }
-        update_match(
-            &match_info.metadata.match_id,
-            queue_id,
-            true,
-            game_end_timestamp,
-            match_info,
-        )?;
     } else {
-        if game_score.warmup < 2 && game_score.wins < 1 && !early_surrender {
-            game_score.warmup += 1;
-            game_score.games -= 1;
-        };
-        update_match(
-            &match_info.metadata.match_id,
-            queue_id,
-            false,
-            game_end_timestamp,
-            match_info,
-        )?;
-    };
+        game_score.games += 1;
+        if let Some(team) = match_info
+            .info
+            .teams
+            .iter()
+            .find(|t| t.team_id == our_team_id)
+        {
+            if team.win {
+                is_win = true;
+                game_score.wins += 1;
+            } else if game_score.warmup < 2
+                && game_score.wins == 0 // Only count warmup if no wins yet in this mode
+                && match_info.info.queue_id != Queue::SUMMONERS_RIFT_CLASH
+            {
+                game_score.warmup += 1;
+                game_score.games -= 1; // Don't count warmup towards total games played
+            }
+        } else {
+            error!(
+                "Could not find team data for team ID {} in match {}.",
+                match our_team_id {
+                    Team::BLUE => "Blue",
+                    Team::RED => "Red",
+                    _ => "Other",
+                },
+                match_info.metadata.match_id
+            );
+        }
+    }
+
+    update_match(
+        db_path,
+        &match_info.metadata.match_id,
+        queue_id,
+        is_win,
+        game_end_timestamp,
+        match_info,
+    )?;
 
     dom_earners.extend(
         match_info
             .info
             .participants
             .iter()
-            .filter(|p| puuids.clone().contains(&p.puuid))
+            .filter(|p| puuids.contains(&p.puuid)) // Use borrowed puuids
             .filter(|p| p.kills == 5 && p.assists == 5 && p.deaths == 5)
             .map(|p| (match_info.info.game_id, p.summoner_name.clone())),
     );
@@ -904,7 +1224,7 @@ fn update_match_info(
                 .info
                 .participants
                 .iter()
-                .filter(|p| puuids.clone().contains(&p.puuid))
+                .filter(|p| puuids.contains(&p.puuid)) // Use borrowed puuids
                 .filter(|p| p.penta_kills > 0)
                 .map(|p| (match_info.info.game_id, p.summoner_name.clone())),
         );
@@ -912,151 +1232,142 @@ fn update_match_info(
     Ok(())
 }
 
-async fn check_pentakill_info(
-    mut pentakillers: Vec<(i64, String)>,
-    discord_auth: &Arc<serenity::http::Http>,
-) -> Result<()> {
-    if !pentakillers.is_empty() {
-        let user_info = fetch_discord_usernames()?;
-        let mut pentakillers_by_name: Vec<_> = pentakillers
-            .iter()
-            .map(|s| format!("<@{}>", *user_info.get(&s.1.to_lowercase()).unwrap()))
-            .collect::<HashSet<_>>()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        pentakillers_by_name.sort();
-        pentakillers.sort();
-
-        let mut pentakill_games: HashMap<i64, Vec<String>> = HashMap::new();
-        for (game_id, name) in pentakillers {
-            let game_info = pentakill_games.entry(game_id).or_default();
-            game_info.push(name);
-        }
-
-        let len = pentakillers_by_name.len();
-        let names: String = match len {
-            1 => pentakillers_by_name.first().unwrap().to_string(),
-            2 => format!(
-                "{} and {}",
-                pentakillers_by_name.first().unwrap(),
-                pentakillers_by_name.last().unwrap()
-            ),
-            _ => format!(
-                "{}, and {}",
-                pentakillers_by_name[0..len - 2].join(", "),
-                pentakillers_by_name.last().unwrap()
-            ),
-        };
-
-        let mut pentakill_links = Vec::new();
-
-        for (game_id, names) in pentakill_games {
-            let formatted_names: String = match len {
-                1 => names.first().unwrap().to_string(),
-                2 => format!("{} and {}", names.first().unwrap(), names.last().unwrap()),
-                _ => format!(
-                    "{}, and {}",
-                    names[0..len - 2].join(", "),
-                    names.last().unwrap()
-                ),
-            };
-            pentakill_links.push(format!(
-                "[{}'s pentakill game here](https://blitz.gg/lol/match/na1/{}/{})",
-                formatted_names,
-                names.first().unwrap().replace(' ', "%20"),
-                game_id
-            ));
-        }
-
-        update_highlight_reel(
-            &format!(
-                "Make sure to congratulate {} on their pentakill{}!\n\n{}",
-                names,
-                if len > 1 { "s" } else { "" },
-                pentakill_links.join("\n")
-            ),
-            discord_auth,
-        )
-        .await?;
+// Helper function to format names list
+fn format_names_list(names: &[String]) -> String {
+    match names.len() {
+        0 => String::new(),
+        1 => names[0].clone(),
+        2 => format!("{} and {}", names[0], names[1]),
+        _ => format!(
+            "{}, and {}",
+            names[..names.len() - 1].join(", "),
+            names.last().unwrap()
+        ),
     }
+}
+
+async fn check_pentakill_info(
+    pentakillers: Vec<(i64, String)>,
+    discord_auth: &Arc<serenity::http::Http>,
+    config: &Config,
+) -> Result<()> {
+    if pentakillers.is_empty() {
+        return Ok(());
+    }
+
+    let user_info = fetch_discord_usernames(&config.db_path)?;
+    let mut pentakillers_by_discord_mention: Vec<_> = pentakillers
+        .iter()
+        .filter_map(|(_, summoner_name)| {
+            user_info
+                .get(&summoner_name.to_lowercase())
+                .map(|discord_id| format!("<@{}>", discord_id))
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    pentakillers_by_discord_mention.sort();
+
+    let mut pentakill_games: HashMap<i64, Vec<String>> = HashMap::new();
+    for (game_id, name) in pentakillers {
+        pentakill_games.entry(game_id).or_default().push(name);
+    }
+
+    let mention_names_formatted = format_names_list(&pentakillers_by_discord_mention);
+
+    let mut pentakill_links = Vec::new();
+    for (game_id, names) in pentakill_games {
+        let game_names_formatted = format_names_list(&names);
+        let alternative = String::from("player");
+        let url_encoded_name = urlencoding::encode(names.first().unwrap_or(&alternative));
+        pentakill_links.push(format!(
+            "[{}'s pentakill game here](https://blitz.gg/lol/match/na1/{}/{})",
+            game_names_formatted, url_encoded_name, game_id
+        ));
+    }
+
+    update_highlight_reel(
+        &format!(
+            "Make sure to congratulate {} on their pentakill{}!\n\n{}",
+            mention_names_formatted,
+            if pentakillers_by_discord_mention.len() > 1 {
+                "s"
+            } else {
+                ""
+            },
+            pentakill_links.join("\n")
+        ),
+        discord_auth,
+        config.updates_channel_id,
+    )
+    .await?;
 
     Ok(())
 }
 
 async fn check_doms_info(
-    mut dom_earners: Vec<(i64, String)>,
+    dom_earners: Vec<(i64, String)>,
     discord_auth: &Arc<serenity::http::Http>,
+    config: &Config,
 ) -> Result<()> {
-    if !dom_earners.is_empty() {
-        let user_info = fetch_discord_usernames()?;
-        let mut dom_earners_by_name: Vec<_> = dom_earners
-            .iter()
-            .map(|s| format!("<@{}>", *user_info.get(&s.1.to_lowercase()).unwrap()))
-            .collect::<HashSet<_>>()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        dom_earners_by_name.sort();
-        dom_earners.sort();
-
-        let mut dom_games: HashMap<i64, Vec<String>> = HashMap::new();
-        for (game_id, name) in dom_earners {
-            let game_info = dom_games.entry(game_id).or_default();
-            game_info.push(name);
-        }
-
-        let len = dom_earners_by_name.len();
-        let names: String = match len {
-            1 => dom_earners_by_name.first().unwrap().to_string(),
-            2 => format!(
-                "{} and {}",
-                dom_earners_by_name.first().unwrap(),
-                dom_earners_by_name.last().unwrap()
-            ),
-            _ => format!(
-                "{}, and {}",
-                dom_earners_by_name[0..len - 2].join(", "),
-                dom_earners_by_name.last().unwrap()
-            ),
-        };
-
-        let mut dom_links = Vec::new();
-
-        for (game_id, names) in dom_games {
-            let formatted_names: String = match len {
-                1 => names.first().unwrap().to_string(),
-                2 => format!("{} and {}", names.first().unwrap(), names.last().unwrap()),
-                _ => format!(
-                    "{}, and {}",
-                    names[0..len - 2].join(", "),
-                    names.last().unwrap()
-                ),
-            };
-            dom_links.push(format!(
-                "[{}'s dom game here](https://blitz.gg/lol/match/na1/{}/{})",
-                formatted_names,
-                names.first().unwrap().replace(' ', "%20"),
-                game_id
-            ));
-        }
-
-        update_highlight_reel("🚨 SOMEONE JUST GOT DOMS 🚨", discord_auth).await?;
-        update_highlight_reel(
-            "https://tenor.com/view/dominos-dominos-pizza-pizza-dominos-guy-gif-7521435",
-            discord_auth,
-        )
-        .await?;
-        update_highlight_reel(
-            &format!(
-                "{} just earned doms! Here's their games:\n{}",
-                names,
-                dom_links.join("\n")
-            ),
-            discord_auth,
-        )
-        .await?;
+    if dom_earners.is_empty() {
+        return Ok(());
     }
+
+    let user_info = fetch_discord_usernames(&config.db_path)?;
+    let mut dom_earners_by_discord_mention: Vec<_> = dom_earners
+        .iter()
+        .filter_map(|(_, summoner_name)| {
+            user_info
+                .get(&summoner_name.to_lowercase())
+                .map(|discord_id| format!("<@{}>", discord_id))
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    dom_earners_by_discord_mention.sort();
+
+    let mut dom_games: HashMap<i64, Vec<String>> = HashMap::new();
+    for (game_id, name) in dom_earners {
+        dom_games.entry(game_id).or_default().push(name);
+    }
+
+    let mention_names_formatted = format_names_list(&dom_earners_by_discord_mention);
+
+    let mut dom_links = Vec::new();
+    for (game_id, names) in dom_games {
+        let game_names_formatted = format_names_list(&names);
+        let alternative = String::from("player");
+        let url_encoded_name = urlencoding::encode(names.first().unwrap_or(&alternative));
+        dom_links.push(format!(
+            "[{}'s dom game here](https://blitz.gg/lol/match/na1/{}/{})",
+            game_names_formatted, url_encoded_name, game_id
+        ));
+    }
+
+    update_highlight_reel(
+        "🚨 SOMEONE JUST GOT DOMS 🚨",
+        discord_auth,
+        config.updates_channel_id,
+    )
+    .await?;
+    update_highlight_reel(
+        "https://tenor.com/view/dominos-dominos-pizza-pizza-dominos-guy-gif-7521435",
+        discord_auth,
+        config.updates_channel_id,
+    )
+    .await?;
+    update_highlight_reel(
+        &format!(
+            "{} just earned doms! Here's their game{}:\n{}",
+            mention_names_formatted,
+            if dom_links.len() > 1 { "s" } else { "" },
+            dom_links.join("\n")
+        ),
+        discord_auth,
+        config.updates_channel_id,
+    )
+    .await?;
 
     Ok(())
 }
@@ -1065,18 +1376,34 @@ async fn update_discord_status(
     results: &str,
     current_status: Option<&Arc<RwLock<String>>>,
     discord_auth: &Arc<serenity::http::Http>,
+    voice_channel_id: ChannelId,
 ) -> Result<()> {
-    if let Some(current_status) = current_status {
-        let mut s = current_status.write().await;
-        *s = results.to_string();
-        info!("Current status has been updated to '{}'", results);
+    if let Some(status_arc) = current_status {
+        let mut s = status_arc.write().await;
+        if *s != results {
+            *s = results.to_string();
+            info!("Current status state updated to '{}'", results);
+        } else {
+            info!(
+                "Discord status already matches '{}'. Skipping update.",
+                results
+            );
+            return Ok(());
+        }
+    } else {
+        info!(
+            "Updating Discord status to '{}' (no state tracking)",
+            results
+        );
     }
+
     let mut content = serde_json::Map::new();
     content.insert(String::from("status"), results.to_string().into());
 
     discord_auth
-        .edit_voice_status(get_channel_id("VOICE_CHANNEL_ID")?, &content, None)
+        .edit_voice_status(voice_channel_id, &content, None)
         .await?;
+    info!("Successfully sent voice status update to Discord.");
 
     Ok(())
 }
@@ -1084,126 +1411,16 @@ async fn update_discord_status(
 async fn update_highlight_reel(
     results: &str,
     discord_auth: &Arc<serenity::http::Http>,
+    updates_channel_id: ChannelId,
 ) -> Result<()> {
-    let message = CreateMessage::new().content(results.to_string());
+    let message = CreateMessage::new().content(results);
     match discord_auth
-        .send_message(
-            get_channel_id("UPDATES_CHANNEL_ID")?,
-            vec![],
-            (&message).into(),
-        )
+        .send_message(updates_channel_id, vec![], &message)
         .await
     {
-        Result::Ok(message) => info!("Message id is {}", message.id),
-        Result::Err(e) => error!("Ran into an error while sending. Error: {}", e),
+        Result::Ok(message) => info!("Highlight message sent: {}", message.id),
+        Result::Err(e) => error!("Error sending highlight message: {}", e),
     };
 
     Ok(())
-}
-
-#[allow(dead_code)]
-fn calculate_match_performance(match_info: &Match, discord_puuids: &HashSet<String>) -> Result<()> {
-    let discord_participants = match_info
-        .info
-        .participants
-        .iter()
-        .filter(|p| discord_puuids.contains(&p.puuid))
-        .collect::<Vec<_>>();
-
-    let log_models: log_models::LogModels =
-        serde_json::from_str(include_str!("log_models.json")).expect("Valid format");
-    for participant in discord_participants {
-        println!(
-            "Looking for role {} and lane {}",
-            participant.role, participant.lane,
-        );
-        let log_model = log_models
-            .models
-            .iter()
-            .find(|m| m.role == participant.role && m.lane == participant.lane)
-            .unwrap();
-        let mut score: f64 = log_model.intercept;
-        for param in &log_model.params {
-            score += param.coefficient
-                * f64::from(match param.name.as_str() {
-                    "assists" => participant.assists,
-                    "goldEarned" => participant.gold_earned,
-                    "totalMinionsKilled" => participant.total_minions_killed,
-                    "wardsKilled" => participant.wards_killed,
-                    "largestKillingSpree" => participant.largest_killing_spree,
-                    "quadraKills" => participant.quadra_kills,
-                    "timeCCingOthers" => participant.time_c_cing_others,
-                    "visionScore" => participant.vision_score,
-                    "totalEnemyJungleMinionsKilled" => participant
-                        .total_enemy_jungle_minions_killed
-                        .unwrap_or_default(),
-                    "killingSprees" => participant.killing_sprees,
-                    "largestMultiKill" => participant.largest_multi_kill,
-                    "visionWardsBoughtInGame" => participant.vision_wards_bought_in_game,
-                    "totalAllyJungleMinionsKilled" => participant
-                        .total_ally_jungle_minions_killed
-                        .unwrap_or_default(),
-                    "bountyLevel" => participant.bounty_level,
-                    "dragonKills" => participant.dragon_kills,
-                    "kills" => participant.kills,
-                    "baronKills" => participant.baron_kills,
-                    "tripleKills" => participant.triple_kills,
-                    "totalUnitsHealed" => participant.total_units_healed,
-                    "deaths" => participant.deaths,
-                    "objectivesStolen" => participant.objectives_stolen,
-                    "goldSpent" => participant.gold_spent,
-                    "consumablesPurchased" => participant.consumables_purchased,
-                    "objectivesStolenAssists" => participant.objectives_stolen_assists,
-                    "doubleKills" => participant.double_kills,
-                    "wardsPlaced" => participant.wards_placed,
-                    "turretTakedowns" => participant.turret_takedowns.unwrap_or_default(),
-                    "pentaKills" => participant.penta_kills,
-                    "firstBloodAssist" => i32::from(participant.first_blood_assist),
-                    "turretKills" => participant.turret_kills,
-                    "totalTimeSpentDead" => participant.total_time_spent_dead,
-                    "detectorWardsPlaced" => participant.detector_wards_placed,
-                    "totalDamageShieldedOnTeammates" => {
-                        participant.total_damage_shielded_on_teammates
-                    }
-                    _ => {
-                        return Err(anyhow!("Unhandled param: {}", param.name));
-                    }
-                })
-                / match param.name.as_str() {
-                    "firstBloodAssist" => 1.0f64,
-                    _ => {
-                        (match &participant.challenges {
-                            Some(challenge) => challenge.game_length.unwrap_or(30.0),
-                            None => 30.0,
-                        }) as f64
-                            / 60.0f64
-                    }
-                };
-        }
-        let probability = 1. / (1. + (-score).exp());
-        println!(
-            "For participant {}, probability was {}",
-            participant.summoner_name, probability
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use riven::models::match_v5::Match;
-
-    use crate::calculate_match_performance;
-
-    #[test]
-    fn does_calculate_match_performance() {
-        let match_: Match = serde_json::from_str(include_str!("../tests/NA1_4802938104.json"))
-            .expect("Valid Format");
-        let discord_puuids = HashSet::from([String::from(
-            "N0druvX0j969WpG6Py5LBI2OctCB-ZCDhqAR0fjjBn8yzjWjaJFmJEjZQh1X09evWBO9JDpBe3JOEg",
-        )]);
-        calculate_match_performance(&match_, &discord_puuids).unwrap();
-    }
 }
