@@ -33,6 +33,8 @@ use serenity::async_trait;
 use serenity::model::prelude::Member;
 use serenity::model::{id::ChannelId, prelude::Interaction};
 use serenity::prelude::*;
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock; // Added RwLock explicitly
 use tokio::task;
 use tokio::time;
@@ -60,10 +62,10 @@ struct Config {
     updates_channel_id: ChannelId,
     discord_guild_id: GuildId,
     log_path: PathBuf,
-    db_path: PathBuf,
+    pool: sqlx::SqlitePool,
 }
 
-fn load_config() -> Result<Config> {
+async fn load_config() -> Result<Config> {
     dotenv().ok();
 
     let riot_api_token = env::var("RIOT_API_TOKEN").context("Missing RIOT_API_TOKEN")?;
@@ -97,8 +99,13 @@ fn load_config() -> Result<Config> {
     });
     let log_path = PathBuf::from(log_path_str);
 
-    let db_path_str = env::var("DB_PATH").unwrap_or_else(|_| "sqlite.db".to_string());
-    let db_path = PathBuf::from(db_path_str);
+    let db_path_str = env::var("DB_PATH").unwrap_or_else(|_| "sqlite://sqlite.db".to_string());
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5) // Configure pool size
+        .connect(&db_path_str) // Use database_url from config
+        .await
+        .context("Failed to create SQLite connection pool")?;
 
     Ok(Config {
         riot_api_token,
@@ -107,7 +114,7 @@ fn load_config() -> Result<Config> {
         updates_channel_id,
         discord_guild_id,
         log_path,
-        db_path,
+        pool,
     })
 }
 
@@ -269,19 +276,21 @@ impl EventHandler for Handler {
                 "register" => {
                     commands::register::run(&ctx, &command.data.options, self.config.clone()).await
                 }
-                _ => "not implemented :(".to_string(),
+                _ => Err(anyhow!("not implemented :(".to_string())),
             };
-
-            if command.data.name.as_str() == "register" {
-                info!("Register response: {}", content);
-                return;
-            }
 
             if let Err(why) = command
                 .create_response(
                     &ctx.http,
                     CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new().content(content.clone()),
+                        CreateInteractionResponseMessage::new().content(content.unwrap_or_else(
+                            |error| {
+                                format!(
+                                    "An error occurred while processing your command: {}",
+                                    error
+                                )
+                            },
+                        )),
                     ),
                 )
                 .await
@@ -393,7 +402,9 @@ fn get_start_time() -> Result<i64> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load config first
-    let config = load_config().context("Failed to load configuration")?;
+    let config = load_config()
+        .await
+        .context("Failed to load configuration")?;
     let config_arc = Arc::new(config.clone()); // Clone for Arc
 
     std::panic::set_hook(Box::new(|i| {
@@ -480,15 +491,15 @@ async fn main() -> Result<()> {
         let mut interval = time::interval(Duration::from_secs(5)); // Consider making interval configurable
 
         // Use config for DB path
-        let db_path = &background_config.db_path;
-        let summoners = fetch_summoners(db_path)?;
+        let pool = &background_config.pool;
+        let summoners = fetch_summoners(pool).await?;
         let active_summoner_names = summoners.values().cloned().collect::<HashSet<_>>(); // Collect names for puuid fetch
 
         loop {
             // Fetch PUUIDs based on currently known summoners
             // Note: This doesn't automatically pick up newly registered summoners until restart
             // Consider refetching summoners periodically or triggering an update on registration
-            let puuids = fetch_puuids(db_path, &active_summoner_names)?;
+            let puuids = fetch_puuids(pool, &active_summoner_names).await?;
 
             // Check for new day *before* iterating PUUIDs
             let new_start_time = get_start_time()?;
@@ -604,81 +615,83 @@ async fn main() -> Result<()> {
     }
 }
 
-// --- Database Functions (Accept db_path) ---
+// --- Database Functions (Accept pool) ---
 
-fn update_match(
-    db_path: &PathBuf,
+async fn update_match(
+    pool: &sqlx::SqlitePool,
     match_id: &String,
     queue_id: i64,
     is_win: bool,
     end_timestamp: i64,
     match_info: &Match,
 ) -> Result<()> {
-    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
-    let mut statement = connection
-        .prepare("INSERT OR IGNORE INTO match (id, queue_id, win, end_timestamp, MatchInfo) VALUES (?1, ?2, ?3, ?4, ?5);")?;
-    statement.execute(rusqlite::params![
-        // Use params! macro for clarity
-        match_id,
-        queue_id,
-        is_win, // rusqlite handles bool conversion
-        end_timestamp,
-        &serde_json::to_string(match_info)?,
-    ])?;
+    let match_info_json = serde_json::to_string(match_info)?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO match (id, queue_id, win, end_timestamp, MatchInfo) VALUES (?, ?, ?, ?, ?);"
+    )
+    .bind(match_id)
+    .bind(queue_id)
+    .bind(is_win)
+    .bind(end_timestamp)
+    .bind(&match_info_json) // Bind JSON string
+    .execute(pool) // Execute against the pool
+    .await?; // Await the result
+
     Ok(())
 }
 
-fn fetch_discord_usernames(db_path: &PathBuf) -> Result<HashMap<String, String>> {
-    let mut summoner_map: HashMap<String, String> = HashMap::new();
-    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
-    let mut statement = connection.prepare("SELECT DiscordId, LOWER(summonerName) FROM User")?;
-    let mut rows = statement.query([])?; // Use query instead of query_map for simpler iteration
+async fn fetch_discord_usernames(pool: &SqlitePool) -> Result<HashMap<String, String>> {
+    // Fetch rows as tuples (String, String)
+    let mappings: Vec<(String, String)> =
+        sqlx::query_as("SELECT DiscordId, LOWER(summonerName) FROM User")
+            .fetch_all(pool) // Fetch all results into a Vec
+            .await?;
 
-    while let Some(row) = rows.next()? {
-        let discord_id: String = row.get(0)?; // Use ? for error handling
-        let summoner: String = row.get(1)?;
-        summoner_map.insert(summoner, discord_id);
-    }
+    // Convert Vec<(DiscordId, LowerSummonerName)> to HashMap<LowerSummonerName, DiscordId>
+    let summoner_map: HashMap<String, String> = mappings
+        .into_iter()
+        .map(|(id, name)| (name, id)) // Flip order for map
+        .collect();
+
     Ok(summoner_map)
 }
 
-fn fetch_puuids(db_path: &PathBuf, summoner_names: &HashSet<String>) -> Result<HashSet<String>> {
+async fn fetch_puuids(
+    pool: &SqlitePool,
+    summoner_names: &HashSet<String>,
+) -> Result<HashSet<String>> {
     if summoner_names.is_empty() {
         return Ok(HashSet::new());
     }
-    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
 
-    // Use parameterized query
-    let placeholders: String = summoner_names
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT puuid FROM summoner WHERE name IN ({})",
-        placeholders
-    );
-    let mut statement = connection.prepare(&sql)?;
+    // Convert HashSet to Vec for binding
+    let names_vec: Vec<String> = summoner_names.iter().cloned().collect();
+    // Serialize the Vec to a JSON string for the IN clause workaround
+    let names_json = serde_json::to_string(&names_vec)?;
 
-    // Convert HashSet<String> to Vec<&str> for binding
-    let params_vec: Vec<&str> = summoner_names.iter().map(|s| s.as_str()).collect();
+    // Use query_scalar to fetch a single column directly
+    // The `json_each(?)` trick allows binding a list to an IN clause in SQLite with sqlx
+    let puuids: Vec<String> = sqlx::query_scalar(
+        "SELECT puuid FROM summoner WHERE name IN (SELECT value FROM json_each(?))",
+    )
+    .bind(names_json) // Bind the JSON array string
+    .fetch_all(pool)
+    .await?;
 
-    let puuids = statement
-        .query_map(rusqlite::params_from_iter(params_vec), |row| row.get(0))?
-        .collect::<Result<HashSet<String>, _>>()?; // Collect results directly into HashSet
-
-    Ok(puuids)
+    // Collect into HashSet
+    Ok(puuids.into_iter().collect())
 }
 
-fn fetch_summoners(db_path: &PathBuf) -> Result<HashMap<u64, String>> {
-    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
-    let mut statement = connection.prepare("SELECT DiscordId, SummonerName FROM USER;")?;
-    let mut summoners = HashMap::new();
-    let mut rows = statement.query([])?;
+async fn fetch_summoners(pool: &SqlitePool) -> Result<HashMap<u64, String>> {
+    // Fetch rows as tuples (String, String)
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT DiscordId, SummonerName FROM USER")
+        .fetch_all(pool)
+        .await?;
 
-    while let Some(row) = rows.next()? {
-        let discord_id_str: String = row.get(0)?;
-        let summoner_name: String = row.get(1)?;
+    let mut summoners = HashMap::new();
+    for (discord_id_str, summoner_name) in rows {
+        // Parse DiscordId String to u64
         let discord_id = discord_id_str
             .parse::<u64>()
             .with_context(|| format!("Failed to parse DiscordId '{}' as u64", discord_id_str))?;
@@ -688,66 +701,61 @@ fn fetch_summoners(db_path: &PathBuf) -> Result<HashMap<u64, String>> {
 }
 
 async fn fetch_seen_events(
-    db_path: &PathBuf,
+    pool: &SqlitePool, // Accept pool
     match_ids: &Vec<String>,
 ) -> Result<HashMap<String, MatchInfo>> {
     if match_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let connection = rusqlite::Connection::open(db_path)?; // Use db_path
 
-    // Use parameterized query
-    let placeholders = match_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT id, queue_id, win, IFNULL(end_timestamp, 0), MatchInfo FROM match WHERE id IN ({})",
-        placeholders
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let params = rusqlite::params_from_iter(match_ids);
+    // Serialize Vec<String> to JSON for IN clause
+    let ids_json = serde_json::to_string(match_ids)?;
+
+    // Fetch all rows matching the IDs
+    let rows = sqlx::query( "SELECT id, queue_id, win, IFNULL(end_timestamp, 0) as end_ts, MatchInfo FROM match WHERE id IN (SELECT value FROM json_each(?))").bind(ids_json).fetch_all(pool).await?;
 
     let mut seen_matches: HashMap<String, MatchInfo> = HashMap::new();
-    let rows = statement.query_map(params, |row| {
-        let id: String = row.get(0)?;
-        let queue_id: i64 = row.get(1)?;
-        let win: bool = row.get(2)?; // Read bool directly
-        let timestamp_ms: i64 = row.get(3)?;
-        let match_info_str: Option<String> = row.get(4)?; // Handle potentially NULL MatchInfo
 
+    // Process each row manually
+    for row in rows {
+        // Use try_get from SqlxRow trait
+        let id: String = row.try_get("id")?;
+        let queue_id_i64: i64 = row.try_get("queue_id")?;
+        let win: bool = row.try_get("win")?;
+        let timestamp_ms: i64 = row.try_get("end_ts")?; // Use alias 'end_ts'
+        let match_info_str: Option<String> = row.try_get("MatchInfo")?;
+
+        // Parse timestamp
         let end_timestamp = DateTime::from_timestamp_millis(timestamp_ms)
-            .ok_or_else(|| rusqlite::Error::InvalidQuery)?; // Handle potential timestamp error
+            .ok_or_else(|| anyhow!("Invalid timestamp millis from DB: {}", timestamp_ms))?; // Use anyhow for error
 
-        // Handle potentially null or invalid JSON
+        // Parse MatchInfo JSON string
         let match_info: Option<Match> = match match_info_str {
-            Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| {
-                error!("Failed to parse MatchInfo JSON for match {}: {}", id, e);
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?,
+            Some(s) if !s.is_empty() => {
+                match serde_json::from_str(&s) {
+                    Result::Ok(m) => Some(m),
+                    Err(e) => {
+                        error!("Failed to parse MatchInfo JSON for match {}: {}", id, e);
+                        // Decide how to handle parse errors: skip match, return error, etc.
+                        // Here, we'll skip the match_info field for this entry.
+                        None // Or return Err(anyhow!(...)) to fail the whole function
+                    }
+                }
+            }
             _ => None,
         };
 
-        Result::Ok(MatchInfo {
-            id,
-            queue_id: queue_id.to_string(),
-            win,
-            end_timestamp,
-            match_info,
-        })
-    })?;
-
-    for result in rows {
-        match result {
-            std::result::Result::Ok(match_info) => {
-                seen_matches.insert(match_info.id.clone(), match_info);
-            }
-            Err(e) => {
-                // Log error but continue processing other rows if possible
-                error!("Error processing row in fetch_seen_events: {}", e);
-            }
-        }
+        // Insert into the result map
+        seen_matches.insert(
+            id.clone(),
+            MatchInfo {
+                id,
+                queue_id: queue_id_i64.to_string(), // Convert i64 to String
+                win,
+                end_timestamp,
+                match_info,
+            },
+        );
     }
     Ok(seen_matches)
 }
@@ -772,11 +780,11 @@ async fn check_match_history(
     ]);
     let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
     let start_time = get_start_time()?;
-    let db_path = &config.db_path; // Get DB path from config
+    let pool = &config.pool; // Get DB path from config
 
-    let summoner_info = fetch_summoners(db_path)?;
+    let summoner_info = fetch_summoners(pool).await?;
     let summoner_names = summoner_info.values().cloned().collect::<HashSet<_>>();
-    let puuids = fetch_puuids(db_path, &summoner_names)?;
+    let puuids = fetch_puuids(pool, &summoner_names).await?;
 
     // Use a simple Vec to collect all match IDs, then deduplicate
     let mut all_match_ids: Vec<String> = Vec::new();
@@ -839,7 +847,7 @@ async fn check_match_history(
     }
 
     // Fetch info only for matches we haven't processed yet
-    let seen_matches = fetch_seen_events(db_path, &unique_match_ids).await?;
+    let seen_matches = fetch_seen_events(pool, &unique_match_ids).await?;
     let mut pentakillers = Vec::new();
     let mut dom_earners = Vec::new();
 
@@ -879,7 +887,7 @@ async fn check_match_history(
             Result::Ok(Some(match_info)) => {
                 // Process the newly fetched match details
                 update_match_info(
-                    db_path,
+                    pool,
                     &match_info,
                     &mut queue_scores,
                     &queue_ids,
@@ -887,7 +895,8 @@ async fn check_match_history(
                     &mut pentakillers,
                     &mut dom_earners,
                     start_time,
-                )?;
+                )
+                .await?;
             }
             Result::Ok(None) => {
                 error!("Riot API returned Ok(None) for match id {}", match_id);
@@ -1068,8 +1077,8 @@ fn generate_status_message(
     results
 }
 
-fn update_match_info(
-    db_path: &PathBuf,
+async fn update_match_info(
+    pool: &sqlx::SqlitePool,
     match_info: &Match,
     queue_scores: &mut HashMap<Queue, Score>,
     queue_ids: &HashMap<Queue, &str>,
@@ -1119,13 +1128,14 @@ fn update_match_info(
         );
         let queue_id: i64 = u16::from(match_info.info.queue_id).into();
         update_match(
-            db_path,
+            pool,
             &match_info.metadata.match_id,
             queue_id,
             false,
             game_end_timestamp,
             match_info,
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1200,13 +1210,14 @@ fn update_match_info(
     }
 
     update_match(
-        db_path,
+        pool,
         &match_info.metadata.match_id,
         queue_id,
         is_win,
         game_end_timestamp,
         match_info,
-    )?;
+    )
+    .await?;
 
     dom_earners.extend(
         match_info
@@ -1255,7 +1266,7 @@ async fn check_pentakill_info(
         return Ok(());
     }
 
-    let user_info = fetch_discord_usernames(&config.db_path)?;
+    let user_info = fetch_discord_usernames(&config.pool).await?;
     let mut pentakillers_by_discord_mention: Vec<_> = pentakillers
         .iter()
         .filter_map(|(_, summoner_name)| {
@@ -1314,7 +1325,7 @@ async fn check_doms_info(
         return Ok(());
     }
 
-    let user_info = fetch_discord_usernames(&config.db_path)?;
+    let user_info = fetch_discord_usernames(&config.pool).await?;
     let mut dom_earners_by_discord_mention: Vec<_> = dom_earners
         .iter()
         .filter_map(|(_, summoner_name)| {
@@ -1423,4 +1434,1184 @@ async fn update_highlight_reel(
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Import items from outer scope
+    use models::Score;
+    use riven::consts::{Champion, PlatformRoute, Queue, Team as TeamId};
+    use riven::models::match_v5::*;
+    use std::collections::{HashMap, HashSet};
+    use std::env;
+
+    // Helper to set up an in-memory database for testing
+    async fn setup_in_memory_db_pool() -> Result<SqlitePool> {
+        // Connect to an in-memory database
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+
+        // Run migrations (same schema setup)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS User (
+                 DiscordId TEXT PRIMARY KEY,
+                 SummonerName TEXT NOT NULL UNIQUE
+             );",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS summoner (
+                 puuid TEXT PRIMARY KEY,
+                 name TEXT NOT NULL UNIQUE
+             );",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS match (
+                 id TEXT PRIMARY KEY,
+                 queue_id INTEGER NOT NULL,
+                 win BOOLEAN NOT NULL,
+                 end_timestamp INTEGER,
+                 MatchInfo TEXT
+             );",
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(pool)
+    }
+
+    // Helper to create a basic Match struct for testing
+    fn create_test_match(
+        match_id: &str,
+        queue_id: Queue,
+        game_end_timestamp: Option<i64>,
+        participants: Vec<Participant>,
+        teams: Vec<riven::models::match_v5::Team>,
+    ) -> Match {
+        Match {
+            metadata: Metadata {
+                data_version: "2".to_string(),
+                match_id: match_id.to_string(),
+                participants: participants.iter().map(|p| p.puuid.clone()).collect(),
+            },
+            info: Info {
+                game_creation: game_end_timestamp.unwrap_or(0) - 1800 * 1000, // Approx 30 mins before end
+                game_duration: 1800,                                          // Approx 30 mins
+                game_end_timestamp,
+                game_id: 1234567890, // Example game ID
+                game_mode: riven::consts::GameMode::CLASSIC,
+                game_name: "test_game".to_string(),
+                game_start_timestamp: game_end_timestamp.unwrap_or(0) - 1800 * 1000,
+                game_type: Some(riven::consts::GameType::MATCHED_GAME),
+                game_version: riven::consts::GameMode::CLASSIC.to_string(),
+                map_id: if queue_id == Queue::HOWLING_ABYSS_5V5_ARAM {
+                    riven::consts::Map::HOWLING_ABYSS
+                } else {
+                    riven::consts::Map::SUMMONERS_RIFT
+                },
+                participants,
+                platform_id: PlatformRoute::NA1.to_string(),
+                queue_id,
+                teams,
+                tournament_code: None,
+                end_of_game_result: None,
+            },
+        }
+    }
+
+    // Helper to create a basic Participant struct
+    fn create_test_participant(
+        puuid: &str,
+        summoner_name: &str,
+        team_id: TeamId,
+        win: bool,
+        kills: i32,
+        deaths: i32,
+        assists: i32,
+        penta_kills: i32,
+        placement: Option<i32>, // For Arena
+        early_surrender: bool,
+    ) -> Participant {
+        Participant {
+            puuid: puuid.to_string(),
+            summoner_name: summoner_name.to_string(),
+            team_id,
+            win,
+            kills,
+            deaths,
+            assists,
+            penta_kills,
+            placement,
+            game_ended_in_early_surrender: early_surrender,
+            game_ended_in_surrender: !win && !early_surrender, // Simple assumption
+            missions: None,
+            player_score0: None,
+            player_score1: None,
+            player_score2: None,
+            player_score3: None,
+            player_score4: None,
+            player_score5: None,
+            player_score6: None,
+            player_score7: None,
+            player_score8: None,
+            player_score9: None,
+            player_score10: None,
+            player_score11: None,
+            player_augment1: None,
+            player_augment2: None,
+            player_augment3: None,
+            player_augment4: None,
+            player_augment5: None,
+            player_augment6: None,
+            player_subteam_id: None,
+            riot_id_game_name: None,
+            subteam_placement: None,
+            total_time_cc_dealt: 0,
+            retreat_pings: Some(0),
+            // Fill other fields with default/dummy values as needed for tests
+            all_in_pings: Some(0),
+            assist_me_pings: Some(0),
+            bait_pings: Some(0),
+            baron_kills: 0,
+            basic_pings: Some(0),
+            bounty_level: 0,
+            challenges: None, // Add challenges if needed for specific tests
+            champ_experience: 15000,
+            champ_level: 18,
+            #[allow(deprecated)]
+            champion_id: Result::Ok(Champion::ANNIE),
+            champion_name: "Annie".to_string(),
+            champion_transform: 0,
+            command_pings: Some(0),
+            consumables_purchased: 5,
+            damage_dealt_to_buildings: Some(5000),
+            damage_dealt_to_objectives: 8000,
+            damage_dealt_to_turrets: 5000,
+            damage_self_mitigated: 10000,
+            danger_pings: Some(0),
+            detector_wards_placed: 2,
+            double_kills: if kills >= 2 { 1 } else { 0 },
+            dragon_kills: 0,
+            eligible_for_progression: Some(true),
+            enemy_missing_pings: Some(0),
+            enemy_vision_pings: Some(0),
+            first_blood_assist: false,
+            first_blood_kill: false,
+            first_tower_assist: false,
+            first_tower_kill: false,
+            get_back_pings: Some(0),
+            gold_earned: 12000,
+            gold_spent: 11000,
+            hold_pings: Some(0),
+            individual_position: "MIDDLE".to_string(), // Example
+            inhibitor_kills: 1,
+            inhibitor_takedowns: Some(1),
+            inhibitors_lost: Some(0),
+            item0: 3020, // Example item ID
+            item1: 3157,
+            item2: 3089,
+            item3: 3135,
+            item4: 3165,
+            item5: 3117,
+            item6: 3340, // Trinket
+            items_purchased: 15,
+            killing_sprees: if kills >= 3 { 1 } else { 0 },
+            lane: "MIDDLE".to_string(), // Example
+            largest_critical_strike: 300,
+            largest_killing_spree: kills,
+            largest_multi_kill: if penta_kills > 0 {
+                5
+            } else if kills >= 2 {
+                2
+            } else {
+                1
+            },
+            longest_time_spent_living: 600,
+            magic_damage_dealt: 20000,
+            magic_damage_dealt_to_champions: 15000,
+            magic_damage_taken: 8000,
+            need_vision_pings: Some(0),
+            neutral_minions_killed: 20,
+            nexus_kills: if win { 1 } else { 0 },
+            nexus_lost: Some(if win { 0 } else { 1 }),
+            nexus_takedowns: Some(if win { 1 } else { 0 }),
+            objectives_stolen: 0,
+            objectives_stolen_assists: 0,
+            on_my_way_pings: Some(0),
+            participant_id: 1, // Example
+            perks: Perks {
+                stat_perks: riven::models::match_v5::PerkStats {
+                    defense: 5002,
+                    flex: 5008,
+                    offense: 5005,
+                },
+                styles: vec![], // Add perk styles if needed
+            },
+            physical_damage_dealt: 5000,
+            physical_damage_dealt_to_champions: 3000,
+            physical_damage_taken: 10000,
+            profile_icon: 123,
+            push_pings: Some(0),
+            quadra_kills: 0,
+            riot_id_name: None,
+            riot_id_tagline: None,
+            role: "SOLO".to_string(), // Example
+            sight_wards_bought_in_game: 5,
+            spell1_casts: 100,
+            spell2_casts: 80,
+            spell3_casts: 60,
+            spell4_casts: 20,
+            summoner1_casts: 5,
+            summoner1_id: 4, // Flash
+            summoner2_casts: 4,
+            summoner2_id: 14, // Ignite
+            summoner_id: "test_summoner_id".to_string(),
+            summoner_level: 30,
+            team_early_surrendered: early_surrender,
+            team_position: "MIDDLE".to_string(), // Example
+            time_c_cing_others: 10,
+            time_played: 1800,
+            total_ally_jungle_minions_killed: Some(5),
+            total_damage_dealt: 25000,
+            total_damage_dealt_to_champions: 18000,
+            total_damage_shielded_on_teammates: 1000,
+            total_damage_taken: 18000,
+            total_enemy_jungle_minions_killed: Some(15),
+            total_heal: 2000,
+            total_heals_on_teammates: 500,
+            total_minions_killed: 150,
+            total_time_spent_dead: 60,
+            total_units_healed: 5,
+            triple_kills: 0,
+            true_damage_dealt: 0,
+            true_damage_dealt_to_champions: 0,
+            true_damage_taken: 0,
+            turret_kills: 2,
+            turret_takedowns: Some(2),
+            turrets_lost: Some(1),
+            unreal_kills: 0,
+            vision_cleared_pings: Some(0),
+            vision_score: 25,
+            vision_wards_bought_in_game: 3,
+            wards_killed: 5,
+            wards_placed: 10,
+        }
+    }
+
+    // Helper to create a basic Team struct
+    fn create_test_team(team_id: TeamId, win: bool) -> riven::models::match_v5::Team {
+        riven::models::match_v5::Team {
+            bans: vec![], // Add bans if needed
+            objectives: riven::models::match_v5::Objectives {
+                baron: Objective {
+                    first: false,
+                    kills: 0,
+                },
+                champion: Objective {
+                    first: win,
+                    kills: 20,
+                }, // Example kills
+                dragon: Objective {
+                    first: false,
+                    kills: 1,
+                },
+                inhibitor: Objective {
+                    first: win,
+                    kills: 1,
+                },
+                rift_herald: Objective {
+                    first: false,
+                    kills: 0,
+                },
+                tower: Objective {
+                    first: win,
+                    kills: 5,
+                },
+                horde: None,
+                atakhan: None,
+            },
+            team_id,
+            win,
+            feats: None, // Add feats if needed
+        }
+    }
+
+    #[test]
+    fn test_mode_score_standard() {
+        let score = Score {
+            wins: 3,
+            games: 5,
+            warmup: 0,
+            top_finishes: 0,
+            bottom_finishes: 0,
+        };
+        assert_eq!(
+            mode_score(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, &score),
+            "3\u{2006}-\u{2006}2"
+        );
+    }
+
+    #[test]
+    fn test_mode_score_warmup() {
+        let score = Score {
+            wins: 0,
+            games: 0,
+            warmup: 1,
+            top_finishes: 0,
+            bottom_finishes: 0,
+        };
+        assert_eq!(
+            mode_score(&Queue::SUMMONERS_RIFT_5V5_DRAFT_PICK, &score),
+            "🏃"
+        );
+        // Warmup shouldn't show if there are games played
+        let score_with_games = Score {
+            wins: 0,
+            games: 1,
+            warmup: 1,
+            top_finishes: 0,
+            bottom_finishes: 0,
+        };
+        assert_eq!(
+            mode_score(&Queue::SUMMONERS_RIFT_5V5_DRAFT_PICK, &score_with_games),
+            "0\u{2006}-\u{2006}1"
+        );
+        // Warmup shouldn't show for Clash
+        assert_eq!(
+            mode_score(&Queue::SUMMONERS_RIFT_CLASH, &score),
+            "0\u{2006}-\u{2006}0"
+        );
+    }
+
+    #[test]
+    fn test_mode_score_arena() {
+        let score = Score {
+            wins: 2,
+            games: 5, // games field might be used differently for Arena internally, but mode_score uses wins/top/bottom
+            warmup: 0,
+            top_finishes: 3, // e.g., 2 wins (1st) + 1 top 4 finish
+            bottom_finishes: 2,
+        };
+        assert_eq!(
+            mode_score(&Queue::ARENA_2V2V2V2_CHERRY, &score),
+            "2\u{2006}-\u{2006}3\u{2006}-\u{2006}2"
+        );
+    }
+
+    #[tokio::test] // Mark as async test
+    async fn test_fetch_summoners_db() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?; // Use async helper
+        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?1, ?2), (?3, ?4)")
+            .bind("111")
+            .bind("PlayerOne")
+            .bind("222")
+            .bind("PlayerTwo")
+            .execute(&pool)
+            .await?;
+
+        // Call the actual async function
+        let summoners = fetch_summoners(&pool).await?;
+
+        assert_eq!(summoners.len(), 2);
+        assert_eq!(summoners.get(&111), Some(&"PlayerOne".to_string()));
+        assert_eq!(summoners.get(&222), Some(&"PlayerTwo".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_puuids_db() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO summoner (puuid, name) VALUES (?1, ?2), (?3, ?4), (?5, ?6)")
+            .bind("puuid1")
+            .bind("playerone") // Keep names lowercase in DB for consistency
+            .bind("puuid2")
+            .bind("playertwo")
+            .bind("puuid3")
+            .bind("playerthree")
+            .execute(&pool)
+            .await?;
+
+        let summoner_names_to_fetch: HashSet<String> = HashSet::from([
+            "playerone".to_string(), // Use lowercase to match DB query logic
+            "playertwo".to_string(),
+            "playerfour".to_string(), // Non-existent
+        ]);
+
+        // Call the actual async function
+        let puuids = fetch_puuids(&pool, &summoner_names_to_fetch).await?;
+
+        assert_eq!(puuids.len(), 2);
+        assert!(puuids.contains("puuid1"));
+        assert!(puuids.contains("puuid2"));
+        assert!(!puuids.contains("puuid3"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_and_fetch_match_db() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let now = chrono::Local::now().timestamp_millis();
+        let match_id = "NA1_TESTMATCH1".to_string();
+        let queue_id = Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO;
+        let is_win = true;
+
+        let participant1 = create_test_participant(
+            "puuid1",
+            "Player1",
+            TeamId::BLUE,
+            true,
+            5,
+            2,
+            10,
+            0,
+            None,
+            false,
+        );
+        let team1 = create_test_team(TeamId::BLUE, true);
+        let team2 = create_test_team(TeamId::RED, false);
+        let test_match = create_test_match(
+            &match_id,
+            queue_id,
+            Some(now),
+            vec![participant1],
+            vec![team1, team2],
+        );
+
+        // Call the actual async update function
+        update_match(
+            &pool,
+            &match_id,
+            i64::from(u16::from(queue_id)),
+            is_win,
+            now,
+            &test_match,
+        )
+        .await?;
+
+        // Call the actual async fetch function
+        let matches_to_fetch = vec![match_id.clone()];
+        let seen_matches_map = fetch_seen_events(&pool, &matches_to_fetch).await?;
+
+        assert_eq!(seen_matches_map.len(), 1);
+        let fetched_info = seen_matches_map.get(&match_id).unwrap();
+
+        assert_eq!(fetched_info.id, match_id);
+        assert_eq!(
+            fetched_info.queue_id,
+            i64::from(u16::from(queue_id)).to_string()
+        );
+        assert_eq!(fetched_info.win, is_win);
+        assert_eq!(fetched_info.end_timestamp.timestamp_millis(), now);
+        assert!(fetched_info.match_info.is_some());
+        assert_eq!(
+            fetched_info.match_info.as_ref().unwrap().metadata.match_id,
+            match_id
+        );
+
+        Ok(())
+    }
+
+    // --- update_match_info tests need #[tokio::test] and .await ---
+    // They also need a dummy pool, even if update_match isn't the primary focus
+
+    #[tokio::test]
+    async fn test_update_match_info_standard_win() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?; // Need pool for update_match call
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> =
+            HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
+        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
+
+        let p1 = create_test_participant(
+            "puuid1",
+            "Player1",
+            TeamId::BLUE,
+            true,
+            10,
+            2,
+            5,
+            0,
+            None,
+            false,
+        );
+        let p2 = create_test_participant(
+            "puuid2",
+            "Player2",
+            TeamId::RED,
+            false,
+            2,
+            10,
+            3,
+            0,
+            None,
+            false,
+        );
+        let team1 = create_test_team(TeamId::BLUE, true);
+        let team2 = create_test_team(TeamId::RED, false);
+        let match_info = create_test_match(
+            "NA1_WIN",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time + 1000 * 30),
+            vec![p1, p2],
+            vec![team1, team2],
+        );
+
+        // Call async function with await
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score = queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .unwrap();
+        assert_eq!(score.wins, 1);
+        assert_eq!(score.games, 1);
+        assert_eq!(score.warmup, 0);
+        assert!(pentakillers.is_empty());
+        assert!(dom_earners.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_match_info_standard_loss_warmup() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> =
+            HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
+        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
+
+        let p1 = create_test_participant(
+            "puuid1",
+            "Player1",
+            TeamId::BLUE,
+            false,
+            2,
+            10,
+            5,
+            0,
+            None,
+            false,
+        );
+        let p2 = create_test_participant(
+            "puuid2",
+            "Player2",
+            TeamId::RED,
+            true,
+            10,
+            2,
+            3,
+            0,
+            None,
+            false,
+        );
+        let team1 = create_test_team(TeamId::BLUE, false);
+        let team2 = create_test_team(TeamId::RED, true);
+        let match_info = create_test_match(
+            "NA1_LOSS",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time + 1000 * 30),
+            vec![p1, p2],
+            vec![team1, team2],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score = queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .unwrap();
+        assert_eq!(score.wins, 0);
+        assert_eq!(score.games, 0);
+        assert_eq!(score.warmup, 1);
+
+        let p3 = create_test_participant(
+            "puuid1",
+            "Player1",
+            TeamId::BLUE,
+            false,
+            3,
+            8,
+            6,
+            0,
+            None,
+            false,
+        );
+        let p4 = create_test_participant(
+            "puuid3",
+            "Player3",
+            TeamId::RED,
+            true,
+            8,
+            3,
+            2,
+            0,
+            None,
+            false,
+        );
+        let team3 = create_test_team(TeamId::BLUE, false);
+        let team4 = create_test_team(TeamId::RED, true);
+        let match_info2 = create_test_match(
+            "NA1_LOSS2",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time + 1000 * 60),
+            vec![p3, p4],
+            vec![team3, team4],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info2,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score_after_2 = queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .unwrap();
+        assert_eq!(score_after_2.wins, 0);
+        assert_eq!(score_after_2.games, 0); // Still 0 games
+        assert_eq!(score_after_2.warmup, 2); // Warmup increases
+
+        let p5 = create_test_participant(
+            "puuid1",
+            "Player1",
+            TeamId::BLUE,
+            false,
+            1,
+            11,
+            7,
+            0,
+            None,
+            false,
+        );
+        let p6 = create_test_participant(
+            "puuid4",
+            "Player4",
+            TeamId::RED,
+            true,
+            11,
+            1,
+            1,
+            0,
+            None,
+            false,
+        );
+        let team5 = create_test_team(TeamId::BLUE, false);
+        let team6 = create_test_team(TeamId::RED, true);
+        let match_info3 = create_test_match(
+            "NA1_LOSS3",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time + 1000 * 90),
+            vec![p5, p6],
+            vec![team5, team6],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info3,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score_after_3 = queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .unwrap();
+        assert_eq!(score_after_3.wins, 0);
+        assert_eq!(score_after_3.games, 1); // Now counts as a game
+        assert_eq!(score_after_3.warmup, 2); // Warmup count stays at max
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_match_info_penta() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> =
+            HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
+        let puuids: HashSet<String> = HashSet::from(["puuid_penta".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
+
+        let p1 = create_test_participant(
+            "puuid_penta",
+            "Penta Pete",
+            TeamId::BLUE,
+            true,
+            25,
+            5,
+            5,
+            1,
+            None,
+            false,
+        );
+        let p2 = create_test_participant(
+            "puuid_other",
+            "Feeder Fred",
+            TeamId::RED,
+            false,
+            5,
+            25,
+            0,
+            0,
+            None,
+            false,
+        );
+        let team1 = create_test_team(TeamId::BLUE, true);
+        let team2 = create_test_team(TeamId::RED, false);
+        let match_info = create_test_match(
+            "NA1_PENTA",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time + 1000 * 30),
+            vec![p1, p2],
+            vec![team1, team2],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score = queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .unwrap();
+        assert_eq!(score.wins, 1);
+        assert_eq!(score.games, 1);
+        assert_eq!(pentakillers.len(), 1);
+        assert_eq!(pentakillers[0].1, "Penta Pete");
+        assert!(dom_earners.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_match_info_doms() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> =
+            HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
+        let puuids: HashSet<String> = HashSet::from(["puuid_doms".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
+
+        let p1 = create_test_participant(
+            "puuid_doms",
+            "Dominic",
+            TeamId::BLUE,
+            true,
+            5,
+            5,
+            5,
+            0,
+            None,
+            false,
+        );
+        let p2 = create_test_participant(
+            "puuid_other",
+            "Average Andy",
+            TeamId::RED,
+            false,
+            5,
+            5,
+            5,
+            0,
+            None,
+            false,
+        );
+        let team1 = create_test_team(TeamId::BLUE, true);
+        let team2 = create_test_team(TeamId::RED, false);
+        let match_info = create_test_match(
+            "NA1_DOMS",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time + 1000 * 30),
+            vec![p1, p2],
+            vec![team1, team2],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score = queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .unwrap();
+        assert_eq!(score.wins, 1);
+        assert_eq!(score.games, 1);
+        assert!(pentakillers.is_empty());
+        assert_eq!(dom_earners.len(), 1);
+        assert_eq!(dom_earners[0].1, "Dominic");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_match_info_arena() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> =
+            HashMap::from([(Queue::ARENA_2V2V2V2_CHERRY, "Arena")]);
+        let puuids: HashSet<String> =
+            HashSet::from(["puuid_arena1".to_string(), "puuid_arena2".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
+
+        let p1 = create_test_participant(
+            "puuid_arena1",
+            "Arena Ace",
+            TeamId::BLUE,
+            true,
+            10,
+            2,
+            5,
+            0,
+            Some(1),
+            false,
+        );
+        let p2 = create_test_participant(
+            "puuid_arena2",
+            "Arena Ally",
+            TeamId::BLUE,
+            true,
+            8,
+            3,
+            6,
+            0,
+            Some(1),
+            false,
+        );
+        let p3 = create_test_participant(
+            "puuid_other1",
+            "Rival 1",
+            TeamId::RED,
+            false,
+            5,
+            5,
+            2,
+            0,
+            Some(3),
+            false,
+        );
+        let p4 = create_test_participant(
+            "puuid_other2",
+            "Rival 2",
+            TeamId::RED,
+            false,
+            4,
+            6,
+            5,
+            0,
+            Some(3),
+            false,
+        );
+        let p5 = create_test_participant(
+            "puuid_arena_opponent",
+            "Bottom Feeder",
+            TeamId::OTHER,
+            false,
+            2,
+            10,
+            1,
+            0,
+            Some(7),
+            false,
+        );
+        let team_dummy = create_test_team(TeamId::BLUE, true);
+
+        let match_info = create_test_match(
+            "NA1_ARENA",
+            Queue::ARENA_2V2V2V2_CHERRY,
+            Some(start_time + 1000 * 30),
+            vec![p1, p2, p3, p4, p5],
+            vec![team_dummy.clone()],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score = queue_scores.get(&Queue::ARENA_2V2V2V2_CHERRY).unwrap();
+        assert_eq!(score.wins, 1);
+        assert_eq!(score.games, 1);
+        assert_eq!(score.top_finishes, 1); // Both players were 1st, counts as one top finish
+        assert_eq!(score.bottom_finishes, 0);
+
+        let p6 = create_test_participant(
+            "puuid_arena1",
+            "Arena Ace",
+            TeamId::BLUE,
+            false,
+            3,
+            8,
+            2,
+            0,
+            Some(6),
+            false,
+        );
+        let p7 = create_test_participant(
+            "puuid_arena2",
+            "Arena Ally",
+            TeamId::BLUE,
+            false,
+            2,
+            9,
+            1,
+            0,
+            Some(3),
+            false,
+        ); // One top 4, one bottom
+        let match_info2 = create_test_match(
+            "NA1_ARENA_LOSS",
+            Queue::ARENA_2V2V2V2_CHERRY,
+            Some(start_time + 1000 * 60),
+            vec![p6, p7],
+            vec![team_dummy.clone()],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info2,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score_after_2 = queue_scores.get(&Queue::ARENA_2V2V2V2_CHERRY).unwrap();
+        assert_eq!(score_after_2.wins, 1);
+        assert_eq!(score_after_2.games, 2);
+        assert_eq!(score_after_2.top_finishes, 2); // Player 7 got 3rd place
+        assert_eq!(score_after_2.bottom_finishes, 1); // Player 6 got 6th place
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_match_info_early_surrender() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> =
+            HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
+        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
+
+        let p1 = create_test_participant(
+            "puuid1",
+            "Player1",
+            TeamId::BLUE,
+            false,
+            0,
+            1,
+            0,
+            0,
+            None,
+            true,
+        );
+        let p2 = create_test_participant(
+            "puuid2",
+            "Player2",
+            TeamId::RED,
+            true,
+            1,
+            0,
+            0,
+            0,
+            None,
+            false,
+        );
+        let team1 = create_test_team(TeamId::BLUE, false);
+        let team2 = create_test_team(TeamId::RED, true);
+        let match_info = create_test_match(
+            "NA1_EARLY_FF",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time + 1000 * 30),
+            vec![p1, p2],
+            vec![team1, team2],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        assert!(
+            queue_scores
+                .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+                .is_none()
+                || queue_scores
+                    .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+                    .unwrap()
+                    .games
+                    == 0
+        );
+        assert!(pentakillers.is_empty());
+        assert!(dom_earners.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_match_info_timestamp_before_start() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> =
+            HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
+        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = chrono::Local::now().timestamp_millis();
+
+        let p1 = create_test_participant(
+            "puuid1",
+            "Player1",
+            TeamId::BLUE,
+            true,
+            10,
+            2,
+            5,
+            0,
+            None,
+            false,
+        );
+        let p2 = create_test_participant(
+            "puuid2",
+            "Player2",
+            TeamId::RED,
+            false,
+            2,
+            10,
+            3,
+            0,
+            None,
+            false,
+        );
+        let team1 = create_test_team(TeamId::BLUE, true);
+        let team2 = create_test_team(TeamId::RED, false);
+        let match_info = create_test_match(
+            "NA1_OLD_MATCH",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(start_time - 1000 * 60 * 60),
+            vec![p1, p2],
+            vec![team1, team2],
+        );
+
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        assert!(queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .is_none());
+        assert!(pentakillers.is_empty());
+        assert!(dom_earners.is_empty());
+        Ok(())
+    }
+
+    // format_highlight_names test remains synchronous
+    fn format_highlight_names(names: &[String]) -> String {
+        match names.len() {
+            0 => String::new(),
+            1 => names[0].clone(),
+            2 => format!("{} and {}", names[0], names[1]),
+            _ => format!(
+                "{}, and {}",
+                names[..names.len() - 1].join(", "),
+                names.last().unwrap()
+            ),
+        }
+    }
+
+    #[test]
+    fn test_format_highlight_names() {
+        assert_eq!(format_highlight_names(&[]), "");
+        assert_eq!(format_highlight_names(&["Alice".to_string()]), "Alice");
+        assert_eq!(
+            format_highlight_names(&["Alice".to_string(), "Bob".to_string()]),
+            "Alice and Bob"
+        );
+        assert_eq!(
+            format_highlight_names(&[
+                "Alice".to_string(),
+                "Bob".to_string(),
+                "Charlie".to_string()
+            ]),
+            "Alice, Bob, and Charlie"
+        );
+    }
 }
