@@ -20,7 +20,6 @@ pub mod globetrotters {
     use serenity::builder;
     use serenity::model::application::CommandDataOption;
     use serenity::model::application::CommandOptionType;
-    use serenity::prelude::Context;
     use std::collections::HashMap;
     use tracing::error;
 
@@ -330,7 +329,6 @@ pub mod groups {
     use serenity::builder;
     use serenity::model::application::CommandOptionType;
     use serenity::model::guild::Member;
-    use serenity::prelude::Context;
     use std::sync::Arc;
     use std::{collections::HashSet, vec};
     use tracing::{debug, error};
@@ -498,7 +496,6 @@ pub mod register {
     use serenity::all::CreateCommandOption;
     use serenity::builder;
     use serenity::model::application::CommandOptionType;
-    use serenity::prelude::Context;
     use std::sync::Arc;
 
     use super::GameId;

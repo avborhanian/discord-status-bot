@@ -712,16 +712,16 @@ async fn fetch_seen_events(
     let ids_json = serde_json::to_string(match_ids)?;
 
     // Fetch all rows matching the IDs
-    let rows = sqlx::query( "SELECT id, queue_id, win, IFNULL(end_timestamp, 0) as end_ts, MatchInfo FROM match WHERE id IN (SELECT value FROM json_each(?))").bind(ids_json).fetch_all(pool).await?;
+    let rows = sqlx::query( "SELECT Id, QUEUE_ID, Win, IFNULL(END_TIMESTAMP, 0) as end_ts, MatchInfo FROM MATCH WHERE Id IN (SELECT value FROM json_each(?))").bind(ids_json).fetch_all(pool).await?;
 
     let mut seen_matches: HashMap<String, MatchInfo> = HashMap::new();
 
     // Process each row manually
     for row in rows {
         // Use try_get from SqlxRow trait
-        let id: String = row.try_get("id")?;
-        let queue_id_i64: i64 = row.try_get("queue_id")?;
-        let win: bool = row.try_get("win")?;
+        let id: String = row.try_get("Id")?;
+        let queue_id = row.try_get("QUEUE_ID")?;
+        let win: bool = row.try_get("Win")?;
         let timestamp_ms: i64 = row.try_get("end_ts")?; // Use alias 'end_ts'
         let match_info_str: Option<String> = row.try_get("MatchInfo")?;
 
@@ -750,7 +750,7 @@ async fn fetch_seen_events(
             id.clone(),
             MatchInfo {
                 id,
-                queue_id: queue_id_i64.to_string(), // Convert i64 to String
+                queue_id,
                 win,
                 end_timestamp,
                 match_info,
@@ -1443,7 +1443,6 @@ mod tests {
     use riven::consts::{Champion, PlatformRoute, Queue, Team as TeamId};
     use riven::models::match_v5::*;
     use std::collections::{HashMap, HashSet};
-    use std::env;
 
     // Helper to set up an in-memory database for testing
     async fn setup_in_memory_db_pool() -> Result<SqlitePool> {
@@ -1454,26 +1453,30 @@ mod tests {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS User (
                  DiscordId TEXT PRIMARY KEY,
-                 SummonerName TEXT NOT NULL UNIQUE
+                 SummonerName TEXT NOT NULL UNIQUE,
+                 DiscordUsername VARCHAR(255),
+                 DiscordDisplayName VARCHAR(255)
              );",
         )
         .execute(&pool)
         .await?;
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS summoner (
-                 puuid TEXT PRIMARY KEY,
-                 name TEXT NOT NULL UNIQUE
+            "CREATE TABLE IF NOT EXISTS Summoner (
+                 Id varchar(255),
+                 AccountId varchar(255),
+                 Puuid TEXT PRIMARY KEY,
+                 Name TEXT NOT NULL UNIQUE
              );",
         )
         .execute(&pool)
         .await?;
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS match (
-                 id TEXT PRIMARY KEY,
-                 queue_id INTEGER NOT NULL,
-                 win BOOLEAN NOT NULL,
-                 end_timestamp INTEGER,
-                 MatchInfo TEXT
+            "CREATE TABLE IF NOT EXISTS MATCH (
+                 Id TEXT PRIMARY KEY,
+                 QUEUE_ID VARCHAR(255) NOT NULL,
+                 Win BOOLEAN,
+                 END_TIMESTAMP DATETIME,
+                 MatchInfo BLOB
              );",
         )
         .execute(&pool)
@@ -1522,6 +1525,7 @@ mod tests {
     }
 
     // Helper to create a basic Participant struct
+    #[allow(deprecated)]
     fn create_test_participant(
         puuid: &str,
         summoner_name: &str,
@@ -1580,7 +1584,6 @@ mod tests {
             challenges: None, // Add challenges if needed for specific tests
             champ_experience: 15000,
             champ_level: 18,
-            #[allow(deprecated)]
             champion_id: Result::Ok(Champion::ANNIE),
             champion_name: "Annie".to_string(),
             champion_transform: 0,
