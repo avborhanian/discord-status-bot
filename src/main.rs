@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use crate::models::MatchInfo;
 use anyhow::Result;
-use anyhow::{anyhow, Context, Error, Ok}; // Added Context
-use chrono::DateTime;
+use anyhow::{anyhow, Context, Error, Ok};
 use chrono::Timelike;
 use chrono::{Datelike, TimeZone};
 use dotenvy::dotenv;
@@ -34,8 +33,7 @@ use serenity::model::prelude::Member;
 use serenity::model::{id::ChannelId, prelude::Interaction};
 use serenity::prelude::*;
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{Row, SqlitePool};
-use tokio::sync::RwLock; // Added RwLock explicitly
+use tokio::sync::RwLock;
 use tokio::task;
 use tokio::time;
 use tracing::{error, info};
@@ -46,13 +44,8 @@ use tracing_subscriber::{filter, prelude::*, Layer};
 static GLOBAL: Jemalloc = Jemalloc;
 
 mod commands;
+mod db;
 mod models;
-
-// Include the `items` module, which is generated from items.proto.
-pub mod log_models {
-    include!(concat!(env!("OUT_DIR"), "/log_models.rs"));
-    include!(concat!(env!("OUT_DIR"), "/log_models.serde.rs"));
-}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -99,7 +92,7 @@ async fn load_config() -> Result<Config> {
     });
     let log_path = PathBuf::from(log_path_str);
 
-    let db_path_str = env::var("DB_PATH").unwrap_or_else(|_| "sqlite://sqlite.db".to_string());
+    let db_path_str = env::var("DB_PATH").unwrap_or(String::from("sqlite://sqlite.db"));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5) // Configure pool size
@@ -140,16 +133,11 @@ macro_rules! riot_api {
                     Some(http::status::StatusCode::TOO_MANY_REQUESTS) => match e.take_response() {
                         Some(r) => {
                             let wait_time = Duration::from_secs(
-                                (String::from_utf8(
-                                    r.headers()
-                                        .get("retry-after")
-                                        .unwrap_or(&HeaderValue::from_str("2").unwrap())
-                                        .as_bytes()
-                                        .to_vec(),
-                                )
-                                .unwrap())
-                                .parse::<u64>()
-                                .unwrap(),
+                                r.headers()
+                                    .get("retry-after")
+                                    .unwrap_or(&HeaderValue::from_str("2").unwrap())
+                                    .to_str()?
+                                    .parse::<u64>()?,
                             ) + Duration::from_millis(
                                 (chrono::Local::now().timestamp_millis() % 1000 + 1000) as u64,
                             );
@@ -177,7 +165,7 @@ macro_rules! riot_api {
 }
 
 struct Handler {
-    users: Arc<RwLock<HashMap<u64, bool>>>,
+    users: Arc<RwLock<HashSet<u64>>>,
     current_status: Arc<RwLock<String>>,
     discord_auth: Arc<serenity::http::Http>,
     config: Arc<Config>, // Add config here
@@ -235,7 +223,7 @@ impl EventHandler for Handler {
                     info!("We found members");
                     let mut users = self.users.write().await;
                     for member in members {
-                        users.insert(member.user.id.get(), false);
+                        users.insert(member.user.id.get());
                     }
                 }
                 info!(
@@ -308,16 +296,7 @@ impl EventHandler for Handler {
     ) {
         // Use config for channel ID
         let voice_channel_id = self.config.voice_channel_id;
-        info!(
-            "Pattern we're checking is: ({}, {}, {})",
-            if old.is_some() { "Some" } else { "None" },
-            if new.channel_id.is_some() {
-                "Some"
-            } else {
-                "None"
-            },
-            if new.member.is_some() { "Some" } else { "None" }
-        );
+
         match (old, new.channel_id, new.member) {
             (None, None, None | Some(_)) => {
                 info!("I didn't think the None, None, None | Some(_) pattern could be reached");
@@ -328,7 +307,7 @@ impl EventHandler for Handler {
             (None, Some(new_channel_id), Some(ref member)) => {
                 if new_channel_id == voice_channel_id {
                     let mut users = self.users.write().await;
-                    users.insert(member.user.id.get(), false);
+                    users.insert(member.user.id.get());
                 }
             }
             (Some(old_channel), None | Some(_), None) => {
@@ -354,7 +333,7 @@ impl EventHandler for Handler {
             (Some(old_channel), Some(new_channel_id), Some(ref member)) => {
                 if new_channel_id == voice_channel_id {
                     let mut users = self.users.write().await;
-                    users.insert(member.user.id.get(), false);
+                    users.insert(member.user.id.get());
                 } else if let Some(channel_id) = old_channel.channel_id {
                     if voice_channel_id == channel_id {
                         if let Some(old_member) = old_channel.member {
@@ -432,7 +411,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let active_users: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new()));
+    let active_users: Arc<RwLock<HashSet<u64>>> = Arc::new(RwLock::new(HashSet::new()));
     let current_status: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
 
     // Use config for Discord bot token
@@ -477,7 +456,6 @@ async fn main() -> Result<()> {
     let background_riot_api = Arc::new(riot_api); // Put RiotApi in Arc if needed across awaits
     let background_discord_client = discord_client.clone();
     let background_current_status = current_status.clone();
-    // let background_active_users = active_users.clone(); // Not currently used in loop, but if needed
 
     let forever: task::JoinHandle<Result<()>> = task::spawn(async move {
         let mut start_time = get_start_time().unwrap_or_else(|e| {
@@ -492,16 +470,12 @@ async fn main() -> Result<()> {
 
         // Use config for DB path
         let pool = &background_config.pool;
-        let summoners = fetch_summoners(pool).await?;
+        let summoners = db::fetch_summoners(pool).await?;
         let active_summoner_names = summoners.values().cloned().collect::<HashSet<_>>(); // Collect names for puuid fetch
 
         loop {
-            // Fetch PUUIDs based on currently known summoners
-            // Note: This doesn't automatically pick up newly registered summoners until restart
-            // Consider refetching summoners periodically or triggering an update on registration
-            let puuids = fetch_puuids(pool, &active_summoner_names).await?;
+            let puuids = db::fetch_puuids(pool, &active_summoner_names).await?;
 
-            // Check for new day *before* iterating PUUIDs
             let new_start_time = get_start_time()?;
             let is_new_day = current_date < new_start_time;
 
@@ -615,153 +589,6 @@ async fn main() -> Result<()> {
     }
 }
 
-// --- Database Functions (Accept pool) ---
-
-async fn update_match(
-    pool: &sqlx::SqlitePool,
-    match_id: &String,
-    queue_id: i64,
-    is_win: bool,
-    end_timestamp: i64,
-    match_info: &Match,
-) -> Result<()> {
-    let match_info_json = serde_json::to_string(match_info)?;
-
-    sqlx::query(
-        "INSERT OR IGNORE INTO match (id, queue_id, win, end_timestamp, MatchInfo) VALUES (?, ?, ?, ?, ?);"
-    )
-    .bind(match_id)
-    .bind(queue_id)
-    .bind(is_win)
-    .bind(end_timestamp)
-    .bind(&match_info_json) // Bind JSON string
-    .execute(pool) // Execute against the pool
-    .await?; // Await the result
-
-    Ok(())
-}
-
-async fn fetch_discord_usernames(pool: &SqlitePool) -> Result<HashMap<String, String>> {
-    // Fetch rows as tuples (String, String)
-    let mappings: Vec<(String, String)> =
-        sqlx::query_as("SELECT DiscordId, LOWER(summonerName) FROM User")
-            .fetch_all(pool) // Fetch all results into a Vec
-            .await?;
-
-    // Convert Vec<(DiscordId, LowerSummonerName)> to HashMap<LowerSummonerName, DiscordId>
-    let summoner_map: HashMap<String, String> = mappings
-        .into_iter()
-        .map(|(id, name)| (name, id)) // Flip order for map
-        .collect();
-
-    Ok(summoner_map)
-}
-
-async fn fetch_puuids(
-    pool: &SqlitePool,
-    summoner_names: &HashSet<String>,
-) -> Result<HashSet<String>> {
-    if summoner_names.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    // Convert HashSet to Vec for binding
-    let names_vec: Vec<String> = summoner_names.iter().cloned().collect();
-    // Serialize the Vec to a JSON string for the IN clause workaround
-    let names_json = serde_json::to_string(&names_vec)?;
-
-    // Use query_scalar to fetch a single column directly
-    // The `json_each(?)` trick allows binding a list to an IN clause in SQLite with sqlx
-    let puuids: Vec<String> = sqlx::query_scalar(
-        "SELECT puuid FROM summoner WHERE name IN (SELECT value FROM json_each(?))",
-    )
-    .bind(names_json) // Bind the JSON array string
-    .fetch_all(pool)
-    .await?;
-
-    // Collect into HashSet
-    Ok(puuids.into_iter().collect())
-}
-
-async fn fetch_summoners(pool: &SqlitePool) -> Result<HashMap<u64, String>> {
-    // Fetch rows as tuples (String, String)
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT DiscordId, SummonerName FROM USER")
-        .fetch_all(pool)
-        .await?;
-
-    let mut summoners = HashMap::new();
-    for (discord_id_str, summoner_name) in rows {
-        // Parse DiscordId String to u64
-        let discord_id = discord_id_str
-            .parse::<u64>()
-            .with_context(|| format!("Failed to parse DiscordId '{}' as u64", discord_id_str))?;
-        summoners.insert(discord_id, summoner_name);
-    }
-    Ok(summoners)
-}
-
-async fn fetch_seen_events(
-    pool: &SqlitePool, // Accept pool
-    match_ids: &Vec<String>,
-) -> Result<HashMap<String, MatchInfo>> {
-    if match_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    // Serialize Vec<String> to JSON for IN clause
-    let ids_json = serde_json::to_string(match_ids)?;
-
-    // Fetch all rows matching the IDs
-    let rows = sqlx::query( "SELECT Id, QUEUE_ID, Win, IFNULL(END_TIMESTAMP, 0) as end_ts, MatchInfo FROM MATCH WHERE Id IN (SELECT value FROM json_each(?))").bind(ids_json).fetch_all(pool).await?;
-
-    let mut seen_matches: HashMap<String, MatchInfo> = HashMap::new();
-
-    // Process each row manually
-    for row in rows {
-        // Use try_get from SqlxRow trait
-        let id: String = row.try_get("Id")?;
-        let queue_id = row.try_get("QUEUE_ID")?;
-        let win: bool = row.try_get("Win")?;
-        let timestamp_ms: i64 = row.try_get("end_ts")?; // Use alias 'end_ts'
-        let match_info_str: Option<String> = row.try_get("MatchInfo")?;
-
-        // Parse timestamp
-        let end_timestamp = DateTime::from_timestamp_millis(timestamp_ms)
-            .ok_or_else(|| anyhow!("Invalid timestamp millis from DB: {}", timestamp_ms))?; // Use anyhow for error
-
-        // Parse MatchInfo JSON string
-        let match_info: Option<Match> = match match_info_str {
-            Some(s) if !s.is_empty() => {
-                match serde_json::from_str(&s) {
-                    Result::Ok(m) => Some(m),
-                    Err(e) => {
-                        error!("Failed to parse MatchInfo JSON for match {}: {}", id, e);
-                        // Decide how to handle parse errors: skip match, return error, etc.
-                        // Here, we'll skip the match_info field for this entry.
-                        None // Or return Err(anyhow!(...)) to fail the whole function
-                    }
-                }
-            }
-            _ => None,
-        };
-
-        // Insert into the result map
-        seen_matches.insert(
-            id.clone(),
-            MatchInfo {
-                id,
-                queue_id,
-                win,
-                end_timestamp,
-                match_info,
-            },
-        );
-    }
-    Ok(seen_matches)
-}
-
-// --- Core Logic Functions (Accept config or relevant parts) ---
-
 async fn check_match_history(
     riot_api: &RiotApi,
     discord_client: &Arc<serenity::http::Http>,
@@ -782,9 +609,9 @@ async fn check_match_history(
     let start_time = get_start_time()?;
     let pool = &config.pool; // Get DB path from config
 
-    let summoner_info = fetch_summoners(pool).await?;
+    let summoner_info = db::fetch_summoners(pool).await?;
     let summoner_names = summoner_info.values().cloned().collect::<HashSet<_>>();
-    let puuids = fetch_puuids(pool, &summoner_names).await?;
+    let puuids = db::fetch_puuids(pool, &summoner_names).await?;
 
     // Use a simple Vec to collect all match IDs, then deduplicate
     let mut all_match_ids: Vec<String> = Vec::new();
@@ -847,7 +674,7 @@ async fn check_match_history(
     }
 
     // Fetch info only for matches we haven't processed yet
-    let seen_matches = fetch_seen_events(pool, &unique_match_ids).await?;
+    let seen_matches = db::fetch_seen_events(pool, &unique_match_ids).await?;
     let mut pentakillers = Vec::new();
     let mut dom_earners = Vec::new();
 
@@ -930,6 +757,19 @@ fn process_seen_match_score(
     if let Some(info) = &match_info.match_info {
         queue_id = info.info.queue_id;
     } else {
+        return Ok(());
+    }
+
+    // If we don't have two participants in the match, skip it
+    if match_info.match_info.as_ref().is_none_or(|match_info| {
+        match_info
+            .info
+            .participants
+            .iter()
+            .filter(|p| puuids.contains(&p.puuid))
+            .count()
+            < 2
+    }) {
         return Ok(());
     }
 
@@ -1127,7 +967,7 @@ async fn update_match_info(
             match_info.metadata.match_id
         );
         let queue_id: i64 = u16::from(match_info.info.queue_id).into();
-        update_match(
+        db::update_match(
             pool,
             &match_info.metadata.match_id,
             queue_id,
@@ -1136,6 +976,22 @@ async fn update_match_info(
             match_info,
         )
         .await?;
+        return Ok(());
+    }
+
+    // Check if at least two discord users are present in the match, otherwise, early return OK(());
+    if match_info
+        .info
+        .participants
+        .iter()
+        .filter(|p| puuids.contains(&p.puuid))
+        .count()
+        < 2
+    {
+        info!(
+            "Match {} has less than 2 tracked PUUIDs. Skipping score update.",
+            match_info.metadata.match_id
+        );
         return Ok(());
     }
 
@@ -1209,7 +1065,7 @@ async fn update_match_info(
         }
     }
 
-    update_match(
+    db::update_match(
         pool,
         &match_info.metadata.match_id,
         queue_id,
@@ -1266,7 +1122,7 @@ async fn check_pentakill_info(
         return Ok(());
     }
 
-    let user_info = fetch_discord_usernames(&config.pool).await?;
+    let user_info = db::fetch_discord_usernames(&config.pool).await?;
     let mut pentakillers_by_discord_mention: Vec<_> = pentakillers
         .iter()
         .filter_map(|(_, summoner_name)| {
@@ -1325,7 +1181,7 @@ async fn check_doms_info(
         return Ok(());
     }
 
-    let user_info = fetch_discord_usernames(&config.pool).await?;
+    let user_info = db::fetch_discord_usernames(&config.pool).await?;
     let mut dom_earners_by_discord_mention: Vec<_> = dom_earners
         .iter()
         .filter_map(|(_, summoner_name)| {
@@ -1440,12 +1296,14 @@ async fn update_highlight_reel(
 mod tests {
     use super::*; // Import items from outer scope
     use models::Score;
-    use riven::consts::{Champion, PlatformRoute, Queue, Team as TeamId};
+    use riven::consts::{PlatformRoute, Queue, Team as TeamId};
     use riven::models::match_v5::*;
+    use sqlx::SqlitePool;
     use std::collections::{HashMap, HashSet};
+    use std::fs;
 
     // Helper to set up an in-memory database for testing
-    async fn setup_in_memory_db_pool() -> Result<SqlitePool> {
+    pub async fn setup_in_memory_db_pool() -> Result<SqlitePool> {
         // Connect to an in-memory database
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
 
@@ -1473,9 +1331,9 @@ mod tests {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS MATCH (
                  Id TEXT PRIMARY KEY,
-                 QUEUE_ID VARCHAR(255) NOT NULL,
+                 QUEUE_ID VARCHAR(255) NOT NULL, -- Storing as VARCHAR as in schema
                  Win BOOLEAN,
-                 END_TIMESTAMP DATETIME,
+                 END_TIMESTAMP INTEGER, -- Storing as INTEGER (Unix millis)
                  MatchInfo BLOB
              );",
         )
@@ -1486,7 +1344,7 @@ mod tests {
     }
 
     // Helper to create a basic Match struct for testing
-    fn create_test_match(
+    pub fn create_test_match(
         match_id: &str,
         queue_id: Queue,
         game_end_timestamp: Option<i64>,
@@ -1525,8 +1383,7 @@ mod tests {
     }
 
     // Helper to create a basic Participant struct
-    #[allow(deprecated)]
-    fn create_test_participant(
+    pub fn create_test_participant(
         puuid: &str,
         summoner_name: &str,
         team_id: TeamId,
@@ -1538,175 +1395,61 @@ mod tests {
         placement: Option<i32>, // For Arena
         early_surrender: bool,
     ) -> Participant {
-        Participant {
-            puuid: puuid.to_string(),
-            summoner_name: summoner_name.to_string(),
-            team_id,
-            win,
-            kills,
-            deaths,
-            assists,
-            penta_kills,
-            placement,
-            game_ended_in_early_surrender: early_surrender,
-            game_ended_in_surrender: !win && !early_surrender, // Simple assumption
-            missions: None,
-            player_score0: None,
-            player_score1: None,
-            player_score2: None,
-            player_score3: None,
-            player_score4: None,
-            player_score5: None,
-            player_score6: None,
-            player_score7: None,
-            player_score8: None,
-            player_score9: None,
-            player_score10: None,
-            player_score11: None,
-            player_augment1: None,
-            player_augment2: None,
-            player_augment3: None,
-            player_augment4: None,
-            player_augment5: None,
-            player_augment6: None,
-            player_subteam_id: None,
-            riot_id_game_name: None,
-            subteam_placement: None,
-            total_time_cc_dealt: 0,
-            retreat_pings: Some(0),
-            // Fill other fields with default/dummy values as needed for tests
-            all_in_pings: Some(0),
-            assist_me_pings: Some(0),
-            bait_pings: Some(0),
-            baron_kills: 0,
-            basic_pings: Some(0),
-            bounty_level: 0,
-            challenges: None, // Add challenges if needed for specific tests
-            champ_experience: 15000,
-            champ_level: 18,
-            champion_id: Result::Ok(Champion::ANNIE),
-            champion_name: "Annie".to_string(),
-            champion_transform: 0,
-            command_pings: Some(0),
-            consumables_purchased: 5,
-            damage_dealt_to_buildings: Some(5000),
-            damage_dealt_to_objectives: 8000,
-            damage_dealt_to_turrets: 5000,
-            damage_self_mitigated: 10000,
-            danger_pings: Some(0),
-            detector_wards_placed: 2,
-            double_kills: if kills >= 2 { 1 } else { 0 },
-            dragon_kills: 0,
-            eligible_for_progression: Some(true),
-            enemy_missing_pings: Some(0),
-            enemy_vision_pings: Some(0),
-            first_blood_assist: false,
-            first_blood_kill: false,
-            first_tower_assist: false,
-            first_tower_kill: false,
-            get_back_pings: Some(0),
-            gold_earned: 12000,
-            gold_spent: 11000,
-            hold_pings: Some(0),
-            individual_position: "MIDDLE".to_string(), // Example
-            inhibitor_kills: 1,
-            inhibitor_takedowns: Some(1),
-            inhibitors_lost: Some(0),
-            item0: 3020, // Example item ID
-            item1: 3157,
-            item2: 3089,
-            item3: 3135,
-            item4: 3165,
-            item5: 3117,
-            item6: 3340, // Trinket
-            items_purchased: 15,
-            killing_sprees: if kills >= 3 { 1 } else { 0 },
-            lane: "MIDDLE".to_string(), // Example
-            largest_critical_strike: 300,
-            largest_killing_spree: kills,
-            largest_multi_kill: if penta_kills > 0 {
-                5
-            } else if kills >= 2 {
-                2
-            } else {
-                1
-            },
-            longest_time_spent_living: 600,
-            magic_damage_dealt: 20000,
-            magic_damage_dealt_to_champions: 15000,
-            magic_damage_taken: 8000,
-            need_vision_pings: Some(0),
-            neutral_minions_killed: 20,
-            nexus_kills: if win { 1 } else { 0 },
-            nexus_lost: Some(if win { 0 } else { 1 }),
-            nexus_takedowns: Some(if win { 1 } else { 0 }),
-            objectives_stolen: 0,
-            objectives_stolen_assists: 0,
-            on_my_way_pings: Some(0),
-            participant_id: 1, // Example
-            perks: Perks {
-                stat_perks: riven::models::match_v5::PerkStats {
-                    defense: 5002,
-                    flex: 5008,
-                    offense: 5005,
-                },
-                styles: vec![], // Add perk styles if needed
-            },
-            physical_damage_dealt: 5000,
-            physical_damage_dealt_to_champions: 3000,
-            physical_damage_taken: 10000,
-            profile_icon: 123,
-            push_pings: Some(0),
-            quadra_kills: 0,
-            riot_id_name: None,
-            riot_id_tagline: None,
-            role: "SOLO".to_string(), // Example
-            sight_wards_bought_in_game: 5,
-            spell1_casts: 100,
-            spell2_casts: 80,
-            spell3_casts: 60,
-            spell4_casts: 20,
-            summoner1_casts: 5,
-            summoner1_id: 4, // Flash
-            summoner2_casts: 4,
-            summoner2_id: 14, // Ignite
-            summoner_id: "test_summoner_id".to_string(),
-            summoner_level: 30,
-            team_early_surrendered: early_surrender,
-            team_position: "MIDDLE".to_string(), // Example
-            time_c_cing_others: 10,
-            time_played: 1800,
-            total_ally_jungle_minions_killed: Some(5),
-            total_damage_dealt: 25000,
-            total_damage_dealt_to_champions: 18000,
-            total_damage_shielded_on_teammates: 1000,
-            total_damage_taken: 18000,
-            total_enemy_jungle_minions_killed: Some(15),
-            total_heal: 2000,
-            total_heals_on_teammates: 500,
-            total_minions_killed: 150,
-            total_time_spent_dead: 60,
-            total_units_healed: 5,
-            triple_kills: 0,
-            true_damage_dealt: 0,
-            true_damage_dealt_to_champions: 0,
-            true_damage_taken: 0,
-            turret_kills: 2,
-            turret_takedowns: Some(2),
-            turrets_lost: Some(1),
-            unreal_kills: 0,
-            vision_cleared_pings: Some(0),
-            vision_score: 25,
-            vision_wards_bought_in_game: 3,
-            wards_killed: 5,
-            wards_placed: 10,
-        }
+        // Construct the path relative to the Cargo manifest directory
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test_data/participant_template.json");
+
+        // Read the template file
+        let template_json = fs::read_to_string(&path).unwrap_or_else(|e| {
+            self::panic!("Failed to read participant template file {:?}: {}", path, e)
+        });
+
+        // Deserialize the template
+        let mut participant: Participant = serde_json::from_str(&template_json)
+            .unwrap_or_else(|e| self::panic!("Failed to deserialize participant template: {}", e));
+
+        // Override specific fields based on function arguments
+        participant.puuid = puuid.to_string();
+        participant.summoner_name = summoner_name.to_string();
+        participant.team_id = team_id;
+        participant.win = win;
+        participant.kills = kills;
+        participant.deaths = deaths;
+        participant.assists = assists;
+        participant.penta_kills = penta_kills;
+        participant.placement = placement;
+        participant.game_ended_in_early_surrender = early_surrender;
+        // Assume game_ended_in_surrender based on win/early_surrender for simplicity
+        participant.game_ended_in_surrender = !win && !early_surrender;
+        // Update teamEarlySurrendered based on the participant's team perspective
+        participant.team_early_surrendered = early_surrender;
+
+        // You might want to update other fields based on win/loss/kills too, e.g., nexus kills
+        participant.nexus_kills = if win { 1 } else { 0 };
+        participant.nexus_lost = Some(if win { 0 } else { 1 });
+        participant.nexus_takedowns = Some(if win { 1 } else { 0 });
+        participant.double_kills = if kills >= 2 { 1 } else { 0 }; // Simple example
+        participant.killing_sprees = if kills >= 3 { 1 } else { 0 }; // Simple example
+        participant.largest_killing_spree = kills; // Simple example
+        participant.largest_multi_kill = if penta_kills > 0 {
+            5
+        } else if kills >= 4 {
+            4
+        } else if kills >= 3 {
+            3
+        } else if kills >= 2 {
+            2
+        } else {
+            1
+        }; // Simple example
+
+        participant
     }
 
     // Helper to create a basic Team struct
-    fn create_test_team(team_id: TeamId, win: bool) -> riven::models::match_v5::Team {
+    pub fn create_test_team(team_id: TeamId, win: bool) -> riven::models::match_v5::Team {
         riven::models::match_v5::Team {
-            bans: vec![], // Add bans if needed
+            bans: vec![],
             objectives: riven::models::match_v5::Objectives {
                 baron: Objective {
                     first: false,
@@ -1715,7 +1458,7 @@ mod tests {
                 champion: Objective {
                     first: win,
                     kills: 20,
-                }, // Example kills
+                },
                 dragon: Objective {
                     first: false,
                     kills: 1,
@@ -1737,7 +1480,7 @@ mod tests {
             },
             team_id,
             win,
-            feats: None, // Add feats if needed
+            feats: None,
         }
     }
 
@@ -1803,129 +1546,13 @@ mod tests {
         );
     }
 
-    #[tokio::test] // Mark as async test
-    async fn test_fetch_summoners_db() -> Result<()> {
-        let pool = setup_in_memory_db_pool().await?; // Use async helper
-        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?1, ?2), (?3, ?4)")
-            .bind("111")
-            .bind("PlayerOne")
-            .bind("222")
-            .bind("PlayerTwo")
-            .execute(&pool)
-            .await?;
-
-        // Call the actual async function
-        let summoners = fetch_summoners(&pool).await?;
-
-        assert_eq!(summoners.len(), 2);
-        assert_eq!(summoners.get(&111), Some(&"PlayerOne".to_string()));
-        assert_eq!(summoners.get(&222), Some(&"PlayerTwo".to_string()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_fetch_puuids_db() -> Result<()> {
-        let pool = setup_in_memory_db_pool().await?;
-        sqlx::query("INSERT INTO summoner (puuid, name) VALUES (?1, ?2), (?3, ?4), (?5, ?6)")
-            .bind("puuid1")
-            .bind("playerone") // Keep names lowercase in DB for consistency
-            .bind("puuid2")
-            .bind("playertwo")
-            .bind("puuid3")
-            .bind("playerthree")
-            .execute(&pool)
-            .await?;
-
-        let summoner_names_to_fetch: HashSet<String> = HashSet::from([
-            "playerone".to_string(), // Use lowercase to match DB query logic
-            "playertwo".to_string(),
-            "playerfour".to_string(), // Non-existent
-        ]);
-
-        // Call the actual async function
-        let puuids = fetch_puuids(&pool, &summoner_names_to_fetch).await?;
-
-        assert_eq!(puuids.len(), 2);
-        assert!(puuids.contains("puuid1"));
-        assert!(puuids.contains("puuid2"));
-        assert!(!puuids.contains("puuid3"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_update_and_fetch_match_db() -> Result<()> {
-        let pool = setup_in_memory_db_pool().await?;
-        let now = chrono::Local::now().timestamp_millis();
-        let match_id = "NA1_TESTMATCH1".to_string();
-        let queue_id = Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO;
-        let is_win = true;
-
-        let participant1 = create_test_participant(
-            "puuid1",
-            "Player1",
-            TeamId::BLUE,
-            true,
-            5,
-            2,
-            10,
-            0,
-            None,
-            false,
-        );
-        let team1 = create_test_team(TeamId::BLUE, true);
-        let team2 = create_test_team(TeamId::RED, false);
-        let test_match = create_test_match(
-            &match_id,
-            queue_id,
-            Some(now),
-            vec![participant1],
-            vec![team1, team2],
-        );
-
-        // Call the actual async update function
-        update_match(
-            &pool,
-            &match_id,
-            i64::from(u16::from(queue_id)),
-            is_win,
-            now,
-            &test_match,
-        )
-        .await?;
-
-        // Call the actual async fetch function
-        let matches_to_fetch = vec![match_id.clone()];
-        let seen_matches_map = fetch_seen_events(&pool, &matches_to_fetch).await?;
-
-        assert_eq!(seen_matches_map.len(), 1);
-        let fetched_info = seen_matches_map.get(&match_id).unwrap();
-
-        assert_eq!(fetched_info.id, match_id);
-        assert_eq!(
-            fetched_info.queue_id,
-            i64::from(u16::from(queue_id)).to_string()
-        );
-        assert_eq!(fetched_info.win, is_win);
-        assert_eq!(fetched_info.end_timestamp.timestamp_millis(), now);
-        assert!(fetched_info.match_info.is_some());
-        assert_eq!(
-            fetched_info.match_info.as_ref().unwrap().metadata.match_id,
-            match_id
-        );
-
-        Ok(())
-    }
-
-    // --- update_match_info tests need #[tokio::test] and .await ---
-    // They also need a dummy pool, even if update_match isn't the primary focus
-
     #[tokio::test]
     async fn test_update_match_info_standard_win() -> Result<()> {
         let pool = setup_in_memory_db_pool().await?; // Need pool for update_match call
         let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
         let queue_ids: HashMap<Queue, &str> =
             HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
-        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string()]);
+        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string(), "puuid2".to_string()]);
         let mut pentakillers = Vec::new();
         let mut dom_earners = Vec::new();
         let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
@@ -1994,7 +1621,12 @@ mod tests {
         let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
         let queue_ids: HashMap<Queue, &str> =
             HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
-        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string()]);
+        let puuids: HashSet<String> = HashSet::from([
+            "puuid1".to_string(),
+            "puuid2".to_string(),
+            "puuid3".to_string(),
+            "puuid4".to_string(),
+        ]);
         let mut pentakillers = Vec::new();
         let mut dom_earners = Vec::new();
         let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
@@ -2167,7 +1799,8 @@ mod tests {
         let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
         let queue_ids: HashMap<Queue, &str> =
             HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
-        let puuids: HashSet<String> = HashSet::from(["puuid_penta".to_string()]);
+        let puuids: HashSet<String> =
+            HashSet::from(["puuid_penta".to_string(), "puuid_other".to_string()]);
         let mut pentakillers = Vec::new();
         let mut dom_earners = Vec::new();
         let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
@@ -2235,7 +1868,8 @@ mod tests {
         let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
         let queue_ids: HashMap<Queue, &str> =
             HashMap::from([(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO, "Solo")]);
-        let puuids: HashSet<String> = HashSet::from(["puuid_doms".to_string()]);
+        let puuids: HashSet<String> =
+            HashSet::from(["puuid_doms".to_string(), "puuid_other".to_string()]);
         let mut pentakillers = Vec::new();
         let mut dom_earners = Vec::new();
         let start_time = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
@@ -2259,7 +1893,7 @@ mod tests {
             false,
             5,
             5,
-            5,
+            4,
             0,
             None,
             false,
@@ -2586,30 +2220,16 @@ mod tests {
         Ok(())
     }
 
-    // format_highlight_names test remains synchronous
-    fn format_highlight_names(names: &[String]) -> String {
-        match names.len() {
-            0 => String::new(),
-            1 => names[0].clone(),
-            2 => format!("{} and {}", names[0], names[1]),
-            _ => format!(
-                "{}, and {}",
-                names[..names.len() - 1].join(", "),
-                names.last().unwrap()
-            ),
-        }
-    }
-
     #[test]
-    fn test_format_highlight_names() {
-        assert_eq!(format_highlight_names(&[]), "");
-        assert_eq!(format_highlight_names(&["Alice".to_string()]), "Alice");
+    fn test_format_names_list() {
+        assert_eq!(format_names_list(&[]), "");
+        assert_eq!(format_names_list(&["Alice".to_string()]), "Alice");
         assert_eq!(
-            format_highlight_names(&["Alice".to_string(), "Bob".to_string()]),
+            format_names_list(&["Alice".to_string(), "Bob".to_string()]),
             "Alice and Bob"
         );
         assert_eq!(
-            format_highlight_names(&[
+            format_names_list(&[
                 "Alice".to_string(),
                 "Bob".to_string(),
                 "Charlie".to_string()

@@ -486,9 +486,9 @@ pub mod groups {
 }
 
 pub mod register {
+    use crate::db;
     use crate::Config;
     use anyhow::anyhow;
-    use anyhow::Context as AnyhowContext;
     use anyhow::Result;
     use riven::RiotApi;
     use serenity::all::CommandDataOption;
@@ -600,29 +600,17 @@ pub mod register {
             GameId::SummonerName(name) => name.to_string(),
         };
 
-        sqlx::query(
-            "INSERT OR REPLACE INTO User (DiscordId, SummonerName, DiscordUsername, DiscordDisplayName) VALUES (?, ?, ?, ?);"
+        db::register_user_summoner(
+            pool,
+            user.id.get(),
+            &user.name,
+            user.global_name.as_deref().unwrap_or(&user.name),
+            &summoner_name_lower,
+            &summoner_info.puuid,
+            &summoner_info.id,
+            &summoner_info.account_id,
         )
-        .bind(&user.id.get().to_string())
-        .bind(&summoner_name_lower) // Store lowercase name
-        .bind(&user.name)
-        .bind(&user.global_name.unwrap_or_else(|| user.name.clone())) // Use global_name if available
-        .execute(pool)
-        .await
-        .context("Failed to insert/update user data into User table")?;
-
-        // Insert or Update Summoner table
-        // Using INSERT OR REPLACE based on puuid primary key
-        sqlx::query(
-            "INSERT OR REPLACE INTO Summoner (puuid, name, id, accountId) VALUES (?, ?, ?, ?);",
-        )
-        .bind(&summoner_info.puuid)
-        .bind(&summoner_name_lower) // Store lowercase name/riot id
-        .bind(&summoner_info.id) // Summoner ID
-        .bind(&summoner_info.account_id) // Account ID
-        .execute(pool)
-        .await
-        .context("Failed to insert/update summoner data into Summoner table")?;
+        .await?;
 
         // Return a success message
         Ok(format!(
