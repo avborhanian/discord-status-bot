@@ -164,14 +164,17 @@ pub async fn fetch_seen_events(
 /// Inserts or replaces user and summoner data during registration.
 pub async fn register_user_summoner(
     pool: &SqlitePool,
-    discord_id: u64,
-    discord_username: &str,
-    discord_display_name: &str,
-    riot_id_or_summoner_name: &str, // Combined name#tag or just name
-    puuid: &str,
-    summoner_id: &str,
-    account_id: &str,
+    user: &serenity::model::user::User,
+    summoner_name_lower: &str,
+    summoner_info: &riven::models::summoner_v4::Summoner,
 ) -> Result<()> {
+    let discord_id: u64 = user.id.get();
+    let discord_username: &str = &user.name;
+    let discord_display_name: &str = user.global_name.as_deref().unwrap_or(&user.name);
+    let riot_id_or_summoner_name: &str = summoner_name_lower;
+    let puuid: &str = &summoner_info.puuid;
+    let summoner_id: &str = &summoner_info.id;
+    let account_id: &str = &summoner_info.account_id;
     // Use a transaction for atomicity
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
@@ -179,7 +182,7 @@ pub async fn register_user_summoner(
     sqlx::query(
         "INSERT OR REPLACE INTO User (DiscordId, SummonerName, DiscordUsername, DiscordDisplayName) VALUES (?, ?, ?, ?);"
     )
-    .bind(&discord_id.to_string())
+    .bind(discord_id.to_string())
     .bind(riot_id_or_summoner_name) // Store the provided name/riot id (lowercase handled by caller if needed)
     .bind(discord_username)
     .bind(discord_display_name)
@@ -508,13 +511,26 @@ mod tests {
         // Initial registration
         register_user_summoner(
             &pool,
-            discord_id,
-            discord_username,
-            discord_display_name,
+            &serde_json::from_str(
+                r#"{
+                "username": "TestUser",
+                "id": 123456789,
+                "global_name": "Test Display Name"
+            }"#,
+            )
+            .unwrap(), // Placeholder
             riot_id,
-            puuid,
-            summoner_id,
-            account_id,
+            &serde_json::from_str(
+                r#"{
+                "puuid": "test_puuid_123",
+                "id": "test_summoner_id_456",
+                "accountId": "test_account_id_789",
+                "profileIconId": 1234,
+                "revisionDate": 1234567890,
+                "summonerLevel": 30
+            }"#,
+            )
+            .unwrap(),
         )
         .await?;
 
@@ -549,7 +565,6 @@ mod tests {
         assert_eq!(fetched_id, summoner_id);
         assert_eq!(fetched_account_id, account_id);
 
-        // Test REPLACE functionality (update existing user/summoner)
         let updated_riot_id = "UpdatedRiot#NA1";
         let updated_summoner_id = "updated_summoner_id";
         let updated_account_id = "updated_account_id";
@@ -558,13 +573,26 @@ mod tests {
 
         register_user_summoner(
             &pool,
-            discord_id, // Same discord ID
-            updated_discord_username,
-            updated_discord_display_name,
+            &serde_json::from_str(
+                r#"{
+                "username": "UpdatedUsername",
+                "id": 123456789,
+                "global_name": "Updated Display"
+            }"#,
+            )
+            .unwrap(),
             updated_riot_id,
-            puuid, // Same puuid
-            updated_summoner_id,
-            updated_account_id,
+            &serde_json::from_str(
+                r#"{
+                "accountId": "updated_account_id",
+                "id": "updated_summoner_id",
+                "puuid": "test_puuid_123",
+                "profileIconId": 1234,
+                "revisionDate": 1234567890,
+                "summonerLevel": 30
+            }"#,
+            )
+            .unwrap(),
         )
         .await?;
 

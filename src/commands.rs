@@ -8,15 +8,11 @@ fn f64_to_usize(value: f64) -> Result<usize> {
     Result::Ok(result)
 }
 
-enum GameId {
-    SummonerName(String),
-    RiotId(String, String),
-}
-
 pub mod globetrotters {
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use serenity::all::CommandDataOptionValue;
     use serenity::all::CreateCommandOption;
+    use serenity::all::CreateInteractionResponseMessage;
     use serenity::builder;
     use serenity::model::application::CommandDataOption;
     use serenity::model::application::CommandOptionType;
@@ -49,7 +45,10 @@ pub mod globetrotters {
             )
     }
 
-    pub fn run(_ctx: &serenity::prelude::Context, options: &[CommandDataOption]) -> Result<String> {
+    pub fn run(
+        _ctx: &serenity::prelude::Context,
+        options: &[CommandDataOption],
+    ) -> Result<CreateInteractionResponseMessage> {
         let choice: usize = options
             .iter()
             .find(|o| o.name == "challenge")
@@ -62,9 +61,9 @@ pub mod globetrotters {
                 }
             });
         if choice == 0 {
-            return Result::Ok(
+            return Result::Err(anyhow!(
                 "Unable to handle the result sent for whatever reason. Bug Araam.".to_string(),
-            );
+            ));
         }
 
         // You can update the list using https://wiki.leagueoflegends.com/en-us/Challenges#Faction_Challenges
@@ -302,16 +301,15 @@ pub mod globetrotters {
         ]);
 
         if let Some(champs_list) = map.get(&choice) {
-            return Result::Ok(format!(
+            return Result::Ok(CreateInteractionResponseMessage::new().content(format!(
                 "Here are the champs required to complete the challenge:\n\n{}",
                 champs_list
                     .iter()
                     .map(|c| format!("- {}", c.name().unwrap_or("Unknown")))
                     .collect::<Vec<_>>()
-                    .join("\n")
-            ));
+                    .join("\n"))));
         }
-        Result::Ok("No idea lol".to_string())
+        Result::Err(anyhow!("No idea lol".to_string()))
     }
 }
 
@@ -326,6 +324,7 @@ pub mod groups {
     use serenity::all::CommandDataOptionValue;
     use serenity::all::CreateCommand;
     use serenity::all::CreateCommandOption;
+    use serenity::all::CreateInteractionResponseMessage;
     use serenity::builder;
     use serenity::model::application::CommandOptionType;
     use serenity::model::guild::Member;
@@ -353,7 +352,7 @@ pub mod groups {
         ctx: &serenity::prelude::Context,
         options: &[CommandDataOption],
         config: Arc<Config>,
-    ) -> Result<String> {
+    ) -> Result<CreateInteractionResponseMessage> {
         let channel_fetch = ctx.http.get_channel(config.voice_channel_id).await;
         let channel;
         if let Result::Ok(c) = channel_fetch {
@@ -386,7 +385,7 @@ pub mod groups {
         for (_, [user_id]) in
             re.captures_iter(options.iter().find(|o| o.name == "ignore").map_or("", |o| {
                 match &o.value {
-                    CommandDataOptionValue::String(s) => &s,
+                    CommandDataOptionValue::String(s) => s,
                     _ => "",
                 }
             }))
@@ -445,20 +444,22 @@ pub mod groups {
             }
         };
 
-        Ok(generate(&members_to_group, total_groups, &mut thread_rng()))
+        generate(&members_to_group, total_groups, &mut thread_rng())
     }
 
     pub fn generate<R: rand::RngCore>(
         members_to_group: &[Member],
         number_of_groups: usize,
         rng: &mut R,
-    ) -> String {
+    ) -> Result<CreateInteractionResponseMessage> {
         let mut members_to_group = members_to_group.to_owned();
         members_to_group.shuffle(rng);
 
         let mut results = Vec::new();
         if members_to_group.len() < number_of_groups {
-            return "Too many groups requested, and not enough users.".to_owned();
+            return Err(anyhow!(
+                "Too many groups requested, and not enough users.".to_owned()
+            ));
         }
 
         let quotient = members_to_group.len() / number_of_groups;
@@ -481,24 +482,24 @@ pub mod groups {
             );
         }
 
-        results.join("\n\n")
+        Ok(CreateInteractionResponseMessage::new().content(results.join("\n\n")))
     }
 }
 
 pub mod register {
     use crate::db;
+    use crate::riot_utils::parse_summoner_input;
+    use crate::riot_utils::GameId;
     use crate::Config;
-    use anyhow::anyhow;
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use riven::RiotApi;
     use serenity::all::CommandDataOption;
     use serenity::all::CommandDataOptionValue;
     use serenity::all::CreateCommandOption;
+    use serenity::all::CreateInteractionResponseMessage;
     use serenity::builder;
     use serenity::model::application::CommandOptionType;
     use std::sync::Arc;
-
-    use super::GameId;
 
     pub fn register() -> builder::CreateCommand {
         builder::CreateCommand::new("register")
@@ -525,207 +526,324 @@ pub mod register {
         ctx: &serenity::prelude::Context,
         options: &[CommandDataOption],
         config: Arc<Config>,
-    ) -> Result<String> {
+    ) -> Result<CreateInteractionResponseMessage> {
         let riot_api = RiotApi::new(&config.riot_api_token);
         let pool = &config.pool;
 
         let user_id = match options.iter().find(|o| o.name == "user") {
             Some(user_option) => match &user_option.value {
                 CommandDataOptionValue::User(user) => *user,
-                _ => return Ok("Expected a user, found something else.".to_string()),
+                _ => return Err(anyhow!("Expected a user, found something else.".to_string())),
             },
             None => {
-                return Ok("Looks like no user id specified.".to_string());
+                return Err(anyhow!("Looks like no user id specified.".to_string()));
             }
         };
 
-        let user = ctx.http.get_user(user_id).await?;
+        let user: serenity::all::User = ctx.http.get_user(user_id).await?;
 
-        let account: GameId = match options.iter().find(|o| o.name == "summoner") {
+        let GameId { name, tag } = match options.iter().find(|o| o.name == "summoner") {
             Some(account_option) => match &account_option.value {
-                CommandDataOptionValue::String(name) => {
-                    let text = name.trim();
-                    if text.is_empty() {
-                        return Ok("No name specified".to_string());
-                    }
-                    if text.contains('#') {
-                        let mut parts = text.split('#');
-                        GameId::RiotId(
-                            parts
-                                .next()
-                                .ok_or(anyhow!("No display name specified".to_string()))?
-                                .to_string(),
-                            parts
-                                .next()
-                                .ok_or(anyhow!("No Riot tag specified".to_string()))?
-                                .to_string(),
-                        )
-                    } else {
-                        GameId::SummonerName(text.to_string())
-                    }
-                }
-                _ => return Ok("No name specified".to_string()),
+                CommandDataOptionValue::String(name) => parse_summoner_input(name)?,
+                _ => return Err(anyhow!("No name specified".to_string())),
             },
-            None => return Ok("No name specified".to_string()),
+            None => return Err(anyhow!("No name specified".to_string())),
         };
 
-        let summoner_info = match &account {
-            GameId::RiotId(name, tag) => {
-                let account = riot_api
-                    .account_v1()
-                    .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
-                    .await?;
-                match account {
-                    Some(account) => {
-                        riot_api
-                            .summoner_v4()
-                            .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
-                            .await?
-                    }
-                    None => {
-                        return Ok("Unable to find the matching account".to_string());
-                    }
-                }
-            }
-            GameId::SummonerName(name) => {
+        let account = riot_api
+            .account_v1()
+            .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
+            .await?;
+        let summoner_info = match account {
+            Some(account) => {
                 riot_api
                     .summoner_v4()
-                    .get_by_account_id(riven::consts::PlatformRoute::NA1, &name)
+                    .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
                     .await?
+            }
+            None => {
+                return Err(anyhow!("Unable to find the matching account".to_string()));
             }
         };
 
-        let summoner_name_lower = &match &account {
-            GameId::RiotId(name, tag) => format!("{name}#{tag}"),
-            GameId::SummonerName(name) => name.to_string(),
-        };
+        let summoner_name_lower = format!("{name}#{tag}");
 
-        db::register_user_summoner(
-            pool,
-            user.id.get(),
-            &user.name,
-            user.global_name.as_deref().unwrap_or(&user.name),
-            &summoner_name_lower,
-            &summoner_info.puuid,
-            &summoner_info.id,
-            &summoner_info.account_id,
-        )
-        .await?;
+        db::register_user_summoner(pool, &user, &summoner_name_lower, &summoner_info).await?;
 
         // Return a success message
-        Ok(format!(
+        Ok(CreateInteractionResponseMessage::new().content(format!(
             "Successfully registered Discord user '{}' with Riot account '{}'.",
             user.name, summoner_name_lower
-        ))
+        )))
     }
 }
 
-// pub mod clash {
-//     use anyhow::{anyhow, Result};
-//     use riven::RiotApi;
-//     use serenity::builder;
-//     use serenity::model::application::CommandDataOption;
-//     use serenity::model::application::CommandOptionType;
-//     use serenity::prelude::Context;
+pub mod clash {
+    use crate::riot_utils::GameId;
+    use anyhow::{anyhow, Result};
+    use riven::RiotApi;
+    use serenity::all::CreateCommandOption;
+    use serenity::all::CreateInteractionResponseMessage;
+    use serenity::builder;
+    use serenity::model::application::CommandDataOption;
+    use serenity::model::application::CommandOptionType;
+    use std::sync::Arc;
 
-//     use super::GameId;
+    use crate::Config;
 
-//     #[allow(dead_code)]
-//     pub fn register() -> builder::CreateCommand {
-//         command: &mut builder::CreateCommand,
-//     ) -> &mut builder::CreateCommand {
-//         &mut command
-//             .name("clash")
-//             .description("Looks up clash team info based on a player on the enemy team.")
-//             .add_option(|option: CreateCommandOption| {
-//                 option
-//                     .name("summoner")
-//                     .description("The summoner name / riot id.")
-//                     .kind(CommandOptionType::String)
-//                     .required(true)
-//             })
-//     }
+    #[allow(dead_code)]
+    pub fn register() -> builder::CreateCommand {
+        builder::CreateCommand::new("clash")
+            .description("Looks up clash team info based on a player on the enemy team.")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "summoner",
+                    "The summoner name / riot id.",
+                )
+                .required(true),
+            )
+    }
 
-//     #[allow(dead_code)]
-//     pub async fn run(_ctx: &serenity::prelude::Context, options: &[CommandDataOption]) -> Result<String> {
-//         let riot_api_key: &str = &env::var("RIOT_API_TOKEN")?;
-//         let riot_api = RiotApi::new(riot_api_key);
+    #[allow(dead_code)]
+    pub async fn run(
+        _ctx: &serenity::prelude::Context,
+        options: &[CommandDataOption],
+        config: Arc<Config>,
+    ) -> Result<CreateInteractionResponseMessage> {
+        let riot_api = RiotApi::new(&config.riot_api_token);
 
-//         let account: GameId = match options.iter().find(|o| o.name == "summoner") {
-//             Some(account_option) => match account_option.value.as_ref()?.as_str() {
-//                 Some(name) => {
-//                     let text = name.trim();
-//                     if text.is_empty() {
-//                         return Err(anyhow!("No name specified".to_string()));
-//                     }
-//                     if text.contains('#') {
-//                         let mut parts = text.split('#');
-//                         GameId::RiotId(
-//                             parts.next()?.to_string(),
-//                             parts.next()?.to_string(),
-//                         )
-//                     } else {
-//                         GameId::SummonerName(text.to_string())
-//                     }
-//                 }
-//                 None => return Err(anyhow!("No name specified".to_string())),
-//             },
-//             None => return Err(anyhow!("No name specified".to_string())),
-//         };
+        let GameId { name, tag } = match options.iter().find(|o| o.name == "summoner") {
+            Some(account_option) => match account_option.value.as_str() {
+                Some(name) => {
+                    let text = name.trim();
+                    if text.is_empty() {
+                        return Err(anyhow!("No name specified".to_string()));
+                    }
+                    if text.contains('#') {
+                        let mut parts = text.split('#');
+                        GameId {
+                            name: parts
+                                .next()
+                                .ok_or(anyhow!("No display name specified"))?
+                                .to_string(),
+                            tag: parts
+                                .next()
+                                .ok_or(anyhow!("No Riot tag specified"))?
+                                .to_string(),
+                        }
+                    } else {
+                        return Err(anyhow!("No name specified".to_string()));
+                    }
+                }
+                None => return Err(anyhow!("No name specified".to_string())),
+            },
+            None => return Err(anyhow!("No name specified".to_string())),
+        };
 
-//         let member_info = match &account {
-//             GameId::RiotId(name, tag) => {
-//                 let account = riot_api
-//                     .account_v1()
-//                     .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, name, tag)
-//                     .await
-//                     ?;
-//                 match account {
-//                     Some(account) => riot_api
-//                         .summoner_v4()
-//                         .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
-//                         .await
-//                         ?,
-//                     None => {
-//                         return Err(anyhow!("Unable to find the matching account".to_string()));
-//                     }
-//                 }
-//             }
-//             GameId::SummonerName(name) => riot_api
-//                 .summoner_v4()
-//                 .get_by_summoner_name(riven::consts::PlatformRoute::NA1, name)
-//                 .await
-//                 ?
-//                 ?,
-//         };
+        let account = riot_api
+            .account_v1()
+            .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
+            .await?;
+        let member_info = match account {
+            Some(account) => {
+                riot_api
+                    .summoner_v4()
+                    .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
+                    .await?
+            }
+            None => {
+                return Err(anyhow!("Unable to find the matching account".to_string()));
+            }
+        };
 
-//         let clash_players = riot_api
-//             .clash_v1()
-//             .get_players_by_summoner(riven::consts::PlatformRoute::NA1, &member_info.id)
-//             .await?;
-//         let clash_tournaments = riot_api
-//             .clash_v1()
-//             .get_tournaments(riven::consts::PlatformRoute::NA1)
-//             .await?;
-//         let _ = clash_tournaments.iter().filter(|t| {
-//             t.schedule
-//                 .iter()
-//                 .any(|phase| phase.start_time <= chrono::Local::now().timestamp_micros())
-//         });
-//         let _team_ids = clash_players
-//             .iter()
-//             .filter_map(|player| player.team_id.as_ref())
-//             .map(|team_id| async {
-//                 let _team_fetch = riot_api
-//                     .clash_v1()
-//                     .get_team_by_id(riven::consts::PlatformRoute::NA1, team_id)
-//                     .await
-//                     ?;
-//             });
+        let clash_players = riot_api
+            .clash_v1()
+            .get_players_by_puuid(riven::consts::PlatformRoute::NA1, &member_info.puuid)
+            .await?;
+        let clash_tournaments = riot_api
+            .clash_v1()
+            .get_tournaments(riven::consts::PlatformRoute::NA1)
+            .await?;
+        let _ = clash_tournaments.iter().filter(|t| {
+            t.schedule
+                .iter()
+                .any(|phase| phase.start_time <= chrono::Local::now().timestamp_micros())
+        });
+        let _team_ids = clash_players
+            .iter()
+            .filter_map(|player| player.team_id.as_ref())
+            .map(|team_id| async {
+                let _team_fetch = riot_api
+                    .clash_v1()
+                    .get_team_by_id(riven::consts::PlatformRoute::NA1, team_id)
+                    .await
+                    .unwrap_or_default();
+            });
 
-//         Ok(String::new())
-//     }
-// }
+        Ok(CreateInteractionResponseMessage::new().content(""))
+    }
+}
+
+pub mod rank {
+    use crate::db;
+    use crate::riot_utils::{parse_summoner_input, riot_api, GameId};
+    use crate::Config;
+    use anyhow::{anyhow, Context, Result};
+    use riven::consts::{PlatformRoute, QueueType, RegionalRoute};
+    use riven::RiotApi;
+    use serenity::all::{
+        CommandDataOption, CommandDataOptionValue, CreateCommand, CreateCommandOption, CreateEmbed,
+        CreateInteractionResponseMessage, User,
+    };
+    use serenity::builder;
+    use serenity::model::application::CommandOptionType;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    pub fn register() -> builder::CreateCommand {
+        CreateCommand::new("rank")
+            .description("Fetches the Ranked Solo/Duo and Flex queue stats for a player.")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "summoner",
+                    "The summoner name or Riot ID (Name#Tag). Optional: Defaults to your registered account.",
+                )
+                .required(false), // Make it optional
+            )
+    }
+
+    pub async fn run(
+        _ctx: &serenity::prelude::Context,
+        options: &[CommandDataOption],
+        config: Arc<Config>,
+        caller: &User, // Pass the user who invoked the command
+    ) -> Result<CreateInteractionResponseMessage> {
+        // Return CreateEmbed for richer output
+        let riot_api = RiotApi::new(&config.riot_api_token);
+        let pool = &config.pool;
+
+        let target_account_input: Option<&str> =
+            options.iter().find(|o| o.name == "summoner").and_then(|o| {
+                if let CommandDataOptionValue::String(s) = &o.value {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            });
+
+        let (puuid, display_name) = match target_account_input {
+            // --- User provided a summoner name/Riot ID ---
+            Some(input_str) => {
+                let GameId { name, tag } = parse_summoner_input(input_str)?;
+                let display_name = input_str.to_string(); // Use the raw input for display initially
+                let account_result = riot_api!(
+                    riot_api
+                        .account_v1()
+                        .get_by_riot_id(RegionalRoute::AMERICAS, &name, &tag)
+                        .await
+                );
+
+                let account_puuid = match account_result {
+                    Ok(Some(acc)) => Ok(acc.puuid),
+                    Ok(None) => Err(anyhow!("Riot ID `{name}#{tag}` not found.")),
+                    Err(e) => Err(anyhow!("Error fetching Riot ID: {}", e)),
+                }?;
+                (account_puuid, display_name)
+            }
+            // --- No summoner provided, look up registered user ---
+            None => {
+                let registered_summoners = db::fetch_summoners(pool)
+                    .await
+                    .context("Failed to fetch registered summoners from DB")?;
+
+                if let Some(summoner_name_or_riot_id) = registered_summoners.get(&caller.id.get()) {
+                    // Grab puuid from the database.
+                    let summoner_names =
+                        HashSet::from([registered_summoners[&caller.id.get()].clone()]);
+                    let puuids = db::fetch_puuids(pool, &summoner_names)
+                        .await
+                        .context("Failed to fetch PUUID from DB")?;
+                    // grab the only puuid from the hashset of puuids.
+                    let account_puuid = puuids
+                        .iter()
+                        .next()
+                        .ok_or(anyhow!("No PUUID found for the registered summoner."))?;
+                    (account_puuid.to_string(), summoner_name_or_riot_id.clone())
+                } else {
+                    return Err(anyhow!(
+                        "You are not registered. Use `/register` or provide a summoner name/Riot ID."
+                    ));
+                }
+            }
+        };
+
+        let league_entries_result = riot_api!(
+            riot_api
+                .league_v4()
+                .get_league_entries_by_puuid(PlatformRoute::NA1, &puuid)
+                .await
+        );
+
+        let league_entries = match league_entries_result {
+            Ok(entries) => entries,
+            Err(e) => return Err(anyhow!("Error fetching rank information: {}", e)),
+        };
+
+        // --- Build the Embed ---
+        let mut embed = CreateEmbed::new()
+            .title(format!("Ranked Stats for {}", display_name))
+            // You could add a thumbnail using DataDragon profile icon URL if desired
+            // .thumbnail(format!("https://ddragon.leagueoflegends.com/cdn/14.1.1/img/profileicon/{}.png", summoner.profile_icon_id)) // Example URL, check current patch
+            .color(0x0099FF); // Discord blue color
+
+        let mut found_rank = false;
+
+        for entry in league_entries {
+            let queue_name = match entry.queue_type {
+                QueueType::RANKED_SOLO_5x5 => "Ranked Solo/Duo",
+                QueueType::RANKED_FLEX_SR => "Ranked Flex 5v5",
+                _ => continue, // Skip other queue types like TFT or Cherry
+            };
+            found_rank = true;
+
+            let tier = entry
+                .tier
+                .map_or("Unranked".to_string(), |t| format!("{:?}", t));
+            let rank = entry.rank.map_or("".to_string(), |r| format!("{:?}", r));
+            let lp = entry.league_points;
+            let wins = entry.wins;
+            let losses = entry.losses;
+            let win_rate = if wins + losses > 0 {
+                (wins as f64 / (wins + losses) as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let rank_str = if tier != "Unranked" {
+                format!("{} {}", tier, rank)
+            } else {
+                tier // Just "Unranked"
+            };
+
+            embed = embed.field(
+                queue_name,
+                format!(
+                    "**{}**\n{} LP\n{:.1}% WR ({}W / {}L)",
+                    rank_str, lp, win_rate, wins, losses
+                ),
+                true, // Inline field
+            );
+        }
+
+        if !found_rank {
+            embed = embed.description("This player is unranked in Solo/Duo and Flex queues.");
+        }
+
+        Ok(CreateInteractionResponseMessage::new().embed(embed))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -734,6 +852,22 @@ mod tests {
     use serenity::model::prelude::Member;
 
     use crate::commands::groups::generate;
+
+    macro_rules! assert_content {
+        ($content:expr, $value:expr) => {
+            assert_eq!(
+                $content,
+                serde_json::to_value($value.unwrap())
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .get("content")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            );
+        };
+    }
 
     fn member(id: u64, nick_name: &str) -> Member {
         serde_json::from_str(&format!(
@@ -762,7 +896,7 @@ mod tests {
             2,
             &mut rng,
         );
-        assert_eq!("Group 1:\n\n<@234>\n\nGroup 2:\n\n<@123>", value);
+        assert_content!("Group 1:\n\n<@234>\n\nGroup 2:\n\n<@123>", value);
     }
 
     #[test]
@@ -777,7 +911,7 @@ mod tests {
             2,
             &mut rng,
         );
-        assert_eq!("Group 1:\n\n<@234> <@345>\n\nGroup 2:\n\n<@123>", value);
+        assert_content!("Group 1:\n\n<@234> <@345>\n\nGroup 2:\n\n<@123>", value);
     }
 
     #[test]
@@ -792,7 +926,10 @@ mod tests {
             4,
             &mut rng,
         );
-        assert_eq!("Too many groups requested, and not enough users.", value);
+        assert_eq!(
+            "Too many groups requested, and not enough users.",
+            value.unwrap_err().to_string()
+        );
     }
 
     #[test]
@@ -807,7 +944,7 @@ mod tests {
             3,
             &mut rng,
         );
-        assert_eq!(
+        assert_content!(
             "Group 1:\n\n<@234>\n\nGroup 2:\n\n<@345>\n\nGroup 3:\n\n<@123>",
             value
         );
@@ -823,6 +960,6 @@ mod tests {
             4,
             &mut rng,
         );
-        assert_eq!("Group 1:\n\n<@9> <@8> <@7> <@6> <@12>\n\nGroup 2:\n\n<@2> <@14> <@1> <@19> <@10>\n\nGroup 3:\n\n<@13> <@5> <@17> <@16> <@18>\n\nGroup 4:\n\n<@11> <@15> <@20> <@4> <@3>", value);
+        assert_content!("Group 1:\n\n<@9> <@8> <@7> <@6> <@12>\n\nGroup 2:\n\n<@2> <@14> <@1> <@19> <@10>\n\nGroup 3:\n\n<@13> <@5> <@17> <@16> <@18>\n\nGroup 4:\n\n<@11> <@15> <@20> <@4> <@3>", value);
     }
 }

@@ -16,7 +16,6 @@ use futures::future::FutureExt;
 use futures::select;
 use futures::stream;
 use futures_util::StreamExt;
-use http::HeaderValue;
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use models::Score;
@@ -46,6 +45,9 @@ static GLOBAL: Jemalloc = Jemalloc;
 mod commands;
 mod db;
 mod models;
+mod riot_utils;
+
+use riot_utils::riot_api;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -111,59 +113,6 @@ async fn load_config() -> Result<Config> {
     })
 }
 
-macro_rules! riot_api {
-    ($response:expr) => {{
-        let result = $response;
-        match result {
-            Result::Err(mut e) => {
-                let status_code = { e.status_code().clone() };
-                return match status_code {
-                    None => Result::Err(anyhow!(
-                        "{}",
-                        match e.take_response() {
-                            Some(r) => {
-                                let message = r.text();
-                                let text = message.await?;
-                                text.clone()
-                            }
-                            None => String::from("<no response>"),
-                        }
-                    )),
-                    Some(http::status::StatusCode::FORBIDDEN) => panic!("The Riot Key is bad."),
-                    Some(http::status::StatusCode::TOO_MANY_REQUESTS) => match e.take_response() {
-                        Some(r) => {
-                            let wait_time = Duration::from_secs(
-                                r.headers()
-                                    .get("retry-after")
-                                    .unwrap_or(&HeaderValue::from_str("2").unwrap())
-                                    .to_str()?
-                                    .parse::<u64>()?,
-                            ) + Duration::from_millis(
-                                (chrono::Local::now().timestamp_millis() % 1000 + 1000) as u64,
-                            );
-                            tokio::time::sleep(wait_time).await;
-                            return Result::Err(anyhow!(
-                                "Rate limited - had to wait {} seconds",
-                                wait_time.as_secs()
-                            ));
-                        }
-                        None => {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            return Result::Err(anyhow!(
-                                "Rate limited - didn't know what to wait, so waited 2 seconds"
-                            ));
-                        }
-                    },
-                    _s => {
-                        return Result::Err(anyhow!(e));
-                    }
-                };
-            }
-            Result::Ok(s) => Result::<_, anyhow::Error>::Ok(s),
-        }
-    }};
-}
-
 struct Handler {
     users: Arc<RwLock<HashSet<u64>>>,
     current_status: Arc<RwLock<String>>,
@@ -175,7 +124,7 @@ impl Handler {
     async fn remove_user(&self, member: &Member) {
         let mut users = self.users.write().await;
         users.remove(&member.user.id.get());
-        if users.len() == 0 {
+        if users.is_empty() {
             let message = self.current_status.read().await.to_string();
             info!("Len is 0, going to update the status to {}", message);
             match update_discord_status(
@@ -202,7 +151,7 @@ fn mode_score(queue_id: &Queue, score: &Score) -> String {
             score.wins, score.top_finishes, score.bottom_finishes,
         );
     } else if score.warmup > 0 && score.games == 0 && *queue_id != Queue::SUMMONERS_RIFT_CLASH {
-        return format!("🏃");
+        return "🏃".to_string();
     }
     format!(
         "{}\u{2006}-\u{2006}{}",
@@ -240,6 +189,7 @@ impl EventHandler for Handler {
                 commands::groups::register(),
                 commands::globetrotters::register(),
                 commands::register::register(),
+                commands::rank::register(),
             ],
         )
         .await
@@ -256,7 +206,7 @@ impl EventHandler for Handler {
                 command.data.name.as_str()
             );
 
-            let content = match command.data.name.as_str() {
+            let message = match command.data.name.as_str() {
                 "groups" => {
                     commands::groups::run(&ctx, &command.data.options, self.config.clone()).await
                 }
@@ -264,22 +214,28 @@ impl EventHandler for Handler {
                 "register" => {
                     commands::register::run(&ctx, &command.data.options, self.config.clone()).await
                 }
-                _ => Err(anyhow!("not implemented :(".to_string())),
+                "rank" => {
+                    commands::rank::run(
+                        &ctx,
+                        &command.data.options,
+                        self.config.clone(),
+                        &command.user,
+                    )
+                    .await
+                }
+                x => Err(anyhow!(format!("{x} is not implemented :("))),
             };
 
             if let Err(why) = command
                 .create_response(
                     &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new().content(content.unwrap_or_else(
-                            |error| {
-                                format!(
-                                    "An error occurred while processing your command: {}",
-                                    error
-                                )
-                            },
-                        )),
-                    ),
+                    CreateInteractionResponse::Message(message.unwrap_or_else(|error| {
+                        info!("Error: {}", error);
+                        CreateInteractionResponseMessage::new().content(format!(
+                            "An error occurred while processing your command: {}",
+                            error
+                        ))
+                    })),
                 )
                 .await
             {
@@ -773,14 +729,14 @@ fn process_seen_match_score(
         return Ok(());
     }
 
-    let game_score = queue_scores.entry(queue_id).or_insert_with(Score::default);
+    let game_score = queue_scores.entry(queue_id).or_default();
 
     let early_surrender = match &match_info.match_info {
         Some(info) => info
             .info
             .participants
             .first()
-            .map_or(false, |p| p.game_ended_in_early_surrender),
+            .is_some_and(|p| p.game_ended_in_early_surrender),
         None => false,
     };
 
@@ -917,6 +873,7 @@ fn generate_status_message(
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_match_info(
     pool: &sqlx::SqlitePool,
     match_info: &Match,
@@ -951,15 +908,13 @@ async fn update_match_info(
         return Ok(());
     }
 
-    let game_score = queue_scores
-        .entry(match_info.info.queue_id)
-        .or_insert_with(Score::default);
+    let game_score = queue_scores.entry(match_info.info.queue_id).or_default();
 
     let early_surrender = match_info
         .info
         .participants
         .first()
-        .map_or(false, |p| p.game_ended_in_early_surrender);
+        .is_some_and(|p| p.game_ended_in_early_surrender);
 
     if early_surrender {
         info!(

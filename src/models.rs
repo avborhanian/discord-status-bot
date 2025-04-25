@@ -10,11 +10,11 @@ pub struct Score {
     pub bottom_finishes: u32,
 }
 
+#[allow(dead_code)]
 pub struct MatchInfo {
     pub id: String,
     pub queue_id: String,
     pub win: bool,
-    #[allow(dead_code)]
     pub end_timestamp: chrono::DateTime<Utc>,
     #[allow(clippy::struct_field_names)]
     pub match_info: Option<Match>,
