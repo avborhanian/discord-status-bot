@@ -794,9 +794,7 @@ pub mod rank {
         // --- Build the Embed ---
         let mut embed = CreateEmbed::new()
             .title(format!("Ranked Stats for {}", display_name))
-            // You could add a thumbnail using DataDragon profile icon URL if desired
-            // .thumbnail(format!("https://ddragon.leagueoflegends.com/cdn/14.1.1/img/profileicon/{}.png", summoner.profile_icon_id)) // Example URL, check current patch
-            .color(0x0099FF); // Discord blue color
+            .color(0x0099FF);
 
         let mut found_rank = false;
 
@@ -804,7 +802,7 @@ pub mod rank {
             let queue_name = match entry.queue_type {
                 QueueType::RANKED_SOLO_5x5 => "Ranked Solo/Duo",
                 QueueType::RANKED_FLEX_SR => "Ranked Flex 5v5",
-                _ => continue, // Skip other queue types like TFT or Cherry
+                _ => continue,
             };
             found_rank = true;
 

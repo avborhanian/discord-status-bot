@@ -754,8 +754,7 @@ fn process_seen_match_score(
                         if seen_placements.insert(position) {
                             if position == 1 {
                                 game_score.wins += 1;
-                            }
-                            if position <= 4 {
+                            } else if position <= 4 {
                                 game_score.top_finishes += 1;
                             } else {
                                 game_score.bottom_finishes += 1;
@@ -979,8 +978,7 @@ async fn update_match_info(
                         if position == 1 {
                             is_win = true;
                             game_score.wins += 1;
-                        }
-                        if position <= 4 {
+                        } else if position <= 4 {
                             game_score.top_finishes += 1;
                         } else {
                             game_score.bottom_finishes += 1;
