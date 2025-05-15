@@ -557,6 +557,7 @@ async fn check_match_history(
         (Queue::SUMMONERS_RIFT_5V5_BLIND_PICK, "Blind"),
         (Queue::SUMMONERS_RIFT_5V5_RANKED_FLEX, "Flex"),
         (Queue::SUMMONERS_RIFT_NORMAL_SWIFTPLAY, "Swiftplay"),
+        (Queue(2300), "Brawl"),
         (Queue::HOWLING_ABYSS_5V5_ARAM, "ARAM"),
         (Queue::SUMMONERS_RIFT_CLASH, "Clash"),
         (Queue::ARENA_2V2V2V2_CHERRY, "Arena"),
