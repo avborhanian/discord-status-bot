@@ -500,7 +500,6 @@ pub mod register {
     use serenity::builder;
     use serenity::model::application::CommandOptionType;
     use std::sync::Arc;
-
     pub fn register() -> builder::CreateCommand {
         builder::CreateCommand::new("register")
             .description("Adds a new user to the database.")
@@ -700,6 +699,7 @@ pub mod rank {
     use serenity::model::application::CommandOptionType;
     use std::collections::HashSet;
     use std::sync::Arc;
+    use tracing::error;
 
     pub fn register() -> builder::CreateCommand {
         CreateCommand::new("rank")

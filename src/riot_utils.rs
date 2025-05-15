@@ -13,7 +13,7 @@ macro_rules! riot_api {
         match result {
             Result::Err(mut e) => {
                 let status_code = { e.status_code().clone() };
-                println!("Error: {:?}", e);
+                error!("Error: {:?}", e);
                 return match status_code {
                     None => Result::Err(anyhow!(
                         "{}",
