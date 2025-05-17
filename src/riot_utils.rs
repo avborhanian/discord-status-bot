@@ -25,9 +25,9 @@ macro_rules! riot_api {
                             None => String::from("<no response>"),
                         }
                     )),
-                    Some(http::status::StatusCode::FORBIDDEN) => {
-                        error!("The Riot Key is bad, or riot cooked the api again.")
-                    }
+                    Some(http::status::StatusCode::FORBIDDEN) => Result::Err(anyhow!(
+                        "The Riot Key is bad, or riot cooked the api again."
+                    )),
                     Some(http::status::StatusCode::TOO_MANY_REQUESTS) => match e.take_response() {
                         Some(r) => {
                             let wait_time = Duration::from_secs(

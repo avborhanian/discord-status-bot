@@ -699,7 +699,6 @@ pub mod rank {
     use serenity::model::application::CommandOptionType;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use tracing::error;
 
     pub fn register() -> builder::CreateCommand {
         CreateCommand::new("rank")
