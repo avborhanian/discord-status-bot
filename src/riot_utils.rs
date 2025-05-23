@@ -93,3 +93,79 @@ pub fn parse_summoner_input(input: &str) -> Result<GameId> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*; // imports parse_summoner_input and GameId
+
+    #[test]
+    fn test_parse_valid_input() {
+        let result = parse_summoner_input("PlayerName#NA1").unwrap();
+        assert_eq!(result.name, "PlayerName");
+        assert_eq!(result.tag, "NA1");
+    }
+
+    #[test]
+    fn test_parse_with_spaces() {
+        let result = parse_summoner_input("  Player Name With Spaces  # EUW  ").unwrap();
+        assert_eq!(result.name, "Player Name With Spaces");
+        assert_eq!(result.tag, "EUW");
+    }
+
+    #[test]
+    fn test_parse_missing_hash() {
+        let result = parse_summoner_input("PlayerNameNA1");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid Riot ID format: Expected format is 'name#tag'."
+        );
+    }
+
+    #[test]
+    fn test_parse_missing_name() {
+        let result = parse_summoner_input("#NA1");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid Riot ID format: Name or tag part is empty."
+        );
+    }
+
+    #[test]
+    fn test_parse_missing_tag() {
+        let result = parse_summoner_input("PlayerName#");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid Riot ID format: Name or tag part is empty."
+        );
+    }
+    
+    #[test]
+    fn test_parse_empty_string() {
+        let result = parse_summoner_input("");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Summoner name/Riot ID cannot be empty."
+        );
+    }
+
+    #[test]
+    fn test_parse_only_hash() {
+        let result = parse_summoner_input("#");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid Riot ID format: Name or tag part is empty."
+        );
+    }
+
+    #[test]
+    fn test_parse_multiple_hashes() {
+        let result = parse_summoner_input("Player#Name#Tag").unwrap();
+        assert_eq!(result.name, "Player");
+        assert_eq!(result.tag, "Name"); // It will take the first part as name and second as tag, ignoring the rest after the second #
+    }
+}

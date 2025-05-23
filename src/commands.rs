@@ -588,99 +588,408 @@ pub mod clash {
     use serenity::model::application::CommandOptionType;
     use std::sync::Arc;
 
+    use crate::db;
+    use crate::riot_utils::{parse_summoner_input, riot_api, GameId};
     use crate::Config;
+    use anyhow::Context;
+    use chrono::{DateTime, Local, TimeZone, Utc};
+    use riven::consts::{PlatformRoute, RegionalRoute};
+    use serenity::all::{CommandDataOptionValue, User};
+    use std::collections::HashSet;
 
-    #[allow(dead_code)]
     pub fn register() -> builder::CreateCommand {
         builder::CreateCommand::new("clash")
-            .description("Looks up clash team info based on a player on the enemy team.")
+            .description("Provides information about League of Legends Clash tournaments.")
             .add_option(
                 CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "summoner",
-                    "The summoner name / riot id.",
+                    CommandOptionType::SubCommand,
+                    "schedule",
+                    "View the schedule for upcoming Clash tournaments.",
+                ), // No options for this subcommand
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "myteam",
+                    "View details of your currently active Clash team and tournament progress.",
+                ), // No options for this subcommand
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "scout",
+                    "Get basic public information about an opponent's Clash team.",
                 )
-                .required(true),
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "summoner",
+                        "The Riot ID (Name#Tag) of a player on the team to scout.",
+                    )
+                    .required(true),
+                ),
             )
     }
 
-    #[allow(dead_code)]
     pub async fn run(
         _ctx: &serenity::prelude::Context,
         options: &[CommandDataOption],
         config: Arc<Config>,
+        caller: &User,
     ) -> Result<CreateInteractionResponseMessage> {
         let riot_api = RiotApi::new(&config.riot_api_token);
+        let pool = &config.pool;
 
-        let GameId { name, tag } = match options.iter().find(|o| o.name == "summoner") {
-            Some(account_option) => match account_option.value.as_str() {
-                Some(name) => {
-                    let text = name.trim();
-                    if text.is_empty() {
-                        return Err(anyhow!("No name specified".to_string()));
-                    }
-                    if text.contains('#') {
-                        let mut parts = text.split('#');
-                        GameId {
-                            name: parts
-                                .next()
-                                .ok_or(anyhow!("No display name specified"))?
-                                .to_string(),
-                            tag: parts
-                                .next()
-                                .ok_or(anyhow!("No Riot tag specified"))?
-                                .to_string(),
+        // Check which subcommand was called
+        if let Some(subcommand) = options.get(0) {
+            if subcommand.name == "schedule" {
+                // Logic for the "schedule" subcommand
+                let all_tournaments = riot_api!(riot_api
+                    .clash_v1()
+                    .get_tournaments(PlatformRoute::NA1)
+                    .await)
+                    .context("Failed to fetch Clash tournaments from Riot API.")?;
+
+                let now_ms = Utc::now().timestamp_millis();
+
+                let mut upcoming_tournaments: Vec<_> = all_tournaments
+                    .into_iter()
+                    .filter_map(|t| {
+                        let relevant_phases: Vec<_> = t
+                            .schedule
+                            .clone()
+                            .into_iter()
+                            .filter(|phase| {
+                                phase.start_time >= now_ms
+                                    || (phase.registration_time < now_ms && phase.start_time > now_ms)
+                            })
+                            .collect();
+
+                        if relevant_phases.is_empty() {
+                            None
+                        } else {
+                            let mut tournament_with_filtered_phases = t.clone();
+                            tournament_with_filtered_phases.schedule = relevant_phases;
+                            // Sort phases within the tournament by start time
+                            tournament_with_filtered_phases.schedule.sort_by_key(|p| p.start_time);
+                            Some(tournament_with_filtered_phases)
                         }
-                    } else {
-                        return Err(anyhow!("No name specified".to_string()));
+                    })
+                    .collect();
+
+                // Sort tournaments by the start time of their earliest phase
+                upcoming_tournaments.sort_by_key(|t| {
+                    t.schedule.first().map_or(i64::MAX, |p| p.start_time)
+                });
+
+                if upcoming_tournaments.is_empty() {
+                    return Ok(CreateInteractionResponseMessage::new()
+                        .content("No upcoming Clash tournaments found at the moment."));
+                }
+
+                let mut response_content = "**Upcoming Clash Tournaments:**\n\n".to_string();
+                for tournament in upcoming_tournaments {
+                    response_content.push_str(&format!(
+                        "**Tournament:** {} ({}) - Theme ID: {}\n", // Clarified Theme ID
+                        tournament.name_key, tournament.name_key_secondary, tournament.theme_id
+                    ));
+                    response_content.push_str("__Phases:__\n");
+                    for phase in tournament.schedule {
+                        let registration_dt_opt: Option<DateTime<Local>> = Local
+                            .timestamp_millis_opt(phase.registration_time).single();
+                        let start_dt_opt: Option<DateTime<Local>> =
+                            Local.timestamp_millis_opt(phase.start_time).single();
+
+                        let registration_str = registration_dt_opt
+                            .map_or_else(|| "Invalid time".to_string(), |dt| dt.format("%Y-%m-%d %H:%M %Z").to_string());
+                        let start_str = start_dt_opt
+                            .map_or_else(|| "Invalid time".to_string(), |dt| dt.format("%Y-%m-%d %H:%M %Z").to_string());
+
+                        response_content.push_str(&format!(
+                            "  - **Phase {}**: Registration: `{}`, Starts: `{}` (Cancelled: {})\n",
+                            phase.id,
+                            registration_str,
+                            start_str,
+                            phase.cancelled
+                        ));
+                    }
+                    response_content.push_str("\n"); // Add a newline between tournaments
+                }
+                return Ok(CreateInteractionResponseMessage::new().content(response_content));
+            } else if subcommand.name == "myteam" {
+                // Logic for the "myteam" subcommand
+                let registered_summoners = db::fetch_summoners(pool)
+                    .await
+                    .context("Error: Could not retrieve your registration details from the database. Please try again or contact an admin if the issue persists.")?;
+
+                let user_riot_id_str = match registered_summoners.get(&caller.id.get()) {
+                    Some(riot_id) => riot_id.clone(),
+                    None => {
+                        return Ok(CreateInteractionResponseMessage::new().content(
+                            "You are not registered. Please use `/register` first to link your Riot account.",
+                        ));
+                    }
+                };
+
+                let puuids = db::fetch_puuids(pool, &HashSet::from([user_riot_id_str.clone()])) // Cloning user_riot_id_str
+                    .await
+                    .context(format!("Error: Could not fetch your Riot account details (PUUID) for {}. Please try re-registering or contact an admin.", user_riot_id_str))?;
+                
+                let user_puuid = match puuids.iter().next() {
+                    Some(puuid) => puuid.to_string(),
+                    None => return Err(anyhow!("Error: Could not find PUUID for your registered Riot ID ({}). This is unexpected. Please contact an admin or try re-registering.", user_riot_id_str)),
+                };
+
+                let player_teams_dto = riot_api!(riot_api
+                    .clash_v1()
+                    .get_players_by_puuid(PlatformRoute::NA1, &user_puuid)
+                    .await)
+                    .with_context(|| format!("Error: Could not fetch your Clash team information from Riot API for PUUID: {}.", user_puuid))?;
+
+                if player_teams_dto.is_empty() {
+                    return Ok(CreateInteractionResponseMessage::new()
+                        .content("You are not currently part of any Clash team."));
+                }
+
+                let mut relevant_team_details = Vec::new();
+                let now_ms = Utc::now().timestamp_millis();
+
+                for player_dto in player_teams_dto {
+                    if let Some(team_id) = &player_dto.team_id {
+                        let team_dto = match riot_api!(riot_api
+                            .clash_v1()
+                            .get_team_by_id(PlatformRoute::NA1, team_id)
+                            .await) {
+                                Ok(Some(dto)) => dto,
+                                Ok(None) => {
+                                    eprintln!("Clash API: Team with ID {} not found for player PUUID {}", team_id, user_puuid);
+                                    continue; // Skip this team if not found
+                                }
+                                Err(e) => return Err(anyhow!("Error: Could not fetch details for your Clash team (ID: {}). Riot API Error: {}", team_id, e)),
+                            };
+
+                        let tournament_dto = match riot_api!(riot_api
+                            .clash_v1()
+                            .get_tournament_by_id(PlatformRoute::NA1, &team_dto.tournament_id.to_string())
+                            .await) {
+                                Ok(Some(dto)) => dto,
+                                Ok(None) => {
+                                    eprintln!("Clash API: Tournament with ID {} not found for team ID {}", team_dto.tournament_id, team_id);
+                                    continue; // Skip if associated tournament not found
+                                }
+                                Err(e) => return Err(anyhow!("Error: Could not fetch tournament details (ID: {}) for your Clash team (ID: {}). Riot API Error: {}", team_dto.tournament_id, team_id, e)),
+                            };
+                        
+                        let is_tournament_relevant = tournament_dto.schedule.iter().any(|phase| {
+                            phase.start_time >= now_ms || (phase.registration_time < now_ms && phase.start_time > now_ms)
+                        });
+
+                        if is_tournament_relevant {
+                            let mut team_info_str = format!(
+                                "**Team Name:** {}\n**Tier:** {}\n**Tournament:** {} ({})\n**Roster:**\n",
+                                team_dto.name, team_dto.tier, tournament_dto.name_key, tournament_dto.name_key_secondary
+                            );
+                            for player in team_dto.players {
+                                // Fetching Riot ID for each player.summoner_id to display Name#Tag
+                                // This is an N+1 problem, consider if this is acceptable performance-wise.
+                                // For now, as per instructions, displaying summoner_id.
+                                // If Riot IDs were needed, a separate lookup for each summoner_id -> PUUID -> Riot ID would be required,
+                                // or a bulk lookup if available.
+                                team_info_str.push_str(&format!(
+                                    "  - {} (Role: {})\n", // Placeholder for Name#Tag if available, using summoner_id for now
+                                    player.summoner_id, player.role // player.summoner_id is SummonerId (String)
+                                ));
+                            }
+                            relevant_team_details.push(team_info_str);
+                        }
                     }
                 }
-                None => return Err(anyhow!("No name specified".to_string())),
-            },
-            None => return Err(anyhow!("No name specified".to_string())),
-        };
 
-        let account = riot_api
-            .account_v1()
-            .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
-            .await?;
-        let member_info = match account {
-            Some(account) => {
-                riot_api
-                    .summoner_v4()
-                    .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
-                    .await?
-            }
-            None => {
-                return Err(anyhow!("Unable to find the matching account".to_string()));
-            }
-        };
+                if relevant_team_details.is_empty() {
+                    return Ok(CreateInteractionResponseMessage::new().content(
+                        "You are not part_of a Clash team in an active or upcoming tournament.",
+                    ));
+                }
 
-        let clash_players = riot_api
-            .clash_v1()
-            .get_players_by_puuid(riven::consts::PlatformRoute::NA1, &member_info.puuid)
-            .await?;
-        let clash_tournaments = riot_api
-            .clash_v1()
-            .get_tournaments(riven::consts::PlatformRoute::NA1)
-            .await?;
-        let _ = clash_tournaments.iter().filter(|t| {
-            t.schedule
-                .iter()
-                .any(|phase| phase.start_time <= chrono::Local::now().timestamp_micros())
-        });
-        let _team_ids = clash_players
-            .iter()
-            .filter_map(|player| player.team_id.as_ref())
-            .map(|team_id| async {
-                let _team_fetch = riot_api
+                return Ok(CreateInteractionResponseMessage::new()
+                    .content(relevant_team_details.join("\n\n---\n\n")));
+            } else if subcommand.name == "scout" {
+                // Logic for the "scout" subcommand
+                let summoner_input_option = subcommand
+                    .options
+                    .get(0)
+                    .ok_or_else(|| anyhow!("Internal error: Missing 'summoner' option for scout subcommand. Please report this."))?;
+
+                let summoner_riot_id_str = match &summoner_input_option.value {
+                    CommandDataOptionValue::String(s) => s,
+                    _ => return Err(anyhow!("Internal error: 'summoner' option was not a string. Please report this.")),
+                };
+
+                let GameId { name, tag } = parse_summoner_input(summoner_riot_id_str)
+                    .map_err(|e| anyhow!("Error: Invalid Riot ID format for '{}'. Expected 'Name#Tag'. {}", summoner_riot_id_str, e))?;
+
+                let account_dto = riot_api!(riot_api
+                    .account_v1()
+                    .get_by_riot_id(RegionalRoute::AMERICAS, &name, &tag)
+                    .await)
+                    .with_context(|| format!("Error: Could not fetch Riot account for '{}#{}'. The Riot API might be down or the ID is incorrect.", name, tag))?;
+
+                let target_puuid = match account_dto {
+                    Some(acc) => acc.puuid,
+                    None => {
+                        return Ok(CreateInteractionResponseMessage::new()
+                            .content(format!("Error: Riot ID '{}#{}' not found.", name, tag)));
+                    }
+                };
+                
+                let player_teams_dto = riot_api!(riot_api
                     .clash_v1()
-                    .get_team_by_id(riven::consts::PlatformRoute::NA1, team_id)
-                    .await
-                    .unwrap_or_default();
-            });
+                    .get_players_by_puuid(PlatformRoute::NA1, &target_puuid)
+                    .await)
+                    .with_context(|| format!("Error: Could not fetch Clash team information from Riot API for player {}#{}.", name, tag))?;
 
-        Ok(CreateInteractionResponseMessage::new().content(""))
+                if player_teams_dto.is_empty() {
+                    return Ok(CreateInteractionResponseMessage::new().content(format!(
+                        "Player **{}#{}** is not currently part of any Clash team.",
+                        name, tag
+                    )));
+                }
+
+                let mut relevant_team_details = Vec::new();
+                let now_ms = Utc::now().timestamp_millis();
+
+                for player_dto in player_teams_dto {
+                    if let Some(team_id) = &player_dto.team_id {
+                        let team_dto = match riot_api!(riot_api
+                            .clash_v1()
+                            .get_team_by_id(PlatformRoute::NA1, team_id)
+                            .await) {
+                                Ok(Some(dto)) => dto,
+                                Ok(None) => {
+                                    eprintln!("Clash API: Team with ID {} not found for player PUUID {}", team_id, target_puuid);
+                                    continue; 
+                                }
+                                Err(e) => return Err(anyhow!("Error: Could not fetch details for Clash team (ID: {}). Riot API Error: {}", team_id, e)),
+                            };
+
+                        let tournament_dto = match riot_api!(riot_api
+                            .clash_v1()
+                            .get_tournament_by_id(PlatformRoute::NA1, &team_dto.tournament_id.to_string())
+                            .await) {
+                                Ok(Some(dto)) => dto,
+                                Ok(None) => {
+                                    eprintln!("Clash API: Tournament with ID {} not found for team ID {}", team_dto.tournament_id, team_id);
+                                    continue;
+                                }
+                                Err(e) => return Err(anyhow!("Error: Could not fetch tournament details (ID: {}) for Clash team (ID: {}). Riot API Error: {}", team_dto.tournament_id, team_id, e)),
+                            };
+                        
+                        let is_tournament_relevant = tournament_dto.schedule.iter().any(|phase| {
+                            phase.start_time >= now_ms || (phase.registration_time < now_ms && phase.start_time > now_ms)
+                        });
+
+                        if is_tournament_relevant {
+                            let mut team_info_str = format!(
+                                "**Team Name:** {}\n**Tier:** {}\n**Tournament:** {} ({})\n**Target Player:** {}#{}\n**Roster:**\n",
+                                team_dto.name, team_dto.tier, tournament_dto.name_key, tournament_dto.name_key_secondary, name, tag
+                            );
+                            for player in team_dto.players {
+                                // As in myteam, displaying summoner_id. A full Name#Tag display would require more lookups.
+                                team_info_str.push_str(&format!(
+                                    "  - {} (Role: {})\n",
+                                    player.summoner_id, player.role
+                                ));
+                            }
+                            relevant_team_details.push(team_info_str);
+                        }
+                    }
+                }
+
+                if relevant_team_details.is_empty() {
+                    return Ok(CreateInteractionResponseMessage::new().content(format!(
+                        "Player **{}#{}** is not part of a Clash team in an active or upcoming tournament.",
+                        name, tag
+                    )));
+                }
+
+                return Ok(CreateInteractionResponseMessage::new()
+                    .content(relevant_team_details.join("\n\n---\n\n")));
+            }
+        }
+
+        Err(anyhow!(
+            "Error: Unknown or unimplemented Clash subcommand. Please report this if you believe it's an error."
+        ))
+    }
+}
+
+#[cfg(test)]
+mod clash_tests { // Renamed to avoid conflict if other tests for `clash` module exist at top level
+    use serenity::all::{CommandOptionType, CommandType};
+
+    use super::clash; // Assuming the clash module is in the same file or accessible via `super`
+
+    #[test]
+    fn test_clash_register_structure() {
+        let command = clash::register();
+
+        assert_eq!(command.name, "clash");
+        assert_eq!(
+            command.description,
+            "Provides information about League of Legends Clash tournaments."
+        );
+        assert_eq!(command.kind, CommandType::ChatInput); // Default, but good to be explicit
+
+        assert_eq!(command.options.len(), 3);
+
+        let schedule_option = command
+            .options
+            .iter()
+            .find(|opt| opt.name == "schedule")
+            .expect("Schedule subcommand not found");
+        assert_eq!(schedule_option.name, "schedule");
+        assert_eq!(
+            schedule_option.description,
+            "View the schedule for upcoming Clash tournaments."
+        );
+        assert_eq!(schedule_option.kind, CommandOptionType::SubCommand);
+
+        let myteam_option = command
+            .options
+            .iter()
+            .find(|opt| opt.name == "myteam")
+            .expect("Myteam subcommand not found");
+        assert_eq!(myteam_option.name, "myteam");
+        assert_eq!(
+            myteam_option.description,
+            "View details of your currently active Clash team and tournament progress."
+        );
+        assert_eq!(myteam_option.kind, CommandOptionType::SubCommand);
+
+        let scout_option = command
+            .options
+            .iter()
+            .find(|opt| opt.name == "scout")
+            .expect("Scout subcommand not found");
+        assert_eq!(scout_option.name, "scout");
+        assert_eq!(
+            scout_option.description,
+            "Get basic public information about an opponent's Clash team."
+        );
+        assert_eq!(scout_option.kind, CommandOptionType::SubCommand);
+
+        assert_eq!(scout_option.options.len(), 1);
+        let summoner_sub_option = scout_option
+            .options
+            .get(0)
+            .expect("Summoner option for scout not found");
+        assert_eq!(summoner_sub_option.name, "summoner");
+        assert_eq!(
+            summoner_sub_option.description,
+            "The Riot ID (Name#Tag) of a player on the team to scout."
+        );
+        assert_eq!(summoner_sub_option.kind, CommandOptionType::String);
+        assert!(summoner_sub_option.required.unwrap_or(false)); // Check if required is true
     }
 }
 
