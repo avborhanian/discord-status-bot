@@ -173,8 +173,7 @@ pub async fn register_user_summoner(
     let discord_display_name: &str = user.global_name.as_deref().unwrap_or(&user.name);
     let riot_id_or_summoner_name: &str = summoner_name_lower;
     let puuid: &str = &summoner_info.puuid;
-    let summoner_id: &str = &summoner_info.id;
-    let account_id: &str = &summoner_info.account_id;
+    let summoner_id = summoner_info.id.clone().unwrap_or_default();
     // Use a transaction for atomicity
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
@@ -198,7 +197,6 @@ pub async fn register_user_summoner(
     .bind(puuid)
     .bind(riot_id_or_summoner_name) // Store the provided name/riot id
     .bind(summoner_id)
-    .bind(account_id)
     .execute(&mut *tx) // Execute within the transaction
     .await
     .context("Failed to insert/update summoner data into Summoner table")?;
@@ -622,11 +620,9 @@ mod tests {
                 .await?;
         let updated_fetched_name: String = updated_summoner_row.try_get("Name")?;
         let updated_fetched_id: String = updated_summoner_row.try_get("Id")?;
-        let updated_fetched_account_id: String = updated_summoner_row.try_get("AccountId")?;
 
         assert_eq!(updated_fetched_name, updated_riot_id);
         assert_eq!(updated_fetched_id, updated_summoner_id);
-        assert_eq!(updated_fetched_account_id, updated_account_id);
 
         Ok(())
     }

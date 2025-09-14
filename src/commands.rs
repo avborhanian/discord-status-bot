@@ -554,12 +554,11 @@ pub mod register {
             .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
             .await?;
         let summoner_info = match account {
-            Some(account) => {
-                riot_api
-                    .summoner_v4()
-                    .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
-                    .await?
-            }
+            Some(account) => riot_api
+                .summoner_v4()
+                .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
+                .await?
+                .ok_or(anyhow!("Unable to find the matching summoner".to_string()))?,
             None => {
                 return Err(anyhow!("Unable to find the matching account".to_string()));
             }
@@ -645,12 +644,11 @@ pub mod clash {
             .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
             .await?;
         let member_info = match account {
-            Some(account) => {
-                riot_api
-                    .summoner_v4()
-                    .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
-                    .await?
-            }
+            Some(account) => riot_api
+                .summoner_v4()
+                .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
+                .await?
+                .ok_or(anyhow!("Unable to find the matching summoner".to_string()))?,
             None => {
                 return Err(anyhow!("Unable to find the matching account".to_string()));
             }
