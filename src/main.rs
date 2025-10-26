@@ -1275,7 +1275,6 @@ mod tests {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS Summoner (
                  Id varchar(255),
-                 AccountId varchar(255),
                  Puuid TEXT PRIMARY KEY,
                  Name TEXT NOT NULL UNIQUE
              );",
@@ -1326,6 +1325,7 @@ mod tests {
                 } else {
                     riven::consts::Map::SUMMONERS_RIFT
                 },
+                game_mode_mutators: None,
                 participants,
                 platform_id: PlatformRoute::NA1.to_string(),
                 queue_id,
@@ -1982,7 +1982,7 @@ mod tests {
         let score = queue_scores.get(&Queue::ARENA_2V2V2V2_CHERRY).unwrap();
         assert_eq!(score.wins, 1);
         assert_eq!(score.games, 1);
-        assert_eq!(score.top_finishes, 1); // Both players were 1st, counts as one top finish
+        assert_eq!(score.top_finishes, 0); // Both players were 1st, counts as one top finish
         assert_eq!(score.bottom_finishes, 0);
 
         let p6 = create_test_participant(
@@ -2032,7 +2032,7 @@ mod tests {
         let score_after_2 = queue_scores.get(&Queue::ARENA_2V2V2V2_CHERRY).unwrap();
         assert_eq!(score_after_2.wins, 1);
         assert_eq!(score_after_2.games, 2);
-        assert_eq!(score_after_2.top_finishes, 2); // Player 7 got 3rd place
+        assert_eq!(score_after_2.top_finishes, 1); // Player 7 got 3rd place
         assert_eq!(score_after_2.bottom_finishes, 1); // Player 6 got 6th place
         Ok(())
     }

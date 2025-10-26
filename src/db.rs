@@ -191,15 +191,13 @@ pub async fn register_user_summoner(
 
     // Insert or Update Summoner table
     // Using INSERT OR REPLACE based on puuid primary key
-    sqlx::query(
-        "INSERT OR REPLACE INTO Summoner (puuid, name, id, accountId) VALUES (?, ?, ?, ?);",
-    )
-    .bind(puuid)
-    .bind(riot_id_or_summoner_name) // Store the provided name/riot id
-    .bind(summoner_id)
-    .execute(&mut *tx) // Execute within the transaction
-    .await
-    .context("Failed to insert/update summoner data into Summoner table")?;
+    sqlx::query("INSERT OR REPLACE INTO Summoner (puuid, name, id) VALUES (?, ?, ?);")
+        .bind(puuid)
+        .bind(riot_id_or_summoner_name) // Store the provided name/riot id
+        .bind(summoner_id)
+        .execute(&mut *tx) // Execute within the transaction
+        .await
+        .context("Failed to insert/update summoner data into Summoner table")?;
 
     // Commit the transaction
     tx.commit().await.context("Failed to commit transaction")?;
@@ -504,7 +502,6 @@ mod tests {
         let riot_id = "TestRiot#NA1";
         let puuid = "test_puuid_123";
         let summoner_id = "test_summoner_id_456";
-        let account_id = "test_account_id_789";
 
         // Initial registration
         register_user_summoner(
@@ -522,7 +519,6 @@ mod tests {
                 r#"{
                 "puuid": "test_puuid_123",
                 "id": "test_summoner_id_456",
-                "accountId": "test_account_id_789",
                 "profileIconId": 1234,
                 "revisionDate": 1234567890,
                 "summonerLevel": 30
@@ -548,24 +544,20 @@ mod tests {
         assert_eq!(fetched_discord_display_name, discord_display_name);
 
         // Verify Summoner table entry
-        let summoner_row =
-            sqlx::query("SELECT Puuid, Name, Id, AccountId FROM Summoner WHERE Puuid = ?")
-                .bind(puuid)
-                .fetch_one(&pool)
-                .await?;
+        let summoner_row = sqlx::query("SELECT Puuid, Name, Id FROM Summoner WHERE Puuid = ?")
+            .bind(puuid)
+            .fetch_one(&pool)
+            .await?;
         let fetched_puuid: String = summoner_row.try_get("Puuid")?;
         let fetched_name: String = summoner_row.try_get("Name")?;
         let fetched_id: String = summoner_row.try_get("Id")?;
-        let fetched_account_id: String = summoner_row.try_get("AccountId")?;
 
         assert_eq!(fetched_puuid, puuid);
         assert_eq!(fetched_name, riot_id);
         assert_eq!(fetched_id, summoner_id);
-        assert_eq!(fetched_account_id, account_id);
 
         let updated_riot_id = "UpdatedRiot#NA1";
         let updated_summoner_id = "updated_summoner_id";
-        let updated_account_id = "updated_account_id";
         let updated_discord_username = "UpdatedUsername";
         let updated_discord_display_name = "Updated Display";
 
@@ -582,7 +574,6 @@ mod tests {
             updated_riot_id,
             &serde_json::from_str(
                 r#"{
-                "accountId": "updated_account_id",
                 "id": "updated_summoner_id",
                 "puuid": "test_puuid_123",
                 "profileIconId": 1234,
@@ -613,11 +604,10 @@ mod tests {
         );
 
         // Verify Summoner table update
-        let updated_summoner_row =
-            sqlx::query("SELECT Name, Id, AccountId FROM Summoner WHERE Puuid = ?")
-                .bind(puuid)
-                .fetch_one(&pool)
-                .await?;
+        let updated_summoner_row = sqlx::query("SELECT Name, Id FROM Summoner WHERE Puuid = ?")
+            .bind(puuid)
+            .fetch_one(&pool)
+            .await?;
         let updated_fetched_name: String = updated_summoner_row.try_get("Name")?;
         let updated_fetched_id: String = updated_summoner_row.try_get("Id")?;
 
