@@ -292,7 +292,18 @@ mod tests {
         let queue_id = Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO;
         let is_win = true;
 
-        let p1 = create_test_participant("p1", "P1", TeamId::BLUE, true, 1, 0, 0, 0, None, false);
+        let p1 = create_test_participant(
+            "p1",
+            "P1#NA1#NA1",
+            TeamId::BLUE,
+            true,
+            1,
+            0,
+            0,
+            0,
+            None,
+            false,
+        );
         let t1 = create_test_team(TeamId::BLUE, true);
         let t2 = create_test_team(TeamId::RED, false);
         // Clone t1 and t2 here as they are used again later
@@ -317,8 +328,8 @@ mod tests {
 
         // Attempt to insert second time (should be ignored)
         let p1_updated =
-            create_test_participant("p1", "P1", TeamId::BLUE, true, 5, 0, 0, 0, None, false); // Change some data
-                                                                                              // Use the original t1 and t2 (or clones if they were modified)
+            create_test_participant("p1", "P1#NA1", TeamId::BLUE, true, 5, 0, 0, 0, None, false); // Change some data
+                                                                                                  // Use the original t1 and t2 (or clones if they were modified)
         let test_match_updated = create_test_match(
             match_id,
             queue_id,
@@ -371,7 +382,8 @@ mod tests {
         let queue_id1 = Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO;
         let queue_id2 = Queue::HOWLING_ABYSS_5V5_ARAM;
 
-        let p1 = create_test_participant("p1", "P1", TeamId::BLUE, true, 1, 0, 0, 0, None, false);
+        let p1 =
+            create_test_participant("p1", "P1#NA1", TeamId::BLUE, true, 1, 0, 0, 0, None, false);
         let t1 = create_test_team(TeamId::BLUE, true);
         let t2 = create_test_team(TeamId::RED, false);
         let test_match1 = create_test_match(
@@ -628,7 +640,7 @@ mod tests {
 
         let participant1 = create_test_participant(
             "puuid1",
-            "Player1",
+            "Player1#NA1",
             TeamId::BLUE,
             true,
             5,

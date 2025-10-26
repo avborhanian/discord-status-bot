@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::models::MatchInfo;
+use crate::riot_utils::GameId;
 use anyhow::Result;
 use anyhow::{anyhow, Context, Error, Ok};
 use chrono::Timelike;
@@ -880,8 +881,8 @@ async fn update_match_info(
     queue_scores: &mut HashMap<Queue, Score>,
     queue_ids: &HashMap<Queue, &str>,
     puuids: &HashSet<String>,
-    pentakillers: &mut Vec<(i64, String)>,
-    dom_earners: &mut Vec<(i64, String)>,
+    pentakillers: &mut Vec<(i64, GameId)>,
+    dom_earners: &mut Vec<(i64, GameId)>,
     start_time: i64,
 ) -> Result<()> {
     let Some(game_end_timestamp) = match_info.info.game_end_timestamp else {
@@ -1036,7 +1037,15 @@ async fn update_match_info(
             .iter()
             .filter(|p| puuids.contains(&p.puuid)) // Use borrowed puuids
             .filter(|p| p.kills == 5 && p.assists == 5 && p.deaths == 5)
-            .map(|p| (match_info.info.game_id, p.summoner_name.clone())),
+            .map(|p| {
+                (
+                    match_info.info.game_id,
+                    GameId {
+                        name: p.riot_id_game_name.as_ref().unwrap().to_string(),
+                        tag: p.riot_id_tagline.as_ref().unwrap().to_string(),
+                    },
+                )
+            }),
     );
 
     if match_info.info.queue_id != Queue::HOWLING_ABYSS_5V5_ARAM {
@@ -1047,7 +1056,15 @@ async fn update_match_info(
                 .iter()
                 .filter(|p| puuids.contains(&p.puuid)) // Use borrowed puuids
                 .filter(|p| p.penta_kills > 0)
-                .map(|p| (match_info.info.game_id, p.summoner_name.clone())),
+                .map(|p| {
+                    (
+                        match_info.info.game_id,
+                        GameId {
+                            name: p.riot_id_game_name.as_ref().unwrap().to_string(),
+                            tag: p.riot_id_tagline.as_ref().unwrap().to_string(),
+                        },
+                    )
+                }),
         );
     }
     Ok(())
@@ -1068,7 +1085,7 @@ fn format_names_list(names: &[String]) -> String {
 }
 
 async fn check_pentakill_info(
-    pentakillers: Vec<(i64, String)>,
+    pentakillers: Vec<(i64, GameId)>,
     discord_auth: &Arc<serenity::http::Http>,
     config: &Config,
 ) -> Result<()> {
@@ -1079,9 +1096,9 @@ async fn check_pentakill_info(
     let user_info = db::fetch_discord_usernames(&config.pool).await?;
     let mut pentakillers_by_discord_mention: Vec<_> = pentakillers
         .iter()
-        .filter_map(|(_, summoner_name)| {
+        .filter_map(|(_, summoner_id)| {
             user_info
-                .get(&summoner_name.to_lowercase())
+                .get(&summoner_id.name().to_lowercase())
                 .map(|discord_id| format!("<@{}>", discord_id))
         })
         .collect::<HashSet<_>>()
@@ -1089,21 +1106,27 @@ async fn check_pentakill_info(
         .collect();
     pentakillers_by_discord_mention.sort();
 
-    let mut pentakill_games: HashMap<i64, Vec<String>> = HashMap::new();
-    for (game_id, name) in pentakillers {
-        pentakill_games.entry(game_id).or_default().push(name);
+    let mut pentakill_games: HashMap<i64, Vec<GameId>> = HashMap::new();
+    for (game_id, riot_id) in pentakillers {
+        pentakill_games.entry(game_id).or_default().push(riot_id);
     }
 
     let mention_names_formatted = format_names_list(&pentakillers_by_discord_mention);
 
     let mut pentakill_links = Vec::new();
-    for (game_id, names) in pentakill_games {
-        let game_names_formatted = format_names_list(&names);
-        let alternative = String::from("player");
-        let url_encoded_name = urlencoding::encode(names.first().unwrap_or(&alternative));
+    let unknown_id = GameId {
+        name: String::from("player"),
+        tag: String::from("NA1"),
+    };
+    for (game_id, riot_ids) in pentakill_games {
+        let game_names_formatted =
+            format_names_list(&riot_ids.iter().map(|id| id.name()).collect::<Vec<_>>());
+        let riot_id = riot_ids.first().unwrap_or(&unknown_id);
+        let url_encoded_riot_tag = urlencoding::encode(&riot_id.tag);
+        let url_encoded_name = urlencoding::encode(&riot_id.name);
         pentakill_links.push(format!(
-            "[{}'s pentakill game here](https://blitz.gg/lol/match/na1/{}/{})",
-            game_names_formatted, url_encoded_name, game_id
+            "[{}'s pentakill game here](https://blitz.gg/lol/match/{}/{}/{})",
+            game_names_formatted, url_encoded_riot_tag, url_encoded_name, game_id
         ));
     }
 
@@ -1127,7 +1150,7 @@ async fn check_pentakill_info(
 }
 
 async fn check_doms_info(
-    dom_earners: Vec<(i64, String)>,
+    dom_earners: Vec<(i64, GameId)>,
     discord_auth: &Arc<serenity::http::Http>,
     config: &Config,
 ) -> Result<()> {
@@ -1138,9 +1161,9 @@ async fn check_doms_info(
     let user_info = db::fetch_discord_usernames(&config.pool).await?;
     let mut dom_earners_by_discord_mention: Vec<_> = dom_earners
         .iter()
-        .filter_map(|(_, summoner_name)| {
+        .filter_map(|(_, riot_id)| {
             user_info
-                .get(&summoner_name.to_lowercase())
+                .get(&riot_id.name().to_lowercase())
                 .map(|discord_id| format!("<@{}>", discord_id))
         })
         .collect::<HashSet<_>>()
@@ -1148,21 +1171,27 @@ async fn check_doms_info(
         .collect();
     dom_earners_by_discord_mention.sort();
 
-    let mut dom_games: HashMap<i64, Vec<String>> = HashMap::new();
-    for (game_id, name) in dom_earners {
-        dom_games.entry(game_id).or_default().push(name);
+    let mut dom_games: HashMap<i64, Vec<GameId>> = HashMap::new();
+    for (game_id, riot_id) in dom_earners {
+        dom_games.entry(game_id).or_default().push(riot_id);
     }
 
     let mention_names_formatted = format_names_list(&dom_earners_by_discord_mention);
 
     let mut dom_links = Vec::new();
-    for (game_id, names) in dom_games {
-        let game_names_formatted = format_names_list(&names);
-        let alternative = String::from("player");
-        let url_encoded_name = urlencoding::encode(names.first().unwrap_or(&alternative));
+    let unknown_id = GameId {
+        name: String::from("player"),
+        tag: String::from("NA1"),
+    };
+    for (game_id, riot_ids) in dom_games {
+        let game_names_formatted =
+            format_names_list(&riot_ids.iter().map(|id| id.name()).collect::<Vec<_>>());
+        let riot_id = riot_ids.first().unwrap_or(&unknown_id);
+        let url_encoded_riot_tag = urlencoding::encode(&riot_id.tag);
+        let url_encoded_name = urlencoding::encode(&riot_id.name);
         dom_links.push(format!(
-            "[{}'s dom game here](https://blitz.gg/lol/match/na1/{}/{})",
-            game_names_formatted, url_encoded_name, game_id
+            "[{}'s dom game here](https://blitz.gg/lol/match/{}/{}/{})",
+            game_names_formatted, url_encoded_riot_tag, url_encoded_name, game_id
         ));
     }
 
@@ -1339,7 +1368,7 @@ mod tests {
     // Helper to create a basic Participant struct
     pub fn create_test_participant(
         puuid: &str,
-        summoner_name: &str,
+        riot_id: &str,
         team_id: TeamId,
         win: bool,
         kills: i32,
@@ -1362,9 +1391,10 @@ mod tests {
         let mut participant: Participant = serde_json::from_str(&template_json)
             .unwrap_or_else(|e| self::panic!("Failed to deserialize participant template: {}", e));
 
+        let game_name = GameId::try_from(riot_id).unwrap();
+
         // Override specific fields based on function arguments
         participant.puuid = puuid.to_string();
-        participant.summoner_name = summoner_name.to_string();
         participant.team_id = team_id;
         participant.win = win;
         participant.kills = kills;
@@ -1377,6 +1407,8 @@ mod tests {
         participant.game_ended_in_surrender = !win && !early_surrender;
         // Update teamEarlySurrendered based on the participant's team perspective
         participant.team_early_surrendered = early_surrender;
+        participant.riot_id_game_name = Some(game_name.name.to_string());
+        participant.riot_id_tagline = Some(game_name.tag.to_string());
 
         // You might want to update other fields based on win/loss/kills too, e.g., nexus kills
         participant.nexus_kills = if win { 1 } else { 0 };
@@ -1513,7 +1545,7 @@ mod tests {
 
         let p1 = create_test_participant(
             "puuid1",
-            "Player1",
+            "Player1#NA1",
             TeamId::BLUE,
             true,
             10,
@@ -1525,7 +1557,7 @@ mod tests {
         );
         let p2 = create_test_participant(
             "puuid2",
-            "Player2",
+            "Player2#NA1",
             TeamId::RED,
             false,
             2,
@@ -1587,7 +1619,7 @@ mod tests {
 
         let p1 = create_test_participant(
             "puuid1",
-            "Player1",
+            "Player1#NA1",
             TeamId::BLUE,
             false,
             2,
@@ -1599,7 +1631,7 @@ mod tests {
         );
         let p2 = create_test_participant(
             "puuid2",
-            "Player2",
+            "Player2#NA1",
             TeamId::RED,
             true,
             10,
@@ -1640,7 +1672,7 @@ mod tests {
 
         let p3 = create_test_participant(
             "puuid1",
-            "Player1",
+            "Player1#NA1",
             TeamId::BLUE,
             false,
             3,
@@ -1652,7 +1684,7 @@ mod tests {
         );
         let p4 = create_test_participant(
             "puuid3",
-            "Player3",
+            "Player3#NA1",
             TeamId::RED,
             true,
             8,
@@ -1693,7 +1725,7 @@ mod tests {
 
         let p5 = create_test_participant(
             "puuid1",
-            "Player1",
+            "Player1#NA1",
             TeamId::BLUE,
             false,
             1,
@@ -1705,7 +1737,7 @@ mod tests {
         );
         let p6 = create_test_participant(
             "puuid4",
-            "Player4",
+            "Player4#NA1",
             TeamId::RED,
             true,
             11,
@@ -1761,7 +1793,7 @@ mod tests {
 
         let p1 = create_test_participant(
             "puuid_penta",
-            "Penta Pete",
+            "Penta Pete#NA3",
             TeamId::BLUE,
             true,
             25,
@@ -1773,7 +1805,7 @@ mod tests {
         );
         let p2 = create_test_participant(
             "puuid_other",
-            "Feeder Fred",
+            "Feeder Fred#NA5",
             TeamId::RED,
             false,
             5,
@@ -1811,7 +1843,7 @@ mod tests {
         assert_eq!(score.wins, 1);
         assert_eq!(score.games, 1);
         assert_eq!(pentakillers.len(), 1);
-        assert_eq!(pentakillers[0].1, "Penta Pete");
+        assert_eq!(pentakillers[0].1.name(), "Penta Pete");
         assert!(dom_earners.is_empty());
         Ok(())
     }
@@ -1830,7 +1862,7 @@ mod tests {
 
         let p1 = create_test_participant(
             "puuid_doms",
-            "Dominic",
+            "Dominic#EUW1",
             TeamId::BLUE,
             true,
             5,
@@ -1842,7 +1874,7 @@ mod tests {
         );
         let p2 = create_test_participant(
             "puuid_other",
-            "Average Andy",
+            "Average Andy#EUW3",
             TeamId::RED,
             false,
             5,
@@ -1881,7 +1913,7 @@ mod tests {
         assert_eq!(score.games, 1);
         assert!(pentakillers.is_empty());
         assert_eq!(dom_earners.len(), 1);
-        assert_eq!(dom_earners[0].1, "Dominic");
+        assert_eq!(dom_earners[0].1.name(), "Dominic");
         Ok(())
     }
 
@@ -1899,7 +1931,7 @@ mod tests {
 
         let p1 = create_test_participant(
             "puuid_arena1",
-            "Arena Ace",
+            "Arena Ace#NA2",
             TeamId::BLUE,
             true,
             10,
@@ -1911,7 +1943,7 @@ mod tests {
         );
         let p2 = create_test_participant(
             "puuid_arena2",
-            "Arena Ally",
+            "Arena Ally#NA4",
             TeamId::BLUE,
             true,
             8,
@@ -1923,7 +1955,7 @@ mod tests {
         );
         let p3 = create_test_participant(
             "puuid_other1",
-            "Rival 1",
+            "Rival 1#NA6",
             TeamId::RED,
             false,
             5,
@@ -1935,7 +1967,7 @@ mod tests {
         );
         let p4 = create_test_participant(
             "puuid_other2",
-            "Rival 2",
+            "Rival 2#NA7",
             TeamId::RED,
             false,
             4,
@@ -1947,7 +1979,7 @@ mod tests {
         );
         let p5 = create_test_participant(
             "puuid_arena_opponent",
-            "Bottom Feeder",
+            "Bottom Feeder#NA8",
             TeamId::OTHER,
             false,
             2,
@@ -1987,7 +2019,7 @@ mod tests {
 
         let p6 = create_test_participant(
             "puuid_arena1",
-            "Arena Ace",
+            "Arena Ace#NA2",
             TeamId::BLUE,
             false,
             3,
@@ -1999,7 +2031,7 @@ mod tests {
         );
         let p7 = create_test_participant(
             "puuid_arena2",
-            "Arena Ally",
+            "Arena Ally#NA4",
             TeamId::BLUE,
             false,
             2,
@@ -2050,7 +2082,7 @@ mod tests {
 
         let p1 = create_test_participant(
             "puuid1",
-            "Player1",
+            "Player1#NA1",
             TeamId::BLUE,
             false,
             0,
@@ -2062,7 +2094,7 @@ mod tests {
         );
         let p2 = create_test_participant(
             "puuid2",
-            "Player2",
+            "Player2#NA1",
             TeamId::RED,
             true,
             1,
@@ -2122,7 +2154,7 @@ mod tests {
 
         let p1 = create_test_participant(
             "puuid1",
-            "Player1",
+            "Player1#NA1",
             TeamId::BLUE,
             true,
             10,
@@ -2134,7 +2166,7 @@ mod tests {
         );
         let p2 = create_test_participant(
             "puuid2",
-            "Player2",
+            "Player2#NA1",
             TeamId::RED,
             false,
             2,

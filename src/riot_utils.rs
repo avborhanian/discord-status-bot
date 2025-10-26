@@ -64,32 +64,40 @@ macro_rules! riot_api {
 
 pub(crate) use riot_api;
 
-// Helper to parse summoner name/Riot ID string
-pub fn parse_summoner_input(input: &str) -> Result<GameId> {
-    let text = input.trim();
-    if text.is_empty() {
-        return Err(anyhow!("Summoner name/Riot ID cannot be empty."));
+impl GameId {
+    pub fn name(&self) -> String {
+        self.name.clone()
     }
-    if text.contains('#') {
-        let mut parts = text.split('#');
-        let name = parts
-            .next()
-            .ok_or_else(|| anyhow!("Invalid Riot ID format: Missing name part."))?;
-        let tag = parts
-            .next()
-            .ok_or_else(|| anyhow!("Invalid Riot ID format: Missing tag part."))?;
-        if name.is_empty() || tag.is_empty() {
-            return Err(anyhow!(
-                "Invalid Riot ID format: Name or tag part is empty."
-            ));
+}
+
+impl TryFrom<&str> for GameId {
+    type Error = anyhow::Error;
+    fn try_from(input: &str) -> Result<Self> {
+        let text = input.trim();
+        if text.is_empty() {
+            return Err(anyhow!("Summoner name/Riot ID cannot be empty."));
         }
-        Ok(GameId {
-            name: name.to_string(),
-            tag: tag.to_string(),
-        })
-    } else {
-        Err(anyhow!(
-            "Invalid Riot ID format: Expected format is 'name#tag'."
-        ))
+        if text.contains('#') {
+            let mut parts = text.split('#');
+            let name = parts
+                .next()
+                .ok_or_else(|| anyhow!("Invalid Riot ID format: Missing name part."))?;
+            let tag = parts
+                .next()
+                .ok_or_else(|| anyhow!("Invalid Riot ID format: Missing tag part."))?;
+            if name.is_empty() || tag.is_empty() {
+                return Err(anyhow!(
+                    "Invalid Riot ID format: Name or tag part is empty."
+                ));
+            }
+            Ok(GameId {
+                name: name.to_string(),
+                tag: tag.to_string(),
+            })
+        } else {
+            Err(anyhow!(
+                "Invalid Riot ID format: Expected format is 'name#tag'."
+            ))
+        }
     }
 }

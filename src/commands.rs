@@ -488,7 +488,6 @@ pub mod groups {
 
 pub mod register {
     use crate::db;
-    use crate::riot_utils::parse_summoner_input;
     use crate::riot_utils::GameId;
     use crate::Config;
     use anyhow::{anyhow, Result};
@@ -543,7 +542,7 @@ pub mod register {
 
         let GameId { name, tag } = match options.iter().find(|o| o.name == "summoner") {
             Some(account_option) => match &account_option.value {
-                CommandDataOptionValue::String(name) => parse_summoner_input(name)?,
+                CommandDataOptionValue::String(name) => GameId::try_from(name.as_str())?,
                 _ => return Err(anyhow!("No name specified".to_string())),
             },
             None => return Err(anyhow!("No name specified".to_string())),
@@ -684,7 +683,7 @@ pub mod clash {
 
 pub mod rank {
     use crate::db;
-    use crate::riot_utils::{parse_summoner_input, riot_api, GameId};
+    use crate::riot_utils::{riot_api, GameId};
     use crate::Config;
     use anyhow::{anyhow, Context, Result};
     use riven::consts::{PlatformRoute, QueueType, RegionalRoute};
@@ -733,7 +732,7 @@ pub mod rank {
         let (puuid, display_name) = match target_account_input {
             // --- User provided a summoner name/Riot ID ---
             Some(input_str) => {
-                let GameId { name, tag } = parse_summoner_input(input_str)?;
+                let GameId { name, tag } = GameId::try_from(input_str)?;
                 let display_name = input_str.to_string(); // Use the raw input for display initially
                 let account_result = riot_api!(
                     riot_api
