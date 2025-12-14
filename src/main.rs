@@ -1125,8 +1125,8 @@ async fn check_pentakill_info(
         let url_encoded_riot_tag = urlencoding::encode(&riot_id.tag);
         let url_encoded_name = urlencoding::encode(&riot_id.name);
         pentakill_links.push(format!(
-            "[{}'s pentakill game here](https://blitz.gg/lol/match/{}/{}/{})",
-            game_names_formatted, url_encoded_riot_tag, url_encoded_name, game_id
+            "[{}'s pentakill game here](https://blitz.gg/lol/match/NA1/{}-{}/{})",
+            game_names_formatted, url_encoded_name, url_encoded_riot_tag, game_id
         ));
     }
 
@@ -1149,13 +1149,12 @@ async fn check_pentakill_info(
     Ok(())
 }
 
-async fn check_doms_info(
+async fn calculate_doms_info(
     dom_earners: Vec<(i64, GameId)>,
-    discord_auth: &Arc<serenity::http::Http>,
     config: &Config,
-) -> Result<()> {
+) -> Result<(String, Vec<String>)> {
     if dom_earners.is_empty() {
-        return Ok(());
+        return Ok((String::from(""), vec![]));
     }
 
     let user_info = db::fetch_discord_usernames(&config.pool).await?;
@@ -1190,10 +1189,19 @@ async fn check_doms_info(
         let url_encoded_riot_tag = urlencoding::encode(&riot_id.tag);
         let url_encoded_name = urlencoding::encode(&riot_id.name);
         dom_links.push(format!(
-            "[{}'s dom game here](https://blitz.gg/lol/match/{}/{}/{})",
-            game_names_formatted, url_encoded_riot_tag, url_encoded_name, game_id
+            "[{}'s dom game here](https://blitz.gg/lol/match/NA1/{}-{}/{})",
+            game_names_formatted, url_encoded_name, url_encoded_riot_tag, game_id
         ));
     }
+    Ok((mention_names_formatted, dom_links))
+}
+
+async fn check_doms_info(
+    dom_earners: Vec<(i64, GameId)>,
+    discord_auth: &Arc<serenity::http::Http>,
+    config: &Config,
+) -> Result<()> {
+    let (mention_names_formatted, dom_links) = calculate_doms_info(dom_earners, config).await?;
 
     update_highlight_reel(
         "🚨 SOMEONE JUST GOT DOMS 🚨",
