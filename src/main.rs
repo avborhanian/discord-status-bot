@@ -54,8 +54,10 @@ use riot_utils::riot_api;
 #[derive(Debug, Clone)]
 struct Config {
     riot_api_token: String,
+    tft_riot_api_token: String,
     discord_bot_token: String,
     voice_channel_id: ChannelId,
+    tft_voice_channel_id: ChannelId,
     updates_channel_id: ChannelId,
     discord_guild_id: GuildId,
     log_path: PathBuf,
@@ -68,11 +70,21 @@ async fn load_config() -> Result<Config> {
     let riot_api_token = env::var("RIOT_API_TOKEN").context("Missing RIOT_API_TOKEN")?;
     let discord_bot_token = env::var("DISCORD_BOT_TOKEN").context("Missing DISCORD_BOT_TOKEN")?;
 
+    let tft_riot_api_token = env::var("TFT_RIOT_API_TOKEN")
+        .context("Missing TFT_RIOT_API_TOKEN")
+        .unwrap_or_default();
+
     let voice_channel_id_u64 = env::var("VOICE_CHANNEL_ID")
         .context("Missing VOICE_CHANNEL_ID")?
         .parse::<u64>()
         .context("Invalid VOICE_CHANNEL_ID (must be u64)")?;
     let voice_channel_id = ChannelId::from(voice_channel_id_u64);
+
+    let tft_voice_channel_id_u64 = env::var("TFT_VOICE_CHANNEL_ID")
+        .context("Missing TFT_VOICE_CHANNEL_ID")?
+        .parse::<u64>()
+        .context("Invalid TFT_VOICE_CHANNEL_ID (must be u64)")?;
+    let tft_voice_channel_id = ChannelId::from(tft_voice_channel_id_u64);
 
     let updates_channel_id_u64 = env::var("UPDATES_CHANNEL_ID")
         .context("Missing UPDATES_CHANNEL_ID")?
@@ -106,8 +118,10 @@ async fn load_config() -> Result<Config> {
 
     Ok(Config {
         riot_api_token,
+        tft_riot_api_token,
         discord_bot_token,
         voice_channel_id,
+        tft_voice_channel_id,
         updates_channel_id,
         discord_guild_id,
         log_path,
@@ -351,6 +365,7 @@ async fn main() -> Result<()> {
 
     // Use config for Riot API key
     let riot_api = RiotApi::new(&config.riot_api_token);
+    let tft_riot_api = RiotApi::new(&config.tft_riot_api_token);
 
     // Use config for log path
     let file_appender = tracing_appender::rolling::daily(&config.log_path, "server.log");
@@ -413,6 +428,7 @@ async fn main() -> Result<()> {
     // Clone necessary Arcs and config values for the background task
     let background_config = config_arc.clone();
     let background_riot_api = Arc::new(riot_api); // Put RiotApi in Arc if needed across awaits
+    let background_tft_riot_api = Arc::new(tft_riot_api);
     let background_discord_client = discord_client.clone();
     let background_current_status = current_status.clone();
 
@@ -451,23 +467,26 @@ async fn main() -> Result<()> {
                     Result::Ok(()) => {}
                     Result::Err(e) => error!("Error during daily history check: {}", e),
                 }
-                match check_tft_match_history(
-                    &background_riot_api,
-                    &background_discord_client,
-                    &background_current_status,
-                    &background_config,
-                )
-                .await
-                {
-                    Result::Ok(()) => {}
-                    Result::Err(e) => error!("Error during daily TFT history check: {}", e),
+
+                if &config.tft_riot_api_token != "" {
+                    match check_tft_match_history(
+                        &background_riot_api,
+                        &background_discord_client,
+                        &background_current_status,
+                        &background_config,
+                    )
+                    .await
+                    {
+                        Result::Ok(()) => {}
+                        Result::Err(e) => error!("Error during daily TFT history check: {}", e),
+                    }
+                    start_time = chrono::Local::now().timestamp(); // Reset scan window start
+                    info!(
+                        "Daily check done. Setting scan start time to {}",
+                        start_time
+                    );
+                    current_date = new_start_time; // Update the date marker
                 }
-                start_time = chrono::Local::now().timestamp(); // Reset scan window start
-                info!(
-                    "Daily check done. Setting scan start time to {}",
-                    start_time
-                );
-                current_date = new_start_time; // Update the date marker
             }
 
             let mut found_new_matches = false;
@@ -507,9 +526,9 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                if !found_new_tft_matches {
+                if !found_new_tft_matches && &background_config.tft_riot_api_token != "" {
                     let tft_matches_fetch: Result<Vec<String>> = riot_api!(
-                        background_riot_api
+                        background_tft_riot_api
                             .tft_match_v1()
                             .get_match_ids_by_puuid(
                                 RegionalRoute::AMERICAS,
@@ -541,7 +560,9 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                if found_new_matches && found_new_tft_matches {
+                if found_new_matches
+                    && (found_new_tft_matches || &background_config.tft_riot_api_token == "")
+                {
                     break;
                 }
             }
@@ -568,7 +589,7 @@ async fn main() -> Result<()> {
 
             if found_new_tft_matches {
                 match check_tft_match_history(
-                    &background_riot_api,
+                    &background_tft_riot_api,
                     &background_discord_client,
                     &background_current_status,
                     &background_config,
@@ -841,7 +862,7 @@ async fn check_tft_match_history(
             &results,
             Some(current_status),
             discord_client,
-            config.voice_channel_id,
+            config.tft_voice_channel_id,
         )
         .await?;
         return Ok(());
@@ -1536,11 +1557,11 @@ async fn check_doms_info(
     discord_auth: &Arc<serenity::http::Http>,
     config: &Config,
 ) -> Result<()> {
-    let (mention_names_formatted, dom_links) = calculate_doms_info(dom_earners, config).await?;
-
-    if dom_links.is_empty() {
+    if dom_earners.is_empty() {
         return Ok(());
     }
+
+    let (mention_names_formatted, dom_links) = calculate_doms_info(dom_earners, config).await?;
 
     update_highlight_reel(
         "🚨 SOMEONE JUST GOT DOMS 🚨",
