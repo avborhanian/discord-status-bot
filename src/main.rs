@@ -23,6 +23,7 @@ use models::Score;
 use riven::consts::Team;
 use riven::consts::{Queue, RegionalRoute};
 use riven::models::match_v5::Match;
+use riven::models::tft_match_v1::Match as TftMatch;
 use riven::RiotApi;
 use serenity::all::CreateInteractionResponse;
 use serenity::all::CreateInteractionResponseMessage;
@@ -146,7 +147,8 @@ impl Handler {
 }
 
 fn mode_score(queue_id: &Queue, score: &Score) -> String {
-    if *queue_id == Queue::ARENA_2V2V2V2_CHERRY {
+    if *queue_id == Queue::ARENA_2V2V2V2_CHERRY || *queue_id == Queue::CONVERGENCE_TEAMFIGHT_TACTICS
+    {
         return format!(
             "{}\u{2006}-\u{2006}{}\u{2006}-\u{2006}{}",
             score.wins, score.top_finishes, score.bottom_finishes,
@@ -449,6 +451,17 @@ async fn main() -> Result<()> {
                     Result::Ok(()) => {}
                     Result::Err(e) => error!("Error during daily history check: {}", e),
                 }
+                match check_tft_match_history(
+                    &background_riot_api,
+                    &background_discord_client,
+                    &background_current_status,
+                    &background_config,
+                )
+                .await
+                {
+                    Result::Ok(()) => {}
+                    Result::Err(e) => error!("Error during daily TFT history check: {}", e),
+                }
                 start_time = chrono::Local::now().timestamp(); // Reset scan window start
                 info!(
                     "Daily check done. Setting scan start time to {}",
@@ -458,38 +471,78 @@ async fn main() -> Result<()> {
             }
 
             let mut found_new_matches = false;
+            let mut found_new_tft_matches = false;
             for puuid in &puuids {
                 interval.tick().await; // Rate limit per PUUID check
-                let matches_fetch: Result<Vec<String>> = riot_api!(
-                    background_riot_api // Use the API client from the closure
-                        .match_v5()
-                        .get_match_ids_by_puuid(
-                            RegionalRoute::AMERICAS,
-                            puuid,
-                            None,
-                            None,
-                            None,
-                            Some(start_time), // Check only since last scan OR daily reset
-                            None,
-                            None,
-                        )
-                        .await
-                );
+                if !found_new_matches {
+                    let matches_fetch: Result<Vec<String>> = riot_api!(
+                        background_riot_api // Use the API client from the closure
+                            .match_v5()
+                            .get_match_ids_by_puuid(
+                                RegionalRoute::AMERICAS,
+                                puuid,
+                                None,
+                                None,
+                                None,
+                                Some(start_time), // Check only since last scan OR daily reset
+                                None,
+                                None,
+                            )
+                            .await
+                    );
 
-                match matches_fetch {
-                    Result::Ok(match_list) if !match_list.is_empty() => {
-                        info!(
-                            "Found {} new match(es) for a user since timestamp {}. Triggering full scan.",
-                            match_list.len(),
-                            start_time
-                        );
-                        found_new_matches = true;
-                        break; // Found matches for one user, no need to check others, proceed to full scan
+                    match matches_fetch {
+                        Result::Ok(match_list) if !match_list.is_empty() => {
+                            info!(
+                                "Found {} new match(es) for a user since timestamp {}. Triggering full scan.",
+                                match_list.len(),
+                                start_time
+                            );
+                            found_new_matches = true;
+                        }
+                        Result::Ok(_) => { /* No new matches for this user */ }
+                        Result::Err(e) => {
+                            error!("Hit an error while fetching matches for {}: {}", puuid, e)
+                        }
                     }
-                    Result::Ok(_) => { /* No new matches for this user */ }
-                    Result::Err(e) => {
-                        error!("Hit an error while fetching matches for {}: {}", puuid, e)
+                }
+
+                if !found_new_tft_matches {
+                    let tft_matches_fetch: Result<Vec<String>> = riot_api!(
+                        background_riot_api
+                            .tft_match_v1()
+                            .get_match_ids_by_puuid(
+                                RegionalRoute::AMERICAS,
+                                puuid,
+                                None,
+                                None,
+                                None,
+                                Some(start_time), // Check only since last scan OR daily reset
+                            )
+                            .await
+                    );
+
+                    match tft_matches_fetch {
+                        Result::Ok(match_list) if !match_list.is_empty() => {
+                            info!(
+                                "Found {} new TFT match(es) for a user since timestamp {}. Triggering full scan.",
+                                match_list.len(),
+                                start_time
+                            );
+                            found_new_tft_matches = true;
+                        }
+                        Result::Ok(_) => { /* No new matches for this user */ }
+                        Result::Err(e) => {
+                            error!(
+                                "Hit an error while fetching TFT matches for {}: {}",
+                                puuid, e
+                            )
+                        }
                     }
+                }
+
+                if found_new_matches && found_new_tft_matches {
+                    break;
                 }
             }
 
@@ -513,13 +566,30 @@ async fn main() -> Result<()> {
                 );
             }
 
+            if found_new_tft_matches {
+                match check_tft_match_history(
+                    &background_riot_api,
+                    &background_discord_client,
+                    &background_current_status,
+                    &background_config,
+                )
+                .await
+                {
+                    Result::Ok(()) => {}
+                    Result::Err(e) => error!("Error during triggered TFT history check: {}", e),
+                }
+                start_time = chrono::Local::now().timestamp();
+                info!(
+                    "Triggered TFT check done. Setting scan start time to {}",
+                    start_time
+                );
+            }
+
             // If it wasn't a new day and no new matches were found, just wait for the next interval cycle
-            if !is_new_day && !found_new_matches {
+            if !is_new_day && !found_new_matches && !found_new_tft_matches {
                 interval.tick().await; // Ensure we wait at least the interval duration even if loop was fast
             }
         }
-        // This loop runs forever, so Ok(()) might not be reached unless there's a panic/error
-        // Ok(())
     });
 
     // --- Main Select Loop ---
@@ -704,6 +774,271 @@ async fn check_match_history(
         config.voice_channel_id,
     )
     .await
+}
+
+async fn check_tft_match_history(
+    riot_api: &RiotApi,
+    discord_client: &Arc<serenity::http::Http>,
+    current_status: &Arc<RwLock<String>>,
+    config: &Config,
+) -> Result<()> {
+    let queue_ids: HashMap<Queue, &str> =
+        HashMap::from([(Queue::CONVERGENCE_TEAMFIGHT_TACTICS, "TFT")]);
+    let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+    let start_time = get_start_time()?;
+    let pool = &config.pool;
+
+    let summoner_info = db::fetch_summoners(pool).await?;
+    let summoner_names = summoner_info.values().cloned().collect::<HashSet<_>>();
+    let puuids = db::fetch_puuids(pool, &summoner_names).await?;
+
+    let mut all_match_ids: Vec<String> = Vec::new();
+    let matches_requests = stream::iter(puuids.clone())
+        .map(|puuid| async move {
+            riot_api!(
+                riot_api
+                    .tft_match_v1()
+                    .get_match_ids_by_puuid(
+                        RegionalRoute::AMERICAS,
+                        &puuid,
+                        None,
+                        None,
+                        None,
+                        Some(start_time),
+                    )
+                    .await
+            )
+        })
+        .buffer_unordered(5);
+
+    let matches_list: Vec<Result<Vec<String>>> = matches_requests.collect().await;
+
+    for result in matches_list {
+        match result {
+            Result::Ok(match_ids) => {
+                all_match_ids.extend(match_ids);
+            }
+            Result::Err(e) => {
+                error!("Error fetching TFT match IDs for a PUUID: {:?}", e);
+            }
+        }
+    }
+
+    let mut unique_match_ids: Vec<String> = all_match_ids
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    unique_match_ids.sort();
+
+    if unique_match_ids.is_empty() {
+        info!(
+            "No relevant TFT matches found since start time {}",
+            start_time
+        );
+        let results = String::from("No TFT games yet!");
+        update_discord_status(
+            &results,
+            Some(current_status),
+            discord_client,
+            config.voice_channel_id,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let seen_matches = fetch_seen_tft_events(pool, &unique_match_ids).await?;
+
+    let mut matches_to_fetch_details = Vec::new();
+    for match_id in &unique_match_ids {
+        if let Some(match_info) = seen_matches.get(match_id) {
+            process_seen_tft_match_score(match_info, &mut queue_scores, &puuids)?;
+        } else {
+            matches_to_fetch_details.push(match_id.clone());
+        }
+    }
+
+    let match_detail_requests = stream::iter(matches_to_fetch_details)
+        .map(|match_id| async move {
+            let result = riot_api!(
+                riot_api
+                    .tft_match_v1()
+                    .get_match(RegionalRoute::AMERICAS, &match_id)
+                    .await
+            );
+            Ok((match_id, result))
+        })
+        .buffer_unordered(10);
+
+    let match_details: Vec<(String, Result<Option<TftMatch>, Error>)> = match_detail_requests
+        .collect::<Vec<Result<(String, Result<Option<TftMatch>, Error>), Error>>>()
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+
+    for (match_id, result) in match_details {
+        match result {
+            Result::Ok(Some(match_info)) => {
+                update_tft_match_info(pool, &match_info, &mut queue_scores, &puuids, start_time)
+                    .await?;
+            }
+            Result::Ok(None) => {
+                error!("Riot API returned Ok(None) for TFT match id {}", match_id);
+            }
+            Result::Err(e) => {
+                error!(
+                    "Failed to fetch details for TFT match {}: {:?}",
+                    match_id, e
+                );
+            }
+        }
+    }
+
+    let status_message = generate_status_message(&queue_scores, &queue_ids);
+
+    update_discord_status(
+        &status_message,
+        Some(current_status),
+        discord_client,
+        config.voice_channel_id,
+    )
+    .await
+}
+
+async fn fetch_seen_tft_events(
+    pool: &sqlx::SqlitePool,
+    match_ids: &[String],
+) -> Result<HashMap<String, TftMatch>> {
+    if match_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let query_string = format!(
+        "SELECT Id, MatchInfo FROM MATCH WHERE Id IN ({})",
+        match_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+    );
+
+    let mut query = sqlx::query_as::<_, (String, Vec<u8>)>(&query_string);
+    for id in match_ids {
+        query = query.bind(id);
+    }
+
+    let rows = query.fetch_all(pool).await?;
+
+    let mut results = HashMap::new();
+    for (id, blob) in rows {
+        if let Result::Ok(match_info) = serde_json::from_slice::<TftMatch>(&blob) {
+            results.insert(id, match_info);
+        }
+    }
+    Ok(results)
+}
+
+async fn save_tft_match(
+    pool: &sqlx::SqlitePool,
+    match_id: &str,
+    queue_id: i64,
+    win: bool,
+    timestamp: i64,
+    match_info: &TftMatch,
+) -> Result<()> {
+    let blob = serde_json::to_vec(match_info)?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO MATCH (Id, QUEUE_ID, Win, END_TIMESTAMP, MatchInfo) VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(match_id)
+    .bind(queue_id.to_string())
+    .bind(win)
+    .bind(timestamp)
+    .bind(blob)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn process_seen_tft_match_score(
+    match_info: &TftMatch,
+    queue_scores: &mut HashMap<Queue, Score>,
+    puuids: &HashSet<String>,
+) -> Result<()> {
+    // Group all TFT matches under one queue ID
+    let game_score = queue_scores
+        .entry(Queue::CONVERGENCE_TEAMFIGHT_TACTICS)
+        .or_default();
+    game_score.games += 1;
+
+    let mut seen_placements = HashSet::new();
+    for participant in match_info.info.participants.iter() {
+        if puuids.contains(&participant.puuid) {
+            let position = participant.placement;
+            if seen_placements.insert(position) {
+                if position == 1 {
+                    game_score.wins += 1;
+                } else if position <= 4 {
+                    game_score.top_finishes += 1;
+                } else {
+                    game_score.bottom_finishes += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn update_tft_match_info(
+    pool: &sqlx::SqlitePool,
+    match_info: &TftMatch,
+    queue_scores: &mut HashMap<Queue, Score>,
+    puuids: &HashSet<String>,
+    start_time: i64,
+) -> Result<()> {
+    let game_datetime = match_info.info.game_datetime;
+
+    if game_datetime < start_time {
+        info!(
+            "TFT Match {} ended before start_time {}. Skipping.",
+            match_info.metadata.match_id, start_time
+        );
+        return Ok(());
+    }
+
+    // Group all TFT matches under one queue ID
+    let game_score = queue_scores
+        .entry(Queue::CONVERGENCE_TEAMFIGHT_TACTICS)
+        .or_default();
+    game_score.games += 1;
+
+    let mut is_win = false;
+    let mut seen_placements = HashSet::new();
+    for participant in match_info.info.participants.iter() {
+        if puuids.contains(&participant.puuid) {
+            let position = participant.placement;
+            if seen_placements.insert(position) {
+                if position == 1 {
+                    is_win = true;
+                    game_score.wins += 1;
+                } else if position <= 4 {
+                    game_score.top_finishes += 1;
+                } else {
+                    game_score.bottom_finishes += 1;
+                }
+            }
+        }
+    }
+
+    let queue_id: i64 = u16::from(Queue::CONVERGENCE_TEAMFIGHT_TACTICS).into();
+    save_tft_match(
+        pool,
+        &match_info.metadata.match_id,
+        queue_id,
+        is_win,
+        game_datetime,
+        match_info,
+    )
+    .await?;
+
+    Ok(())
 }
 
 fn process_seen_match_score(
@@ -1202,6 +1537,10 @@ async fn check_doms_info(
     config: &Config,
 ) -> Result<()> {
     let (mention_names_formatted, dom_links) = calculate_doms_info(dom_earners, config).await?;
+
+    if dom_links.is_empty() {
+        return Ok(());
+    }
 
     update_highlight_reel(
         "🚨 SOMEONE JUST GOT DOMS 🚨",
