@@ -79,6 +79,62 @@ pub async fn fetch_puuids(
     Ok(puuids.into_iter().collect())
 }
 
+/// Fetches a map of summoner names to their LoL and TFT PUUIDs.
+pub async fn fetch_summoner_puuids(
+    pool: &SqlitePool,
+    summoner_names: &HashSet<String>,
+) -> Result<HashMap<String, (String, Option<String>)>> {
+    if summoner_names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let names_vec: Vec<String> = summoner_names.iter().cloned().collect();
+    let names_json =
+        serde_json::to_string(&names_vec).context("Failed to serialize summoner names to JSON")?;
+
+    let rows = sqlx::query(
+        "SELECT Name, Puuid, TftPuuid FROM summoner WHERE Name IN (SELECT value FROM json_each(?))",
+    )
+    .bind(names_json)
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch PUUIDs from Summoner table")?;
+
+    let mut results = HashMap::new();
+    for row in rows {
+        let name: String = row.try_get("Name")?;
+        let puuid: String = row.try_get("Puuid")?;
+        let tft_puuid: Option<String> = row.try_get("TftPuuid")?;
+        results.insert(name, (puuid, tft_puuid));
+    }
+
+    Ok(results)
+}
+
+/// Fetches a set of TFT PUUIDs (falling back to LoL PUUID if TFT is null) for the given summoner names.
+pub async fn fetch_tft_puuids(
+    pool: &SqlitePool,
+    summoner_names: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    if summoner_names.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let names_vec: Vec<String> = summoner_names.iter().cloned().collect();
+    let names_json =
+        serde_json::to_string(&names_vec).context("Failed to serialize summoner names to JSON")?;
+
+    let puuids: Vec<String> = sqlx::query_scalar(
+        "SELECT COALESCE(TftPuuid, Puuid) FROM summoner WHERE Name IN (SELECT value FROM json_each(?))",
+    )
+    .bind(names_json)
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch TFT PUUIDs from Summoner table")?;
+
+    Ok(puuids.into_iter().collect())
+}
+
 /// Fetches a map of Discord IDs (as u64) to Summoner Names from the User table.
 pub async fn fetch_summoners(pool: &SqlitePool) -> Result<HashMap<u64, String>> {
     // Fetch rows as tuples (String, String)
@@ -167,6 +223,7 @@ pub async fn register_user_summoner(
     user: &serenity::model::user::User,
     summoner_name_lower: &str,
     summoner_info: &riven::models::summoner_v4::Summoner,
+    tft_puuid: Option<&str>,
 ) -> Result<()> {
     let discord_id: u64 = user.id.get();
     let discord_username: &str = &user.name;
@@ -191,8 +248,9 @@ pub async fn register_user_summoner(
 
     // Insert or Update Summoner table
     // Using INSERT OR REPLACE based on puuid primary key
-    sqlx::query("INSERT OR REPLACE INTO Summoner (puuid, name, id) VALUES (?, ?, ?);")
+    sqlx::query("INSERT OR REPLACE INTO Summoner (puuid, TftPuuid, name, id) VALUES (?, ?, ?, ?);")
         .bind(puuid)
+        .bind(tft_puuid)
         .bind(riot_id_or_summoner_name) // Store the provided name/riot id
         .bind(summoner_id)
         .execute(&mut *tx) // Execute within the transaction
@@ -537,6 +595,7 @@ mod tests {
             }"#,
             )
             .unwrap(),
+            None,
         )
         .await?;
 
@@ -556,15 +615,18 @@ mod tests {
         assert_eq!(fetched_discord_display_name, discord_display_name);
 
         // Verify Summoner table entry
-        let summoner_row = sqlx::query("SELECT Puuid, Name, Id FROM Summoner WHERE Puuid = ?")
-            .bind(puuid)
-            .fetch_one(&pool)
-            .await?;
+        let summoner_row =
+            sqlx::query("SELECT Puuid, TftPuuid, Name, Id FROM Summoner WHERE Puuid = ?")
+                .bind(puuid)
+                .fetch_one(&pool)
+                .await?;
         let fetched_puuid: String = summoner_row.try_get("Puuid")?;
+        let fetched_tft_puuid: Option<String> = summoner_row.try_get("TftPuuid")?;
         let fetched_name: String = summoner_row.try_get("Name")?;
         let fetched_id: String = summoner_row.try_get("Id")?;
 
         assert_eq!(fetched_puuid, puuid);
+        assert_eq!(fetched_tft_puuid, None);
         assert_eq!(fetched_name, riot_id);
         assert_eq!(fetched_id, summoner_id);
 
@@ -594,6 +656,7 @@ mod tests {
             }"#,
             )
             .unwrap(),
+            Some("test_tft_puuid"),
         )
         .await?;
 
@@ -616,14 +679,20 @@ mod tests {
         );
 
         // Verify Summoner table update
-        let updated_summoner_row = sqlx::query("SELECT Name, Id FROM Summoner WHERE Puuid = ?")
-            .bind(puuid)
-            .fetch_one(&pool)
-            .await?;
+        let updated_summoner_row =
+            sqlx::query("SELECT Name, TftPuuid, Id FROM Summoner WHERE Puuid = ?")
+                .bind(puuid)
+                .fetch_one(&pool)
+                .await?;
         let updated_fetched_name: String = updated_summoner_row.try_get("Name")?;
+        let updated_fetched_tft_puuid: Option<String> = updated_summoner_row.try_get("TftPuuid")?;
         let updated_fetched_id: String = updated_summoner_row.try_get("Id")?;
 
         assert_eq!(updated_fetched_name, updated_riot_id);
+        assert_eq!(
+            updated_fetched_tft_puuid,
+            Some("test_tft_puuid".to_string())
+        );
         assert_eq!(updated_fetched_id, updated_summoner_id);
 
         Ok(())

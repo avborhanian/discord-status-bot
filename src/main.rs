@@ -449,7 +449,7 @@ async fn main() -> Result<()> {
         let active_summoner_names = summoners.values().cloned().collect::<HashSet<_>>(); // Collect names for puuid fetch
 
         loop {
-            let puuids = db::fetch_puuids(pool, &active_summoner_names).await?;
+            let summoner_puuids = db::fetch_summoner_puuids(pool, &active_summoner_names).await?;
 
             let new_start_time = get_start_time()?;
             let is_new_day = current_date < new_start_time;
@@ -491,7 +491,7 @@ async fn main() -> Result<()> {
 
             let mut found_new_matches = false;
             let mut found_new_tft_matches = false;
-            for puuid in &puuids {
+            for (lol_puuid, tft_puuid) in summoner_puuids.values() {
                 interval.tick().await; // Rate limit per PUUID check
                 if !found_new_matches {
                     let matches_fetch: Result<Vec<String>> = riot_api!(
@@ -499,7 +499,7 @@ async fn main() -> Result<()> {
                             .match_v5()
                             .get_match_ids_by_puuid(
                                 RegionalRoute::AMERICAS,
-                                puuid,
+                                lol_puuid,
                                 None,
                                 None,
                                 None,
@@ -521,18 +521,19 @@ async fn main() -> Result<()> {
                         }
                         Result::Ok(_) => { /* No new matches for this user */ }
                         Result::Err(e) => {
-                            error!("Hit an error while fetching matches for {}: {}", puuid, e)
+                            error!("Hit an error while fetching matches for {}: {}", lol_puuid, e)
                         }
                     }
                 }
 
                 if !found_new_tft_matches && &background_config.tft_riot_api_token != "" {
+                    let puuid_to_use = tft_puuid.as_ref().unwrap_or(lol_puuid);
                     let tft_matches_fetch: Result<Vec<String>> = riot_api!(
                         background_tft_riot_api
                             .tft_match_v1()
                             .get_match_ids_by_puuid(
                                 RegionalRoute::AMERICAS,
-                                puuid,
+                                puuid_to_use,
                                 None,
                                 None,
                                 None,
@@ -554,7 +555,7 @@ async fn main() -> Result<()> {
                         Result::Err(e) => {
                             error!(
                                 "Hit an error while fetching TFT matches for {}: {}",
-                                puuid, e
+                                puuid_to_use, e
                             )
                         }
                     }
@@ -811,7 +812,7 @@ async fn check_tft_match_history(
 
     let summoner_info = db::fetch_summoners(pool).await?;
     let summoner_names = summoner_info.values().cloned().collect::<HashSet<_>>();
-    let puuids = db::fetch_puuids(pool, &summoner_names).await?;
+    let puuids = db::fetch_tft_puuids(pool, &summoner_names).await?;
 
     let mut all_match_ids: Vec<String> = Vec::new();
     let matches_requests = stream::iter(puuids.clone())
@@ -1673,6 +1674,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS Summoner (
                  Id varchar(255),
                  Puuid TEXT PRIMARY KEY,
+                 TftPuuid TEXT,
                  Name TEXT NOT NULL UNIQUE
              );",
         )

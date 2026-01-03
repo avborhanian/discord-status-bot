@@ -563,9 +563,27 @@ pub mod register {
             }
         };
 
+        let tft_puuid = if !config.tft_riot_api_token.is_empty() {
+            let tft_riot_api = RiotApi::new(&config.tft_riot_api_token);
+            let tft_account = tft_riot_api
+                .account_v1()
+                .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
+                .await?;
+            tft_account.map(|a| a.puuid)
+        } else {
+            None
+        };
+
         let summoner_name_lower = format!("{name}#{tag}");
 
-        db::register_user_summoner(pool, &user, &summoner_name_lower, &summoner_info).await?;
+        db::register_user_summoner(
+            pool,
+            &user,
+            &summoner_name_lower,
+            &summoner_info,
+            tft_puuid.as_deref(),
+        )
+        .await?;
 
         // Return a success message
         Ok(CreateInteractionResponseMessage::new().content(format!(
