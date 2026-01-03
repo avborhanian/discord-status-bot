@@ -111,7 +111,7 @@ pub async fn fetch_summoner_puuids(
     Ok(results)
 }
 
-/// Fetches a set of TFT PUUIDs (falling back to LoL PUUID if TFT is null) for the given summoner names.
+/// Fetches a set of TFT PUUIDs for the given summoner names.
 pub async fn fetch_tft_puuids(
     pool: &SqlitePool,
     summoner_names: &HashSet<String>,
@@ -125,7 +125,7 @@ pub async fn fetch_tft_puuids(
         serde_json::to_string(&names_vec).context("Failed to serialize summoner names to JSON")?;
 
     let puuids: Vec<String> = sqlx::query_scalar(
-        "SELECT COALESCE(TftPuuid, Puuid) FROM summoner WHERE Name IN (SELECT value FROM json_each(?))",
+        "SELECT TftPuuid FROM summoner WHERE Name IN (SELECT value FROM json_each(?))",
     )
     .bind(names_json)
     .fetch_all(pool)
