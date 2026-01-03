@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::models::MatchInfo;
 use crate::riot_utils::GameId;
 use anyhow::Result;
-use anyhow::{anyhow, Context, Error, Ok};
+use anyhow::{Context, Error, Ok, anyhow};
 use chrono::Timelike;
 use chrono::{Datelike, TimeZone};
 use dotenvy::dotenv;
@@ -20,11 +20,11 @@ use futures_util::StreamExt;
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
 use models::Score;
+use riven::RiotApi;
 use riven::consts::Team;
 use riven::consts::{Queue, RegionalRoute};
 use riven::models::match_v5::Match;
 use riven::models::tft_match_v1::Match as TftMatch;
-use riven::RiotApi;
 use serenity::all::CreateInteractionResponse;
 use serenity::all::CreateInteractionResponseMessage;
 use serenity::all::CreateMessage;
@@ -38,7 +38,7 @@ use tokio::sync::RwLock;
 use tokio::task;
 use tokio::time;
 use tracing::{error, info};
-use tracing_subscriber::{filter, prelude::*, Layer};
+use tracing_subscriber::{Layer, filter, prelude::*};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -455,7 +455,10 @@ async fn main() -> Result<()> {
             let is_new_day = current_date < new_start_time;
 
             if is_new_day {
-                info!("It's a new day, time to scan histories at least once. Current day was {}, now it's {}", current_date, new_start_time);
+                info!(
+                    "It's a new day, time to scan histories at least once. Current day was {}, now it's {}",
+                    current_date, new_start_time
+                );
                 match check_match_history(
                     &background_riot_api,
                     &background_discord_client,
@@ -521,13 +524,18 @@ async fn main() -> Result<()> {
                         }
                         Result::Ok(_) => { /* No new matches for this user */ }
                         Result::Err(e) => {
-                            error!("Hit an error while fetching matches for {}: {}", lol_puuid, e)
+                            error!(
+                                "Hit an error while fetching matches for {}: {}",
+                                lol_puuid, e
+                            )
                         }
                     }
                 }
 
-                if !found_new_tft_matches && &background_config.tft_riot_api_token != "" {
-                    let puuid_to_use = tft_puuid.as_ref().unwrap_or(lol_puuid);
+                if !found_new_tft_matches
+                    && &background_config.tft_riot_api_token != ""
+                    && let Some(puuid_to_use) = tft_puuid
+                {
                     let tft_matches_fetch: Result<Vec<String>> = riot_api!(
                         background_tft_riot_api
                             .tft_match_v1()
@@ -2568,9 +2576,11 @@ mod tests {
         )
         .await?;
 
-        assert!(queue_scores
-            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
-            .is_none());
+        assert!(
+            queue_scores
+                .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+                .is_none()
+        );
         assert!(pentakillers.is_empty());
         assert!(dom_earners.is_empty());
         Ok(())
