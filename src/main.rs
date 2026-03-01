@@ -664,7 +664,8 @@ async fn check_match_history(
         (Queue::ARENA_2V2V2V2_CHERRY, "Arena"),
     ]);
     let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
-    let start_time = get_start_time()?;
+    let start_time_secs = get_start_time()?;
+    let start_time_ms = start_time_secs * 1000;
     let pool = &config.pool; // Get DB path from config
 
     let summoner_info = db::fetch_summoners(pool).await?;
@@ -684,7 +685,7 @@ async fn check_match_history(
                         None,
                         None,
                         None,
-                        Some(start_time),
+                        Some(start_time_secs),
                         None,
                         None,
                     )
@@ -716,7 +717,10 @@ async fn check_match_history(
     unique_match_ids.sort(); // Sort for consistent processing order
 
     if unique_match_ids.is_empty() {
-        info!("No relevant matches found since start time {}", start_time);
+        info!(
+            "No relevant matches found since start time {}",
+            start_time_secs
+        );
         // Update status to "No games" if it wasn't already, maybe?
         // Or just return early if no matches need processing.
         // Let's update the status to ensure it reflects reality if empty.
@@ -739,6 +743,14 @@ async fn check_match_history(
     let mut matches_to_fetch_details = Vec::new();
     for match_id in &unique_match_ids {
         if let Some(match_info) = seen_matches.get(match_id) {
+            let end_ts_ms = match_info.end_timestamp.timestamp_millis();
+            if end_ts_ms < start_time_ms {
+                info!(
+                    "Seen match {} ended before start_time {}. Skipping.",
+                    match_id, start_time_ms
+                );
+                continue;
+            }
             // Process already seen match for score calculation
             process_seen_match_score(match_info, &mut queue_scores, &puuids)?;
         } else {
@@ -779,7 +791,7 @@ async fn check_match_history(
                     &puuids,
                     &mut pentakillers,
                     &mut dom_earners,
-                    start_time,
+                    start_time_ms,
                 )
                 .await?;
             }
@@ -815,7 +827,8 @@ async fn check_tft_match_history(
     let queue_ids: HashMap<Queue, &str> =
         HashMap::from([(Queue::CONVERGENCE_TEAMFIGHT_TACTICS, "TFT")]);
     let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
-    let start_time = get_start_time()?;
+    let start_time_secs = get_start_time()?;
+    let start_time_ms = start_time_secs * 1000;
     let pool = &config.pool;
 
     let summoner_info = db::fetch_summoners(pool).await?;
@@ -834,7 +847,7 @@ async fn check_tft_match_history(
                         None,
                         None,
                         None,
-                        Some(start_time),
+                        Some(start_time_secs),
                     )
                     .await
             )
@@ -864,7 +877,7 @@ async fn check_tft_match_history(
     if unique_match_ids.is_empty() {
         info!(
             "No relevant TFT matches found since start time {}",
-            start_time
+            start_time_secs
         );
         let results = String::from("No TFT games yet!");
         update_discord_status(
@@ -882,6 +895,14 @@ async fn check_tft_match_history(
     let mut matches_to_fetch_details = Vec::new();
     for match_id in &unique_match_ids {
         if let Some(match_info) = seen_matches.get(match_id) {
+            let game_datetime = match_info.info.game_datetime;
+            if game_datetime < start_time_ms {
+                info!(
+                    "Seen TFT match {} ended before start_time {}. Skipping.",
+                    match_id, start_time_ms
+                );
+                continue;
+            }
             process_seen_tft_match_score(match_info, &mut queue_scores, &puuids)?;
         } else {
             matches_to_fetch_details.push(match_id.clone());
@@ -910,7 +931,7 @@ async fn check_tft_match_history(
     for (match_id, result) in match_details {
         match result {
             Result::Ok(Some(match_info)) => {
-                update_tft_match_info(pool, &match_info, &mut queue_scores, &puuids, start_time)
+                update_tft_match_info(pool, &match_info, &mut queue_scores, &puuids, start_time_ms)
                     .await?;
             }
             Result::Ok(None) => {
@@ -2583,6 +2604,132 @@ mod tests {
         );
         assert!(pentakillers.is_empty());
         assert!(dom_earners.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_seen_matches_respect_start_time() -> Result<()> {
+        use crate::db::{fetch_seen_events, update_match};
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string(), "puuid2".to_string()]);
+
+        let start_time_ms = chrono::Local::now().timestamp_millis();
+
+        // Older match (before start_time_ms)
+        let old_end = start_time_ms - 1000 * 60;
+        let p1_old = create_test_participant(
+            "puuid1",
+            "Player1#NA1",
+            TeamId::BLUE,
+            true,
+            10,
+            2,
+            5,
+            0,
+            None,
+            false,
+        );
+        let p2_old = create_test_participant(
+            "puuid2",
+            "Player2#NA1",
+            TeamId::RED,
+            false,
+            2,
+            10,
+            3,
+            0,
+            None,
+            false,
+        );
+        let team1_old = create_test_team(TeamId::BLUE, true);
+        let team2_old = create_test_team(TeamId::RED, false);
+        let old_match = create_test_match(
+            "NA1_OLD",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(old_end),
+            vec![p1_old, p2_old],
+            vec![team1_old, team2_old],
+        );
+
+        // Newer match (after start_time_ms)
+        let new_end = start_time_ms + 1000 * 60;
+        let p1_new = create_test_participant(
+            "puuid1",
+            "Player1#NA1",
+            TeamId::BLUE,
+            true,
+            8,
+            3,
+            7,
+            0,
+            None,
+            false,
+        );
+        let p2_new = create_test_participant(
+            "puuid2",
+            "Player2#NA1",
+            TeamId::RED,
+            false,
+            3,
+            8,
+            4,
+            0,
+            None,
+            false,
+        );
+        let team1_new = create_test_team(TeamId::BLUE, true);
+        let team2_new = create_test_team(TeamId::RED, false);
+        let new_match = create_test_match(
+            "NA1_NEW",
+            Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO,
+            Some(new_end),
+            vec![p1_new, p2_new],
+            vec![team1_new, team2_new],
+        );
+
+        // Insert both matches into the DB
+        update_match(
+            &pool,
+            "NA1_OLD",
+            i64::from(u16::from(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)),
+            true,
+            old_end,
+            &old_match,
+        )
+        .await?;
+        update_match(
+            &pool,
+            "NA1_NEW",
+            i64::from(u16::from(Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)),
+            true,
+            new_end,
+            &new_match,
+        )
+        .await?;
+
+        // Fetch seen matches as check_match_history would
+        let match_ids = vec!["NA1_OLD".to_string(), "NA1_NEW".to_string()];
+        let seen_matches = fetch_seen_events(&pool, &match_ids).await?;
+
+        // Simulate the filtering logic in check_match_history for seen matches
+        for (match_id, match_info) in &seen_matches {
+            let end_ts_ms = match_info.end_timestamp.timestamp_millis();
+            if end_ts_ms < start_time_ms {
+                // Should skip the old match
+                assert_eq!(match_id, "NA1_OLD");
+                continue;
+            }
+            process_seen_match_score(match_info, &mut queue_scores, &puuids)?;
+        }
+
+        // Only the newer match should have contributed to queue_scores
+        let score = queue_scores
+            .get(&Queue::SUMMONERS_RIFT_5V5_RANKED_SOLO)
+            .unwrap();
+        assert_eq!(score.games, 1);
+        assert_eq!(score.wins, 1);
+
         Ok(())
     }
 
