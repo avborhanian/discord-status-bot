@@ -37,7 +37,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::RwLock;
 use tokio::task;
 use tokio::time;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{Layer, filter, prelude::*};
 
 #[cfg(not(target_env = "msvc"))]
@@ -206,6 +206,8 @@ impl EventHandler for Handler {
                 commands::groups::register(),
                 commands::globetrotters::register(),
                 commands::register::register(),
+                commands::unregister::register(),
+                commands::list_users::register(),
                 commands::rank::register(),
             ],
         )
@@ -231,6 +233,18 @@ impl EventHandler for Handler {
                 "register" => {
                     commands::register::run(&ctx, &command.data.options, self.config.clone()).await
                 }
+                "unregister" => {
+                    commands::unregister::run(
+                        &ctx,
+                        &command.data.options,
+                        self.config.clone(),
+                        &command.user,
+                    )
+                    .await
+                }
+                "list-users" => {
+                    commands::list_users::run(&ctx, self.config.clone()).await
+                }
                 "rank" => {
                     commands::rank::run(
                         &ctx,
@@ -248,10 +262,12 @@ impl EventHandler for Handler {
                     &ctx.http,
                     CreateInteractionResponse::Message(message.unwrap_or_else(|error| {
                         info!("Error: {}", error);
-                        CreateInteractionResponseMessage::new().content(format!(
-                            "An error occurred while processing your command: {}",
-                            error
-                        ))
+                        CreateInteractionResponseMessage::new()
+                            .content(format!(
+                                "An error occurred while processing your command: {}",
+                                error
+                            ))
+                            .ephemeral(true)
                     })),
                 )
                 .await
@@ -293,28 +309,19 @@ impl EventHandler for Handler {
                 }
             }
             (Some(old_channel), None, Some(member)) => {
-                if let Some(channel_id) = old_channel.channel_id {
-                    if voice_channel_id == channel_id {
-                        if let Some(old_member) = old_channel.member {
-                            if old_member.user.id == member.user.id {
-                                self.remove_user(&member).await;
-                            }
-                        }
-                    }
+                // User disconnected from a channel entirely
+                if old_channel.channel_id == Some(voice_channel_id) {
+                    self.remove_user(&member).await;
                 }
             }
             (Some(old_channel), Some(new_channel_id), Some(ref member)) => {
+                // User switched channels
                 if new_channel_id == voice_channel_id {
                     let mut users = self.users.write().await;
                     users.insert(member.user.id.get());
-                } else if let Some(channel_id) = old_channel.channel_id {
-                    if voice_channel_id == channel_id {
-                        if let Some(old_member) = old_channel.member {
-                            if old_member.user.id == member.user.id {
-                                self.remove_user(member).await;
-                            }
-                        }
-                    }
+                } else if old_channel.channel_id == Some(voice_channel_id) {
+                    // Moved out of our channel into a different one
+                    self.remove_user(member).await;
                 }
             }
         }
@@ -483,6 +490,33 @@ async fn main() -> Result<()> {
                         Result::Ok(()) => {}
                         Result::Err(e) => error!("Error during daily TFT history check: {}", e),
                     }
+
+                    // Backfill TFT PUUIDs for any users that were registered before the TftPuuid column was added
+                    match db::fetch_summoners_missing_tft_puuid(&background_config.pool).await {
+                        Result::Ok(missing) => {
+                            for (summoner_name, _lol_puuid) in missing {
+                                let parts = summoner_name.splitn(2, '#').collect::<Vec<&str>>();
+                                if parts.len() == 2 {
+                                    match background_tft_riot_api
+                                        .account_v1()
+                                        .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, parts[0], parts[1])
+                                        .await
+                                    {
+                                        Result::Ok(Some(account)) => {
+                                            match db::update_tft_puuid(&background_config.pool, &summoner_name, &account.puuid).await {
+                                                Result::Ok(()) => info!("Backfilled TFT PUUID for {}", summoner_name),
+                                                Result::Err(e) => error!("Failed to store TFT PUUID for {}: {}", summoner_name, e),
+                                            }
+                                        }
+                                        Result::Ok(None) => info!("TFT PUUID backfill: no account found for {}", summoner_name),
+                                        Result::Err(e) => error!("TFT PUUID backfill API error for {}: {}", summoner_name, e),
+                                    }
+                                }
+                            }
+                        }
+                        Result::Err(e) => error!("Failed to fetch summoners missing TFT PUUID: {}", e),
+                    }
+
                     start_time = chrono::Local::now().timestamp(); // Reset scan window start
                     info!(
                         "Daily check done. Setting scan start time to {}",
@@ -1207,6 +1241,13 @@ fn generate_status_message(
         return results;
     }
 
+    warn!(
+        "Status exceeded {} chars ({}), falling back to abbreviated mode: {}",
+        MAX_STATUS_LEN,
+        results.chars().count(),
+        results
+    );
+
     queue_scores_msgs = queue_scores
         .iter()
         .filter(|(_, score)| score.games > 0 || score.warmup > 0)
@@ -1234,6 +1275,13 @@ fn generate_status_message(
     if results.chars().count() <= MAX_STATUS_LEN {
         return results;
     }
+
+    warn!(
+        "Status exceeded {} chars ({}), falling back to single-letter mode: {}",
+        MAX_STATUS_LEN,
+        results.chars().count(),
+        results
+    );
 
     queue_scores_msgs = queue_scores
         .iter()
@@ -1423,14 +1471,10 @@ async fn update_match_info(
             .iter()
             .filter(|p| puuids.contains(&p.puuid)) // Use borrowed puuids
             .filter(|p| p.kills == 5 && p.assists == 5 && p.deaths == 5)
-            .map(|p| {
-                (
-                    match_info.info.game_id,
-                    GameId {
-                        name: p.riot_id_game_name.as_ref().unwrap().to_string(),
-                        tag: p.riot_id_tagline.as_ref().unwrap().to_string(),
-                    },
-                )
+            .filter_map(|p| {
+                let name = p.riot_id_game_name.as_deref().unwrap_or("Unknown").to_string();
+                let tag = p.riot_id_tagline.as_deref().unwrap_or("").to_string();
+                Some((match_info.info.game_id, GameId { name, tag }))
             }),
     );
 
@@ -1440,16 +1484,12 @@ async fn update_match_info(
                 .info
                 .participants
                 .iter()
-                .filter(|p| puuids.contains(&p.puuid)) // Use borrowed puuids
+                .filter(|p| puuids.contains(&p.puuid))
                 .filter(|p| p.penta_kills > 0)
-                .map(|p| {
-                    (
-                        match_info.info.game_id,
-                        GameId {
-                            name: p.riot_id_game_name.as_ref().unwrap().to_string(),
-                            tag: p.riot_id_tagline.as_ref().unwrap().to_string(),
-                        },
-                    )
+                .filter_map(|p| {
+                    let name = p.riot_id_game_name.as_deref().unwrap_or("Unknown").to_string();
+                    let tag = p.riot_id_tagline.as_deref().unwrap_or("").to_string();
+                    Some((match_info.info.game_id, GameId { name, tag }))
                 }),
         );
     }
@@ -1465,7 +1505,7 @@ fn format_names_list(names: &[String]) -> String {
         _ => format!(
             "{}, and {}",
             names[..names.len() - 1].join(", "),
-            names.last().unwrap()
+            names.last().map(String::as_str).unwrap_or("")
         ),
     }
 }

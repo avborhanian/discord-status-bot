@@ -217,6 +217,84 @@ pub async fn fetch_seen_events(
     Ok(seen_matches)
 }
 
+/// Removes a user and their summoner entry from the database.
+/// Returns true if a user row was deleted, false if no user was found.
+pub async fn unregister_user(pool: &SqlitePool, discord_id: u64) -> Result<bool> {
+    let mut tx = pool.begin().await.context("Failed to begin transaction")?;
+
+    // Fetch the summoner name linked to this Discord user so we can clean up the Summoner table
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT SummonerName FROM User WHERE DiscordId = ?")
+            .bind(discord_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .context("Failed to look up user for unregister")?;
+
+    let Some((summoner_name,)) = row else {
+        return Ok(false);
+    };
+
+    sqlx::query("DELETE FROM User WHERE DiscordId = ?")
+        .bind(discord_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("Failed to delete user row")?;
+
+    // Remove the Summoner row only if no other User references it
+    let still_referenced: Option<(String,)> =
+        sqlx::query_as("SELECT DiscordId FROM User WHERE LOWER(SummonerName) = LOWER(?)")
+            .bind(&summoner_name)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("Failed to check if summoner is still referenced")?;
+
+    if still_referenced.is_none() {
+        sqlx::query("DELETE FROM summoner WHERE LOWER(Name) = LOWER(?)")
+            .bind(&summoner_name)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to delete summoner row")?;
+    }
+
+    tx.commit().await.context("Failed to commit transaction")?;
+    Ok(true)
+}
+
+/// Returns summoners that are missing a TFT PUUID: (summoner_name, lol_puuid) pairs.
+pub async fn fetch_summoners_missing_tft_puuid(
+    pool: &SqlitePool,
+) -> Result<Vec<(String, String)>> {
+    sqlx::query_as("SELECT Name, Puuid FROM summoner WHERE TftPuuid IS NULL")
+        .fetch_all(pool)
+        .await
+        .context("Failed to fetch summoners missing TFT PUUID")
+}
+
+/// Updates the TFT PUUID for a summoner by name.
+pub async fn update_tft_puuid(pool: &SqlitePool, summoner_name: &str, tft_puuid: &str) -> Result<()> {
+    sqlx::query("UPDATE summoner SET TftPuuid = ? WHERE Name = ?")
+        .bind(tft_puuid)
+        .bind(summoner_name)
+        .execute(pool)
+        .await
+        .context("Failed to update TFT PUUID")?;
+    Ok(())
+}
+
+/// Returns the Discord ID of the user already registered with this summoner name, if any.
+pub async fn find_existing_summoner_owner(
+    pool: &SqlitePool,
+    summoner_name: &str,
+) -> Result<Option<String>> {
+    let result: Option<(String,)> =
+        sqlx::query_as("SELECT DiscordId FROM User WHERE LOWER(SummonerName) = LOWER(?)")
+            .bind(summoner_name)
+            .fetch_optional(pool)
+            .await
+            .context("Failed to check existing summoner registration")?;
+    Ok(result.map(|(id,)| id))
+}
+
 /// Inserts or replaces user and summoner data during registration.
 pub async fn register_user_summoner(
     pool: &SqlitePool,
@@ -761,6 +839,189 @@ mod tests {
             match_id
         );
 
+        Ok(())
+    }
+
+    // ── New db functions added during code review ────────────────────────────
+
+    #[tokio::test]
+    async fn test_find_existing_summoner_owner_not_registered() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let owner = find_existing_summoner_owner(&pool, "NoOne#NA1").await?;
+        assert!(owner.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_existing_summoner_owner_found() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?, ?)")
+            .bind("999")
+            .bind("Player#NA1")
+            .execute(&pool)
+            .await?;
+
+        let owner = find_existing_summoner_owner(&pool, "Player#NA1").await?;
+        assert_eq!(owner, Some("999".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_existing_summoner_owner_case_insensitive() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?, ?)")
+            .bind("777")
+            .bind("MixedCase#EUW")
+            .execute(&pool)
+            .await?;
+
+        // Query with different casing
+        let owner = find_existing_summoner_owner(&pool, "mixedcase#euw").await?;
+        assert_eq!(owner, Some("777".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unregister_user_not_registered() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let removed = unregister_user(&pool, 12345).await?;
+        assert!(!removed, "Should return false when user does not exist");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unregister_user_removes_user_and_summoner() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+
+        // Seed User + Summoner rows
+        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?, ?)")
+            .bind("100")
+            .bind("Solo#NA1")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO Summoner (Puuid, Name) VALUES (?, ?)")
+            .bind("puuid-solo")
+            .bind("Solo#NA1")
+            .execute(&pool)
+            .await?;
+
+        let removed = unregister_user(&pool, 100).await?;
+        assert!(removed, "Should return true when user was deleted");
+
+        // Verify User row gone
+        let user_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM User WHERE DiscordId = '100'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(user_count.0, 0);
+
+        // Verify Summoner row also removed (no other owner)
+        let summoner_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM Summoner WHERE Name = 'Solo#NA1'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(summoner_count.0, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unregister_user_keeps_summoner_if_still_referenced() -> Result<()> {
+        // This is an edge case: two Discord users sharing a summoner row should not happen
+        // in normal use (UNIQUE constraint on SummonerName), but unregister should be safe
+        // if the summoner name is somehow referenced by another user inserted directly.
+        let pool = setup_in_memory_db_pool().await?;
+
+        // Insert two users pointing at the same summoner name via direct SQL
+        // (bypasses the UNIQUE constraint by using two different names for the users)
+        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?, ?)")
+            .bind("200")
+            .bind("Shared#NA1")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO Summoner (Puuid, Name) VALUES (?, ?)")
+            .bind("puuid-shared")
+            .bind("Shared#NA1")
+            .execute(&pool)
+            .await?;
+        // A second user with a *different* summoner name (normal state)
+        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?, ?)")
+            .bind("201")
+            .bind("Other#NA1")
+            .execute(&pool)
+            .await?;
+
+        // Unregister user 200
+        let removed = unregister_user(&pool, 200).await?;
+        assert!(removed);
+
+        // Summoner "Shared#NA1" should be gone since user 200 was the only reference
+        let summoner_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM Summoner WHERE Name = 'Shared#NA1'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(summoner_count.0, 0);
+
+        // User 201 should still exist
+        let user_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM User WHERE DiscordId = '201'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(user_count.0, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_summoners_missing_tft_puuid_none_missing() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO Summoner (Puuid, TftPuuid, Name) VALUES (?, ?, ?)")
+            .bind("puuid1")
+            .bind("tft-puuid1")
+            .bind("Player#NA1")
+            .execute(&pool)
+            .await?;
+
+        let missing = fetch_summoners_missing_tft_puuid(&pool).await?;
+        assert!(missing.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_summoners_missing_tft_puuid_with_nulls() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO Summoner (Puuid, TftPuuid, Name) VALUES (?, ?, ?), (?, NULL, ?)")
+            .bind("puuid1")
+            .bind("tft-puuid1")
+            .bind("HasTft#NA1")
+            .bind("puuid2")
+            .bind("NoTft#NA1")
+            .execute(&pool)
+            .await?;
+
+        let missing = fetch_summoners_missing_tft_puuid(&pool).await?;
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "NoTft#NA1");
+        assert_eq!(missing[0].1, "puuid2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_tft_puuid() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO Summoner (Puuid, TftPuuid, Name) VALUES (?, NULL, ?)")
+            .bind("puuid1")
+            .bind("Player#NA1")
+            .execute(&pool)
+            .await?;
+
+        update_tft_puuid(&pool, "Player#NA1", "tft-puuid-new").await?;
+
+        let tft_puuid: (Option<String>,) =
+            sqlx::query_as("SELECT TftPuuid FROM Summoner WHERE Name = 'Player#NA1'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(tft_puuid.0, Some("tft-puuid-new".to_string()));
         Ok(())
     }
 }

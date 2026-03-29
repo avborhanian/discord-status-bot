@@ -576,6 +576,16 @@ pub mod register {
 
         let summoner_name_lower = format!("{name}#{tag}");
 
+        // Check if this summoner is already registered to a different Discord user
+        if let Some(existing_owner_id) = db::find_existing_summoner_owner(pool, &summoner_name_lower).await? {
+            if existing_owner_id != user_id.get().to_string() {
+                return Err(anyhow!(
+                    "The Riot account '{}' is already registered to a different Discord user. Use `/unregister` on that account first.",
+                    summoner_name_lower
+                ));
+            }
+        }
+
         db::register_user_summoner(
             pool,
             &user,
@@ -593,109 +603,98 @@ pub mod register {
     }
 }
 
-pub mod clash {
-    use crate::riot_utils::GameId;
+
+pub mod unregister {
+    use crate::db;
+    use crate::Config;
     use anyhow::{anyhow, Result};
-    use riven::RiotApi;
-    use serenity::all::CreateCommandOption;
-    use serenity::all::CreateInteractionResponseMessage;
-    use serenity::builder;
-    use serenity::model::application::CommandDataOption;
+    use serenity::all::{
+        CommandDataOption, CommandDataOptionValue, CreateCommand, CreateCommandOption,
+        CreateInteractionResponseMessage,
+    };
     use serenity::model::application::CommandOptionType;
     use std::sync::Arc;
 
-    use crate::Config;
-
-    #[allow(dead_code)]
-    pub fn register() -> builder::CreateCommand {
-        builder::CreateCommand::new("clash")
-            .description("Looks up clash team info based on a player on the enemy team.")
+    pub fn register() -> CreateCommand {
+        CreateCommand::new("unregister")
+            .description("Removes a Discord user's registered Riot account from the bot.")
             .add_option(
                 CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "summoner",
-                    "The summoner name / riot id.",
+                    CommandOptionType::User,
+                    "user",
+                    "The Discord user to unregister (defaults to yourself).",
                 )
-                .required(true),
+                .required(false),
             )
     }
 
-    #[allow(dead_code)]
     pub async fn run(
-        _ctx: &serenity::prelude::Context,
+        ctx: &serenity::prelude::Context,
         options: &[CommandDataOption],
         config: Arc<Config>,
+        caller: &serenity::model::user::User,
     ) -> Result<CreateInteractionResponseMessage> {
-        let riot_api = RiotApi::new(&config.riot_api_token);
+        let pool = &config.pool;
 
-        let GameId { name, tag } = match options.iter().find(|o| o.name == "summoner") {
-            Some(account_option) => match account_option.value.as_str() {
-                Some(name) => {
-                    let text = name.trim();
-                    if text.is_empty() {
-                        return Err(anyhow!("No name specified".to_string()));
-                    }
-                    if text.contains('#') {
-                        let mut parts = text.split('#');
-                        GameId {
-                            name: parts
-                                .next()
-                                .ok_or(anyhow!("No display name specified"))?
-                                .to_string(),
-                            tag: parts
-                                .next()
-                                .ok_or(anyhow!("No Riot tag specified"))?
-                                .to_string(),
-                        }
-                    } else {
-                        return Err(anyhow!("No name specified".to_string()));
-                    }
+        let target_id = match options.iter().find(|o| o.name == "user") {
+            Some(opt) => match &opt.value {
+                CommandDataOptionValue::User(id) => {
+                    ctx.http.get_user(*id).await?.id
                 }
-                None => return Err(anyhow!("No name specified".to_string())),
+                _ => return Err(anyhow!("Expected a user.")),
             },
-            None => return Err(anyhow!("No name specified".to_string())),
+            None => caller.id,
         };
 
-        let account = riot_api
-            .account_v1()
-            .get_by_riot_id(riven::consts::RegionalRoute::AMERICAS, &name, &tag)
-            .await?;
-        let member_info = match account {
-            Some(account) => riot_api
-                .summoner_v4()
-                .get_by_puuid(riven::consts::PlatformRoute::NA1, &account.puuid)
-                .await?
-                .ok_or(anyhow!("Unable to find the matching summoner".to_string()))?,
-            None => {
-                return Err(anyhow!("Unable to find the matching account".to_string()));
-            }
-        };
+        match db::unregister_user(pool, target_id.get()).await? {
+            true => Ok(CreateInteractionResponseMessage::new().content(format!(
+                "Successfully unregistered <@{}>.",
+                target_id
+            ))),
+            false => Err(anyhow!(
+                "No registered account found for <@{}>.",
+                target_id
+            )),
+        }
+    }
+}
 
-        let clash_players = riot_api
-            .clash_v1()
-            .get_players_by_puuid(riven::consts::PlatformRoute::NA1, &member_info.puuid)
-            .await?;
-        let clash_tournaments = riot_api
-            .clash_v1()
-            .get_tournaments(riven::consts::PlatformRoute::NA1)
-            .await?;
-        let _ = clash_tournaments.iter().filter(|t| {
-            t.schedule
-                .iter()
-                .any(|phase| phase.start_time <= chrono::Local::now().timestamp_micros())
-        });
-        let _team_ids = clash_players
+pub mod list_users {
+    use crate::db;
+    use crate::Config;
+    use anyhow::Result;
+    use serenity::all::{CreateCommand, CreateEmbed, CreateInteractionResponseMessage};
+    use std::sync::Arc;
+
+    pub fn register() -> CreateCommand {
+        CreateCommand::new("list-users")
+            .description("Lists all Discord users registered with the bot.")
+    }
+
+    pub async fn run(
+        _ctx: &serenity::prelude::Context,
+        config: Arc<Config>,
+    ) -> Result<CreateInteractionResponseMessage> {
+        let pool = &config.pool;
+        let summoners = db::fetch_summoners(pool).await?;
+
+        if summoners.is_empty() {
+            return Ok(CreateInteractionResponseMessage::new()
+                .content("No users are currently registered."));
+        }
+
+        let mut lines: Vec<String> = summoners
             .iter()
-            .filter_map(|player| player.team_id.as_ref())
-            .map(|team_id| async {
-                let _team_fetch = riot_api
-                    .clash_v1()
-                    .get_team_by_id(riven::consts::PlatformRoute::NA1, team_id)
-                    .await
-                    .unwrap_or_default();
-            });
+            .map(|(discord_id, summoner_name)| format!("<@{}> → {}", discord_id, summoner_name))
+            .collect();
+        lines.sort();
 
-        Ok(CreateInteractionResponseMessage::new().content(""))
+        let embed = CreateEmbed::new()
+            .title("Registered Users")
+            .description(lines.join("\n"))
+            .color(0x0099FF);
+
+        Ok(CreateInteractionResponseMessage::new().embed(embed))
     }
 }
 
@@ -738,6 +737,12 @@ pub mod rank {
         let riot_api = RiotApi::new(&config.riot_api_token);
         let pool = &config.pool;
 
+        let tft_api: Option<RiotApi> = if config.tft_riot_api_token.is_empty() {
+            None
+        } else {
+            Some(RiotApi::new(&config.tft_riot_api_token))
+        };
+
         let target_account_input: Option<&str> =
             options.iter().find(|o| o.name == "summoner").and_then(|o| {
                 if let CommandDataOptionValue::String(s) = &o.value {
@@ -747,11 +752,11 @@ pub mod rank {
                 }
             });
 
-        let (puuid, display_name) = match target_account_input {
+        let (puuid, tft_puuid, display_name) = match target_account_input {
             // --- User provided a summoner name/Riot ID ---
             Some(input_str) => {
                 let GameId { name, tag } = GameId::try_from(input_str)?;
-                let display_name = input_str.to_string(); // Use the raw input for display initially
+                let display_name = input_str.to_string();
                 let account_result = riot_api!(
                     riot_api
                         .account_v1()
@@ -764,7 +769,20 @@ pub mod rank {
                     Ok(None) => Err(anyhow!("Riot ID `{name}#{tag}` not found.")),
                     Err(e) => Err(anyhow!("Error fetching Riot ID: {}", e)),
                 }?;
-                (account_puuid, display_name)
+
+                // Look up TFT PUUID via TFT API if available
+                let tft_puuid = if let Some(ref tft) = tft_api {
+                    tft.account_v1()
+                        .get_by_riot_id(RegionalRoute::AMERICAS, &name, &tag)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|acc| acc.puuid)
+                } else {
+                    None
+                };
+
+                (account_puuid, tft_puuid, display_name)
             }
             // --- No summoner provided, look up registered user ---
             None => {
@@ -772,19 +790,15 @@ pub mod rank {
                     .await
                     .context("Failed to fetch registered summoners from DB")?;
 
-                if let Some(summoner_name_or_riot_id) = registered_summoners.get(&caller.id.get()) {
-                    // Grab puuid from the database.
-                    let summoner_names =
-                        HashSet::from([registered_summoners[&caller.id.get()].clone()]);
-                    let puuids = db::fetch_puuids(pool, &summoner_names)
+                if let Some(summoner_name) = registered_summoners.get(&caller.id.get()) {
+                    let summoner_names = HashSet::from([summoner_name.clone()]);
+                    let puuid_map = db::fetch_summoner_puuids(pool, &summoner_names)
                         .await
-                        .context("Failed to fetch PUUID from DB")?;
-                    // grab the only puuid from the hashset of puuids.
-                    let account_puuid = puuids
-                        .iter()
-                        .next()
+                        .context("Failed to fetch PUUIDs from DB")?;
+                    let (lol_puuid, tft_puuid) = puuid_map
+                        .get(summoner_name)
                         .ok_or(anyhow!("No PUUID found for the registered summoner."))?;
-                    (account_puuid.to_string(), summoner_name_or_riot_id.clone())
+                    (lol_puuid.clone(), tft_puuid.clone(), summoner_name.clone())
                 } else {
                     return Err(anyhow!(
                         "You are not registered. Use `/register` or provide a summoner name/Riot ID."
@@ -836,7 +850,7 @@ pub mod rank {
             let rank_str = if tier != "Unranked" {
                 format!("{} {}", tier, rank)
             } else {
-                tier // Just "Unranked"
+                tier
             };
 
             embed = embed.field(
@@ -845,12 +859,78 @@ pub mod rank {
                     "**{}**\n{} LP\n{:.1}% WR ({}W / {}L)",
                     rank_str, lp, win_rate, wins, losses
                 ),
-                true, // Inline field
+                true,
             );
         }
 
         if !found_rank {
             embed = embed.description("This player is unranked in Solo/Duo and Flex queues.");
+        }
+
+        // --- TFT Rank section ---
+        if let (Some(tft_puuid), Some(tft)) = (&tft_puuid, &tft_api) {
+            match tft.tft_league_v1().get_league_entries_by_puuid(PlatformRoute::NA1, tft_puuid).await {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry.queue_type {
+                            QueueType::RANKED_TFT => {
+                                let tier = entry.tier.map_or("Unranked".to_string(), |t| format!("{:?}", t));
+                                let rank = entry.rank.map_or("".to_string(), |r| format!("{:?}", r));
+                                let lp = entry.league_points.unwrap_or(0);
+                                let wins = entry.wins;
+                                let losses = entry.losses;
+                                let total = wins + losses;
+                                let top4_rate = if total > 0 {
+                                    (wins as f64 / total as f64) * 100.0
+                                } else {
+                                    0.0
+                                };
+                                let rank_str = if tier != "Unranked" {
+                                    format!("{} {}", tier, rank)
+                                } else {
+                                    tier
+                                };
+                                embed = embed.field(
+                                    "TFT Ranked",
+                                    format!(
+                                        "**{}**\n{} LP\n{:.1}% Top4 ({} / {} games)",
+                                        rank_str, lp, top4_rate, wins, total
+                                    ),
+                                    true,
+                                );
+                            }
+                            QueueType::RANKED_TFT_TURBO => {
+                                let rated_tier = entry.rated_tier.as_deref().unwrap_or("Unrated");
+                                let rated_rating = entry.rated_rating.unwrap_or(0);
+                                let total = entry.wins + entry.losses;
+                                embed = embed.field(
+                                    "TFT Hyper Roll",
+                                    format!(
+                                        "**{}** ({})\n{} / {} games",
+                                        rated_tier, rated_rating, entry.wins, total
+                                    ),
+                                    true,
+                                );
+                            }
+                            QueueType::RANKED_TFT_DOUBLE_UP => {
+                                let tier = entry.tier.map_or("Unranked".to_string(), |t| format!("{:?}", t));
+                                let rank = entry.rank.map_or("".to_string(), |r| format!("{:?}", r));
+                                let lp = entry.league_points.unwrap_or(0);
+                                let rank_str = if tier != "Unranked" { format!("{} {}", tier, rank) } else { tier };
+                                embed = embed.field(
+                                    "TFT Double Up",
+                                    format!("**{}**\n{} LP\n{} / {} games", rank_str, lp, entry.wins, entry.wins + entry.losses),
+                                    true,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch TFT rank for {}: {}", display_name, e);
+                }
+            }
         }
 
         Ok(CreateInteractionResponseMessage::new().embed(embed))

@@ -6,3 +6,4 @@ sqlite.db
 server.log.*
 Untitled-1.py
 .env
+.claude/*
