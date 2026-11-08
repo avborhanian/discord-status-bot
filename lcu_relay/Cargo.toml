@@ -7,10 +7,12 @@ description = "Forwards a fixed allowlist of read-only League Client match-histo
 [dependencies]
 anyhow = "1.0.75"
 base64 = "0.22"
+dotenvy = "0.15.7"
 futures-util = "0.3.28"
 regex = "1.10.0"
 relay_protocol = { path = "../relay_protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.106"
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

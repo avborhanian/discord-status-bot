@@ -24,29 +24,44 @@ It allows the bot to track and score special game modes—such as **ARAM: Mayhem
 ### 1. Download `lcu_relay.exe`
 Download `lcu_relay.exe` from the latest GitHub Actions build artifact or your bot administrator.
 
-### 2. Run Manually
-Open PowerShell or Command Prompt in the directory containing `lcu_relay.exe`:
+### 2. Run Once to Configure
+Simply double-click `lcu_relay.exe` or run it in a terminal without any arguments:
 
 ```powershell
-.\lcu_relay.exe --server ws://<BOT_IP_OR_DOMAIN>:8787/relay/ws --secret <YOUR_RELAY_SECRET> --name "MyGamingPC"
+.\lcu_relay.exe
 ```
+
+On first run, it will interactively prompt you for:
+1. **Relay server URL**: `ws://<BOT_IP_OR_DOMAIN>:8787/relay/ws` (or `wss://...`)
+2. **Relay secret**: The shared secret from the bot administrator
+3. **Relay display name**: (Optional, press Enter to default to your computer's name)
+
+Your configuration is automatically saved to `%APPDATA%\lcu_relay\config.json` so you never have to type it again!
+
+Alternatively, you can provide a `.env` file next to `lcu_relay.exe` or pass standard command-line flags.
 
 ### 3. Run Automatically on Startup (Recommended)
 To keep the relay running whenever your PC starts up:
-1. Right-click `lcu_relay.exe` and click **Create shortcut**.
-2. Right-click the newly created shortcut and select **Properties**.
-3. In the **Target** field, add your flags after the executable path:
-   ```text
-   "C:\path\to\lcu_relay.exe" --server ws://<BOT_IP_OR_DOMAIN>:8787/relay/ws --secret <YOUR_RELAY_SECRET> --name "MyGamingPC"
-   ```
-4. Press `Win + R`, type `shell:startup`, and press Enter.
-5. Move the shortcut into the Windows Startup folder.
+1. Right-click `lcu_relay.exe` and select **Create shortcut**.
+2. Press `Win + R`, type `shell:startup`, and press Enter.
+3. Move the shortcut into the Windows Startup folder.
+
+Because your settings are saved in AppData (or `.env`), the shortcut does not need any arguments!
 
 The relay will automatically connect to the bot whenever your PC starts. When the League of Legends client is opened, the relay detects the lockfile and reports `lcu: up` to the bot. When League is closed, the relay simply waits quietly.
 
 ---
 
-## Command-Line Arguments & Environment Variables
+## Configuration Methods
+
+`lcu_relay` resolves configuration in the following order:
+
+1. **Command-Line Arguments** (highest priority, overrides all)
+2. **Environment Variables or `.env` file** (loaded from current working directory or beside `lcu_relay.exe`)
+3. **Saved Config File** (`%APPDATA%\lcu_relay\config.json` on Windows, `~/.config/lcu_relay/config.json` on Linux)
+4. **Interactive Setup Prompt** (when run without config in an interactive terminal)
+
+### Command-Line Arguments & Environment Variables
 
 | Flag | Environment Variable | Default | Description |
 |---|---|---|---|
@@ -55,6 +70,10 @@ The relay will automatically connect to the bot whenever your PC starts. When th
 | `--name` | `RELAY_NAME` | `%COMPUTERNAME%` | Friendly name for this relay instance |
 | `--lockfile` | `LCU_LOCKFILE` | `C:\Riot Games\League of Legends\lockfile` | Custom path to the League client `lockfile` if installed in a non-default directory |
 | `--rate-limit` | `RELAY_RATE_LIMIT` | `120` | Maximum requests forwarded per minute to prevent client flooding |
+| `--config <path>` | — | `%APPDATA%\lcu_relay\config.json` | Path to a custom `config.json` |
+| `--config-path` | — | — | Print the default configuration file location and exit |
+| `--save` | — | — | Save current arguments to the persistent config file |
+| `--reset` | — | — | Clear the saved configuration and re-prompt |
 
 ---
 
