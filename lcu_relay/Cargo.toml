@@ -1,0 +1,18 @@
+[package]
+name = "lcu_relay"
+version = "0.1.0"
+edition = "2024"
+description = "Forwards a fixed allowlist of read-only League Client match-history requests to discord_status_bot."
+
+[dependencies]
+anyhow = "1.0.75"
+base64 = "0.22"
+futures-util = "0.3.28"
+regex = "1.10.0"
+relay_protocol = { path = "../relay_protocol" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0.106"
+tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"

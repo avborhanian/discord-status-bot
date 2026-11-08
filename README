@@ -1,7 +1,90 @@
-Quick implementation of searching history and logging.
+# Discord Status Bot
 
-Current limitations:
-- Don't have a way to determine others who actually played automatically
-    - We could instead watch the people in the discord, and when the game play status changes in some way, check then.
-- Remove unwraps so we handle errors gracefully, instead of crashing.
-- There's a bug where we have discord users not being removed when users switch channels. Might need to add better tracking to figure out why.
+A Discord bot that monitors Discord voice channels, tracks League of Legends (and TFT) matches played together by channel members, and dynamically updates the voice channel status with current session win-loss records and announcements.
+
+---
+
+## Features
+
+- **Dynamic Voice Channel Status**: Updates channel status based on matches played by connected users (e.g., `Ranked: 3 - 1 | Mayhem: 4 - 1`).
+- **Group Game Detection**: Automatically tracks games where two or more registered members play together.
+- **Warmup Game Handling**: The first loss of a session can be treated as a warmup match.
+- **Pentakill & Dominance Announcements**: Queues channel notifications for special achievements.
+- **ARAM: Mayhem Support via LCU Relay**: Supports tracking game modes (like queue `2400` Mayhem) where the public Riot Developer API returns `403 Forbidden`.
+
+---
+
+## Configuration & Environment Variables
+
+Create a `.env` file or export the following variables:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DISCORD_TOKEN` | Yes | - | Discord Bot Token |
+| `RIOT_API_KEY` | Yes | - | Riot Developer API Key (`RGAPI-...`) |
+| `DATABASE_URL` | No | `sqlite:db.sqlite3` | SQLite database path |
+| `GUILD_ID` | Yes | - | Primary Discord Guild (Server) ID |
+| `CHANNEL_ID` | Yes | - | Voice channel ID to monitor |
+| `RELAY_SECRET` | No | *(disabled)* | Shared Bearer secret to enable the LCU Relay Hub for Mayhem matches |
+| `RELAY_BIND` | No | `0.0.0.0:8787` | Listening address and port for incoming companion relays |
+
+---
+
+## ARAM: Mayhem & LCU Relay
+
+Riot's public `match-v5` endpoint returns `403 Forbidden` for ARAM: Mayhem matches (`queueId: 2400`). To track Mayhem games without requiring the game client or Vanguard on the server/Raspberry Pi hosting the bot, `discord_status_bot` includes an outbound **LCU Relay Hub**.
+
+### Architecture
+
+1. One or more players run the lightweight `lcu_relay` binary on their Windows gaming PC.
+2. The relay establishes an outbound WebSocket connection (`ws://<bot_host>:8787/relay/ws`) to the bot using a shared secret.
+3. When the bot notices tracked players in voice, it queries the relay for Mayhem matches through the local League Client (LCU).
+4. The relay forwards only 3 strictly allowlisted read-only endpoints (alias lookup, match list, and game details), rate-limited to 30 req/min.
+5. If no relay is online, the bot continues operating normally with public API matches.
+
+### 1. Generating a Secure `RELAY_SECRET`
+
+Generate a 256-bit cryptographic secret token:
+
+- **Linux / macOS**:
+  ```bash
+  openssl rand -hex 32
+  ```
+- **PowerShell (Windows)**:
+  ```powershell
+  -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
+  ```
+
+Set this value as `RELAY_SECRET` in your bot's environment.
+
+### 2. Setting Up `lcu_relay` for Players
+
+Friends running League on Windows can download `lcu_relay.exe` (built automatically by GitHub Actions) and run:
+
+```powershell
+.\lcu_relay.exe --server ws://<YOUR_BOT_HOST>:8787/relay/ws --secret <YOUR_RELAY_SECRET> --name "Alice-PC"
+```
+
+To have it start automatically with Windows:
+1. Right-click `lcu_relay.exe` -> **Create shortcut**.
+2. Right-click the shortcut -> **Properties** -> in **Target**, append `--server ws://<YOUR_BOT_HOST>:8787/relay/ws --secret <YOUR_RELAY_SECRET>`.
+3. Press `Win + R`, enter `shell:startup`, and drag the shortcut into the Startup folder.
+
+For full relay documentation and security details, see [`lcu_relay/README.md`](lcu_relay/README.md).
+
+---
+
+## Building & Deploying
+
+### Standard Workspace Build
+```bash
+cargo build --release
+```
+
+### Raspberry Pi Deployment (Cross-Compilation)
+Deployments to the Raspberry Pi run automatically via GitHub Actions on push to `main` using `cross`:
+```bash
+cross build --target arm-unknown-linux-gnueabihf --locked --release
+```
+
+Windows companion relay binaries (`lcu_relay.exe`) are built and published as GitHub Actions artifacts.

@@ -5,8 +5,14 @@ edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[workspace]
+members = [".", "relay_protocol", "lcu_relay"]
+# Only the bot is built by default (keeps the Pi `cross build` unchanged).
+default-members = ["."]
+
 [dependencies]
 anyhow = "1.0.75"
+axum = { version = "0.8", features = ["ws"] }
 chrono = "0.4.30"
 console-subscriber = "0.1.10"
 dotenvy = "0.15.7"
@@ -14,10 +20,10 @@ futures = "0.3.28"
 futures-util = "0.3.28"
 http = "0.2.9"
 pbjson = "0.6.0"
-pbjson-types = "0.6.0"
 prost = "0.12.1"
 rand = "0.8.5"
 regex = "1.10.0"
+relay_protocol = { path = "relay_protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 riven = "2.24.0"
 serde = { version = "1.0.188", features = ["serde_derive"] }
@@ -36,4 +42,5 @@ openssl = { version = "0.10.57", features = ["vendored"] }
 jemallocator = "0.5.4"
 
 [dev-dependencies]
-tokio-test = "0.4.3"
+lcu_relay = { path = "lcu_relay" }
+tokio-tungstenite = "0.24"

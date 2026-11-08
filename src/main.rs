@@ -46,7 +46,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 mod commands;
 mod db;
+mod lcu_convert;
+mod mayhem;
 mod models;
+mod relay_hub;
 mod riot_utils;
 
 use riot_utils::riot_api;
@@ -62,6 +65,9 @@ struct Config {
     discord_guild_id: GuildId,
     log_path: PathBuf,
     pool: sqlx::SqlitePool,
+    /// Present only when `RELAY_SECRET` is set; enables Mayhem tracking via `lcu_relay`.
+    relay_hub: Option<Arc<relay_hub::RelayHub>>,
+    relay_bind: String,
 }
 
 async fn load_config() -> Result<Config> {
@@ -116,6 +122,12 @@ async fn load_config() -> Result<Config> {
         .await
         .context("Failed to create SQLite connection pool")?;
 
+    let relay_hub = env::var("RELAY_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|secret| relay_hub::RelayHub::new(secret.trim().to_string(), Duration::from_secs(15)));
+    let relay_bind = env::var("RELAY_BIND").unwrap_or_else(|_| String::from("0.0.0.0:8787"));
+
     Ok(Config {
         riot_api_token,
         tft_riot_api_token,
@@ -125,6 +137,8 @@ async fn load_config() -> Result<Config> {
         updates_channel_id,
         discord_guild_id,
         log_path,
+        relay_hub,
+        relay_bind,
         pool,
     })
 }
@@ -431,6 +445,18 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow!("Discord client error: {}", e)) // Convert Serenity error
     });
 
+    // --- Relay endpoint (Mayhem tracking via lcu_relay) ---
+    if let Some(hub) = config.relay_hub.clone() {
+        let bind = config.relay_bind.clone();
+        tokio::spawn(async move {
+            if let Err(e) = hub.serve(&bind).await {
+                error!("Relay endpoint stopped: {:#}", e);
+            }
+        });
+    } else {
+        info!("RELAY_SECRET not set; Mayhem tracking via lcu_relay is disabled");
+    }
+
     // --- Background Task ---
     // Clone necessary Arcs and config values for the background task
     let background_config = config_arc.clone();
@@ -449,6 +475,7 @@ async fn main() -> Result<()> {
         });
         let mut current_date = start_time; // Initialize current_date based on initial start_time logic
         let mut interval = time::interval(Duration::from_secs(5)); // Consider making interval configurable
+        let mut last_mayhem_poll: Option<std::time::Instant> = None;
 
         // Use config for DB path
         let pool = &background_config.pool;
@@ -610,6 +637,29 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Mayhem games never show up in match-v5; ask the relays instead.
+            if !found_new_matches
+                && let Some(hub) = &background_config.relay_hub
+                && last_mayhem_poll.is_none_or(|t| t.elapsed() >= mayhem::POLL_INTERVAL)
+                && hub.has_live_relay().await
+            {
+                last_mayhem_poll = Some(std::time::Instant::now());
+                let tracked: HashMap<String, String> = summoner_puuids
+                    .iter()
+                    .map(|(name, (puuid, _))| (name.clone(), puuid.clone()))
+                    .collect();
+                let since_ms = get_start_time()? * 1000;
+                let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
+                match mayhem::has_unseen(hub.as_ref(), pool, &tracked, &mut cache, since_ms).await {
+                    Result::Ok(true) => {
+                        info!("New Mayhem group game found via relay. Triggering full scan.");
+                        found_new_matches = true;
+                    }
+                    Result::Ok(false) => {}
+                    Result::Err(e) => warn!("Mayhem relay poll failed: {:#}", e),
+                }
+            }
+
             // If new matches were found for *any* user, run the full history check
             if found_new_matches {
                 match check_match_history(
@@ -680,6 +730,54 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Scores today's group Mayhem games read through the relay hub. Matches in
+/// `already_counted` were scored by the match-v5 pass and are skipped.
+#[allow(clippy::too_many_arguments)]
+async fn apply_mayhem<S: relay_hub::MayhemSource>(
+    source: &S,
+    pool: &sqlx::SqlitePool,
+    summoner_names: &HashSet<String>,
+    puuids: &HashSet<String>,
+    already_counted: &HashSet<String>,
+    start_time_ms: i64,
+    queue_scores: &mut HashMap<Queue, Score>,
+    queue_ids: &HashMap<Queue, &str>,
+    pentakillers: &mut Vec<(i64, GameId)>,
+    dom_earners: &mut Vec<(i64, GameId)>,
+) -> Result<()> {
+    let tracked: HashMap<String, String> = db::fetch_summoner_puuids(pool, summoner_names)
+        .await?
+        .into_iter()
+        .map(|(name, (puuid, _))| (name, puuid))
+        .collect();
+    let scan = {
+        let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
+        mayhem::scan(source, pool, &tracked, &mut cache, start_time_ms, already_counted).await?
+    };
+    info!(
+        "Mayhem scan: {} stored, {} new group game(s)",
+        scan.seen.len(),
+        scan.new_matches.len()
+    );
+    for stored in &scan.seen {
+        process_seen_match_score(stored, queue_scores, puuids)?;
+    }
+    for new_match in &scan.new_matches {
+        update_match_info(
+            pool,
+            new_match,
+            queue_scores,
+            queue_ids,
+            puuids,
+            pentakillers,
+            dom_earners,
+            start_time_ms,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn check_match_history(
     riot_api: &RiotApi,
     discord_client: &Arc<serenity::http::Http>,
@@ -696,6 +794,7 @@ async fn check_match_history(
         (Queue::HOWLING_ABYSS_5V5_ARAM, "ARAM"),
         (Queue::SUMMONERS_RIFT_CLASH, "Clash"),
         (Queue::ARENA_2V2V2V2_CHERRY, "Arena"),
+        (Queue(mayhem::MAYHEM_QUEUE), "Mayhem"),
     ]);
     let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
     let start_time_secs = get_start_time()?;
@@ -750,7 +849,14 @@ async fn check_match_history(
         .collect();
     unique_match_ids.sort(); // Sort for consistent processing order
 
-    if unique_match_ids.is_empty() {
+    // Mayhem games never appear in match-v5, so with a live relay keep going
+    // even when match-v5 has nothing.
+    let relay_hub = match &config.relay_hub {
+        Some(hub) if hub.has_live_relay().await => Some(hub.clone()),
+        _ => None,
+    };
+
+    if unique_match_ids.is_empty() && relay_hub.is_none() {
         info!(
             "No relevant matches found since start time {}",
             start_time_secs
@@ -773,6 +879,8 @@ async fn check_match_history(
     let seen_matches = db::fetch_seen_events(pool, &unique_match_ids).await?;
     let mut pentakillers = Vec::new();
     let mut dom_earners = Vec::new();
+    // Match ids scored by the match-v5 pass, so the Mayhem pass can't double count.
+    let mut counted_ids: HashSet<String> = HashSet::new();
 
     let mut matches_to_fetch_details = Vec::new();
     for match_id in &unique_match_ids {
@@ -787,6 +895,7 @@ async fn check_match_history(
             }
             // Process already seen match for score calculation
             process_seen_match_score(match_info, &mut queue_scores, &puuids)?;
+            counted_ids.insert(match_id.clone());
         } else {
             // Add to list of matches needing full details
             matches_to_fetch_details.push(match_id.clone());
@@ -828,6 +937,7 @@ async fn check_match_history(
                     start_time_ms,
                 )
                 .await?;
+                counted_ids.insert(match_id);
             }
             Result::Ok(None) => {
                 error!("Riot API returned Ok(None) for match id {}", match_id);
@@ -835,6 +945,26 @@ async fn check_match_history(
             Result::Err(e) => {
                 error!("Failed to fetch details for match {}: {:?}", match_id, e);
             }
+        }
+    }
+
+    if let Some(hub) = relay_hub {
+        // Relay problems must never block the match-v5 status update.
+        if let Err(e) = apply_mayhem(
+            hub.as_ref(),
+            pool,
+            &summoner_names,
+            &puuids,
+            &counted_ids,
+            start_time_ms,
+            &mut queue_scores,
+            &queue_ids,
+            &mut pentakillers,
+            &mut dom_earners,
+        )
+        .await
+        {
+            error!("Mayhem relay scan failed: {:#}", e);
         }
     }
 
@@ -2037,6 +2167,163 @@ mod tests {
         assert_eq!(score.warmup, 0);
         assert!(pentakillers.is_empty());
         assert!(dom_earners.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_apply_mayhem_scores_group_game_once() -> Result<()> {
+        use crate::mayhem::test_support::*;
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO Summoner (Puuid, Name) VALUES ('ENC_RAMJACK', 'RamJack#NA1'), ('ENC_ARAAM', 'Araam#NA1')")
+            .execute(&pool)
+            .await?;
+        let names: HashSet<String> = HashSet::from(["RamJack#NA1".to_string(), "Araam#NA1".to_string()]);
+        let puuids: HashSet<String> = HashSet::from(["ENC_RAMJACK".to_string(), "ENC_ARAAM".to_string()]);
+        let queue_ids: HashMap<Queue, &str> = HashMap::from([(Queue(2400), "Mayhem")]);
+        let start = FIXTURE_CREATION - 60 * 60 * 1000;
+        let source = FakeSource::with_group_game();
+
+        // First scan: new game is fetched, converted, scored and stored.
+        let mut scores: HashMap<Queue, Score> = HashMap::new();
+        let (mut pentas, mut doms) = (Vec::new(), Vec::new());
+        apply_mayhem(&source, &pool, &names, &puuids, &HashSet::new(), start, &mut scores, &queue_ids, &mut pentas, &mut doms)
+            .await?;
+        let score = scores.get(&Queue(2400)).expect("Mayhem scored");
+        assert_eq!((score.wins, score.games), (1, 1));
+        assert!(generate_status_message(&scores, &queue_ids).starts_with("Mayhem:"));
+        assert_eq!(source.game_calls(), vec![FIXTURE_GAME_ID]);
+
+        // Second scan: re-scored from the DB without refetching.
+        let mut rescored: HashMap<Queue, Score> = HashMap::new();
+        apply_mayhem(&source, &pool, &names, &puuids, &HashSet::new(), start, &mut rescored, &queue_ids, &mut pentas, &mut doms)
+            .await?;
+        assert_eq!(rescored.get(&Queue(2400)).map(|s| (s.wins, s.games)), Some((1, 1)));
+        assert_eq!(source.game_calls().len(), 1, "stored game must not be refetched");
+
+        // Already counted by the match-v5 pass: not double counted.
+        let mut skipped: HashMap<Queue, Score> = HashMap::new();
+        let counted = HashSet::from([format!("NA1_{FIXTURE_GAME_ID}")]);
+        apply_mayhem(&source, &pool, &names, &puuids, &counted, start, &mut skipped, &queue_ids, &mut pentas, &mut doms)
+            .await?;
+        assert!(skipped.get(&Queue(2400)).is_none_or(|s| s.games == 0));
+        Ok(())
+    }
+
+    /// Live end-to-end check: real relay hub + real lcu_relay + the League
+    /// client running on this PC. Run with
+    /// `MAYHEM_QA_PLAYERS="Name#TAG,Name#TAG" cargo test live_relay_end_to_end -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "needs a running League client"]
+    async fn live_relay_end_to_end() -> Result<()> {
+        let players: Vec<String> = env::var("MAYHEM_QA_PLAYERS")
+            .context("set MAYHEM_QA_PLAYERS")?
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        let since_hours: i64 = env::var("MAYHEM_QA_HOURS").ok().and_then(|h| h.parse().ok()).unwrap_or(24);
+
+        let hub = relay_hub::RelayHub::new("qa".into(), Duration::from_secs(15));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let router = hub.router();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        tokio::spawn(async move {
+            let config = lcu_relay::RelayConfig {
+                server: format!("ws://{addr}/relay/ws"),
+                secret: "qa".into(),
+                name: "qa-relay".into(),
+            };
+            let lcu = lcu_relay::lcu::LockfileLcu::new(r"C:\Riot Games\League of Legends\lockfile".into()).unwrap();
+            let mut handler = lcu_relay::RequestHandler::new(lcu);
+            lcu_relay::run_connection(&config, &mut handler).await
+        });
+        for _ in 0..100 {
+            if hub.has_live_relay().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(hub.has_live_relay().await, "relay never reported the client up");
+        println!("relay connected, client up");
+
+        let pool = setup_in_memory_db_pool().await?;
+        let mut puuids = HashSet::new();
+        for (i, name) in players.iter().enumerate() {
+            let encrypted = format!("ENC_{i}");
+            sqlx::query("INSERT INTO Summoner (Puuid, Name) VALUES (?, ?)").bind(&encrypted).bind(name).execute(&pool).await?;
+            puuids.insert(encrypted);
+        }
+        let names: HashSet<String> = players.iter().cloned().collect();
+        let queue_ids: HashMap<Queue, &str> = HashMap::from([(Queue(mayhem::MAYHEM_QUEUE), "Mayhem")]);
+        let start = chrono::Local::now().timestamp_millis() - since_hours * 60 * 60 * 1000;
+
+        let tracked: HashMap<String, String> = players.iter().enumerate().map(|(i, n)| (n.clone(), format!("ENC_{i}"))).collect();
+        let mut cache = mayhem::RawPuuidCache::new();
+        let trigger = mayhem::has_unseen(hub.as_ref(), &pool, &tracked, &mut cache, start).await?;
+        println!("resolved {}/{} players; background trigger would fire: {trigger}", cache.len(), players.len());
+
+        let mut scores: HashMap<Queue, Score> = HashMap::new();
+        let (mut pentas, mut doms) = (Vec::new(), Vec::new());
+        apply_mayhem(hub.as_ref(), &pool, &names, &puuids, &HashSet::new(), start, &mut scores, &queue_ids, &mut pentas, &mut doms).await?;
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM MATCH").fetch_one(&pool).await?;
+        println!("stored {stored} Mayhem match(es); pentakill announcements queued: {}", pentas.len());
+        println!("status would be: {}", generate_status_message(&scores, &queue_ids));
+
+        // A second scan must come entirely from the DB.
+        let mut rescored: HashMap<Queue, Score> = HashMap::new();
+        apply_mayhem(hub.as_ref(), &pool, &names, &puuids, &HashSet::new(), start, &mut rescored, &queue_ids, &mut pentas, &mut doms).await?;
+        println!("re-scan status: {}", generate_status_message(&rescored, &queue_ids));
+        assert_eq!(
+            scores.get(&Queue(mayhem::MAYHEM_QUEUE)).map(|s| (s.wins, s.games, s.warmup)),
+            rescored.get(&Queue(mayhem::MAYHEM_QUEUE)).map(|s| (s.wins, s.games, s.warmup))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_match_info_mayhem_from_lcu() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let game: lcu_convert::LcuGame =
+            serde_json::from_str(include_str!("../test_data/lcu_game_mayhem.json"))?;
+        // Participants 2 (RamJack) and 3 (Araam) are tracked; map their raw LCU PUUIDs.
+        let raw_to_encrypted = HashMap::from([
+            ("00000000-0000-0000-0000-000000001002".to_string(), "ENC_RAMJACK".to_string()),
+            ("00000000-0000-0000-0000-000000001003".to_string(), "ENC_ARAAM".to_string()),
+        ]);
+        let match_info = lcu_convert::to_match(&game, &raw_to_encrypted)?;
+
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> = HashMap::from([(Queue(2400), "Mayhem")]);
+        let puuids: HashSet<String> =
+            HashSet::from(["ENC_RAMJACK".to_string(), "ENC_ARAAM".to_string()]);
+        let mut pentakillers = Vec::new();
+        let mut dom_earners = Vec::new();
+        let start_time = match_info.info.game_end_timestamp.unwrap() - 1000 * 60 * 60;
+
+        update_match_info(
+            &pool,
+            &match_info,
+            &mut queue_scores,
+            &queue_ids,
+            &puuids,
+            &mut pentakillers,
+            &mut dom_earners,
+            start_time,
+        )
+        .await?;
+
+        let score = queue_scores.get(&Queue(2400)).expect("Mayhem score recorded");
+        assert_eq!((score.wins, score.games, score.warmup), (1, 1, 0));
+        assert!(generate_status_message(&queue_scores, &queue_ids).contains("Mayhem"));
+
+        // Stored match re-scores identically on a later scan.
+        let seen = db::fetch_seen_events(&pool, &["NA1_5675903256".to_string()]).await?;
+        let stored = seen.get("NA1_5675903256").expect("match stored");
+        assert!(stored.win);
+        let mut rescored: HashMap<Queue, Score> = HashMap::new();
+        process_seen_match_score(stored, &mut rescored, &puuids)?;
+        let rescore = rescored.get(&Queue(2400)).expect("re-scored");
+        assert_eq!((rescore.wins, rescore.games), (1, 1));
         Ok(())
     }
 

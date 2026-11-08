@@ -66,3 +66,22 @@ jobs:
         key: ${{ secrets.KEY }}
         port: ${{ secrets.PORT }}
         script: cd ${{secrets.TARGET_DIR}} && sudo ./start_job.sh
+
+  relay-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: "false"
+
+    - name: Build relay binary
+      run: cargo build -p lcu_relay --release --locked
+
+    - name: Upload relay artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: lcu_relay-windows
+        path: target/release/lcu_relay.exe
+

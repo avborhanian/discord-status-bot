@@ -7,3 +7,5 @@ server.log.*
 Untitled-1.py
 .env
 .claude/*
+.asw/*
+scratch/*
