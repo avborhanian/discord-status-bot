@@ -184,7 +184,7 @@ pub async fn scan_targets<S: MayhemSource>(
                     }
                 } else {
                     // Solo game: record with dummy queue so we don't query its details on every poll
-                    let end_ts = (game.game_creation + game.game_duration * 1000) / 1000;
+                    let end_ts = game.game_creation + game.game_duration * 1000;
                     if let Ok(solo_match) = lcu_convert::to_match(&game, &raw_to_encrypted) {
                         let _ = db::update_match(pool, &match_id, 24000, false, end_ts, &solo_match).await;
                     }
@@ -202,30 +202,30 @@ pub async fn scan_targets<S: MayhemSource>(
     Ok(result)
 }
 
-/// Inspects a single game by ID (e.g. reported by a GameEnded push event) and stores it if it's a Mayhem game.
-/// Returns Ok(true) if a new group Mayhem game was stored.
+/// Inspects a single game by ID (e.g. reported by a GameEnded push event).
+/// Returns Ok(Some(converted_match)) if it is a new group Mayhem game.
 pub async fn inspect_single_game<S: MayhemSource>(
     source: &S,
     pool: &SqlitePool,
     tracked: &HashMap<String, String>,
     cache: &mut RawPuuidCache,
     game_id: i64,
-) -> Result<bool> {
+) -> Result<Option<Match>> {
     let match_id = format!("NA1_{game_id}");
     let stored = db::fetch_seen_events(pool, std::slice::from_ref(&match_id)).await?;
     if stored.contains_key(&match_id) {
-        return Ok(false);
+        return Ok(None);
     }
     let raw_to_encrypted = resolve_raw_puuids(source, tracked, cache).await;
     match source.game(game_id).await {
         Ok(game) => {
-            let end_ts = (game.game_creation + game.game_duration * 1000) / 1000;
+            let end_ts = game.game_creation + game.game_duration * 1000;
             if game.queue_id != MAYHEM_QUEUE {
                 // Not a Mayhem game; record dummy queue so we never query again
                 if let Ok(m) = lcu_convert::to_match(&game, &raw_to_encrypted) {
                     let _ = db::update_match(pool, &match_id, game.queue_id as i64, false, end_ts, &m).await;
                 }
-                return Ok(false);
+                return Ok(None);
             }
             let group_players = game
                 .participant_identities
@@ -235,14 +235,8 @@ pub async fn inspect_single_game<S: MayhemSource>(
             if group_players >= 2 {
                 match lcu_convert::to_match(&game, &raw_to_encrypted) {
                     Ok(converted) => {
-                        let win = converted
-                            .info
-                            .participants
-                            .iter()
-                            .any(|p| p.win && raw_to_encrypted.values().any(|enc| enc == &p.puuid));
-                        db::update_match(pool, &match_id, MAYHEM_QUEUE as i64, win, end_ts, &converted).await?;
-                        info!("Event-driven Mayhem match {match_id} stored ({group_players} group players)");
-                        return Ok(true);
+                        info!("Event-driven Mayhem match {match_id} identified ({group_players} group players)");
+                        return Ok(Some(converted));
                     }
                     Err(e) => warn!("Could not convert Mayhem game {match_id}: {e:#}"),
                 }
@@ -257,7 +251,7 @@ pub async fn inspect_single_game<S: MayhemSource>(
             warn!("Could not fetch game details for {game_id}: {e:#}");
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Finds today's group Mayhem games across all tracked players.
@@ -573,16 +567,23 @@ mod tests {
         let pool = pool().await;
         let mut cache = RawPuuidCache::new();
 
-        // First inspect stores it and returns true
+        // First inspect converts it and returns Some
         let stored = inspect_single_game(&source, &pool, &tracked(), &mut cache, FIXTURE_GAME_ID)
             .await
             .unwrap();
-        assert!(stored);
+        assert!(stored.is_some());
+        let m = stored.unwrap();
+        assert_eq!(m.metadata.match_id, format!("NA1_{FIXTURE_GAME_ID}"));
 
-        // Second inspect recognizes it's already in the DB and returns false
+        // Store it as update_match_info would
+        db::update_match(&pool, &m.metadata.match_id, 2400, true, m.info.game_end_timestamp.unwrap(), &m)
+            .await
+            .unwrap();
+
+        // Second inspect recognizes it's already in the DB and returns None
         let second = inspect_single_game(&source, &pool, &tracked(), &mut cache, FIXTURE_GAME_ID)
             .await
             .unwrap();
-        assert!(!second);
+        assert!(second.is_none());
     }
 }

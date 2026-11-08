@@ -122,6 +122,13 @@ async fn load_config() -> Result<Config> {
         .await
         .context("Failed to create SQLite connection pool")?;
 
+    // Ensure all match timestamps are stored in milliseconds (migrate any legacy second timestamps)
+    let _ = sqlx::query(
+        "UPDATE MATCH SET END_TIMESTAMP = END_TIMESTAMP * 1000 WHERE END_TIMESTAMP > 1000000000 AND END_TIMESTAMP < 100000000000",
+    )
+    .execute(&pool)
+    .await;
+
     let relay_hub = env::var("RELAY_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -526,6 +533,7 @@ async fn main() -> Result<()> {
                     &background_current_status,
                     &background_config,
                     None,
+                    Vec::new(),
                 )
                 .await
                 {
@@ -594,6 +602,7 @@ async fn main() -> Result<()> {
             let mut found_new_matches = false;
             let mut found_new_tft_matches = false;
             let mut triggered_mayhem_targets: Option<Vec<String>> = None;
+            let mut extra_mayhem_matches: Vec<Match> = Vec::new();
 
             // --- 1. Event-driven push check (Option 1) ---
             if let Some(hub) = &background_config.relay_hub {
@@ -607,12 +616,12 @@ async fn main() -> Result<()> {
                         let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
                         if let Some(id) = game_id {
                             match mayhem::inspect_single_game(hub.as_ref(), pool, &tracked, &mut cache, id).await {
-                                Result::Ok(true) => {
-                                    info!("GameEnded game {id} recorded! Triggering update.");
+                                Result::Ok(Some(converted)) => {
+                                    info!("GameEnded group Mayhem game {id} identified! Triggering update.");
                                     found_new_matches = true;
-                                    triggered_mayhem_targets = Some(Vec::new());
+                                    extra_mayhem_matches.push(converted);
                                 }
-                                Result::Ok(false) => {}
+                                Result::Ok(None) => {}
                                 Result::Err(e) => warn!("Failed to inspect GameEnded game {id}: {e:#}"),
                             }
                         } else {
@@ -794,6 +803,7 @@ async fn main() -> Result<()> {
                     &background_current_status,
                     &background_config,
                     triggered_mayhem_targets.as_deref(),
+                    extra_mayhem_matches,
                 )
                 .await
                 {
@@ -878,6 +888,7 @@ async fn apply_mayhem<S: relay_hub::MayhemSource>(
         pool,
         summoner_names,
         None,
+        Vec::new(),
         puuids,
         already_counted,
         start_time_ms,
@@ -895,6 +906,7 @@ async fn apply_mayhem_targets<S: relay_hub::MayhemSource>(
     pool: &sqlx::SqlitePool,
     summoner_names: &HashSet<String>,
     target_names: Option<&[String]>,
+    extra_matches: Vec<Match>,
     puuids: &HashSet<String>,
     already_counted: &HashSet<String>,
     start_time_ms: i64,
@@ -908,6 +920,10 @@ async fn apply_mayhem_targets<S: relay_hub::MayhemSource>(
         .into_iter()
         .map(|(name, (puuid, _))| (name, puuid))
         .collect();
+    let mut skip_ids = already_counted.clone();
+    for extra in &extra_matches {
+        skip_ids.insert(extra.metadata.match_id.clone());
+    }
     let scan = {
         let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
         mayhem::scan_targets(
@@ -917,30 +933,36 @@ async fn apply_mayhem_targets<S: relay_hub::MayhemSource>(
             target_names,
             &mut cache,
             start_time_ms,
-            already_counted,
+            &skip_ids,
         )
         .await?
     };
+    let total_new = scan.new_matches.len() + extra_matches.len();
     info!(
         "Mayhem scan: {} stored, {} new group game(s)",
         scan.seen.len(),
-        scan.new_matches.len()
+        total_new
     );
+    let mut scored_ids = already_counted.clone();
     for stored in &scan.seen {
-        process_seen_match_score(stored, queue_scores, puuids)?;
+        if scored_ids.insert(stored.id.clone()) {
+            process_seen_match_score(stored, queue_scores, puuids)?;
+        }
     }
-    for new_match in &scan.new_matches {
-        update_match_info(
-            pool,
-            new_match,
-            queue_scores,
-            queue_ids,
-            puuids,
-            pentakillers,
-            dom_earners,
-            start_time_ms,
-        )
-        .await?;
+    for new_match in scan.new_matches.into_iter().chain(extra_matches) {
+        if scored_ids.insert(new_match.metadata.match_id.clone()) {
+            update_match_info(
+                pool,
+                &new_match,
+                queue_scores,
+                queue_ids,
+                puuids,
+                pentakillers,
+                dom_earners,
+                start_time_ms,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -951,6 +973,7 @@ async fn check_match_history(
     current_status: &Arc<RwLock<String>>,
     config: &Config,
     mayhem_targets: Option<&[String]>,
+    extra_mayhem_matches: Vec<Match>,
 ) -> Result<()> {
     let queue_ids: HashMap<Queue, &str> = HashMap::from([
         (Queue::SUMMONERS_RIFT_5V5_DRAFT_PICK, "Draft"),
@@ -1123,6 +1146,7 @@ async fn check_match_history(
             pool,
             &summoner_names,
             mayhem_targets,
+            extra_mayhem_matches,
             &puuids,
             &counted_ids,
             start_time_ms,
