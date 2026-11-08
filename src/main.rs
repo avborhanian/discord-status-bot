@@ -148,12 +148,15 @@ struct Handler {
     current_status: Arc<RwLock<String>>,
     discord_auth: Arc<serenity::http::Http>,
     config: Arc<Config>, // Add config here
+    sweep_tx: tokio::sync::mpsc::Sender<u64>,
 }
 
 impl Handler {
     async fn remove_user(&self, member: &Member) {
+        let user_id = member.user.id.get();
         let mut users = self.users.write().await;
-        users.remove(&member.user.id.get());
+        users.remove(&user_id);
+        let _ = self.sweep_tx.try_send(user_id);
         if users.is_empty() {
             let message = self.current_status.read().await.to_string();
             info!("Len is 0, going to update the status to {}", message);
@@ -426,11 +429,14 @@ async fn main() -> Result<()> {
             .build(),
     );
 
+    let (sweep_tx, sweep_rx) = tokio::sync::mpsc::channel::<u64>(64);
+
     let handler = Handler {
         users: active_users.clone(), // Keep cloning Arcs
         current_status: current_status.clone(),
         discord_auth: discord_client.clone(),
         config: config_arc.clone(),
+        sweep_tx,
     };
 
     let mut client = Client::builder(&config.discord_bot_token, intents)
@@ -481,6 +487,8 @@ async fn main() -> Result<()> {
     let background_tft_riot_api = Arc::new(tft_riot_api);
     let background_discord_client = discord_client.clone();
     let background_current_status = current_status.clone();
+    let background_active_users = active_users.clone();
+    let mut background_sweep_rx = sweep_rx;
 
     let forever: task::JoinHandle<Result<()>> = task::spawn(async move {
         let mut start_time = get_start_time().unwrap_or_else(|e| {
@@ -493,6 +501,8 @@ async fn main() -> Result<()> {
         let mut current_date = start_time; // Initialize current_date based on initial start_time logic
         let mut interval = time::interval(Duration::from_secs(5)); // Consider making interval configurable
         let mut last_mayhem_poll: Option<std::time::Instant> = None;
+        let mut round_robin_idx: usize = 0;
+        let mut game_ended_rx = background_config.relay_hub.as_ref().map(|h| h.subscribe_game_ended());
 
         // Use config for DB path
         let pool = &background_config.pool;
@@ -515,6 +525,7 @@ async fn main() -> Result<()> {
                     &background_discord_client,
                     &background_current_status,
                     &background_config,
+                    None,
                 )
                 .await
                 {
@@ -582,6 +593,68 @@ async fn main() -> Result<()> {
 
             let mut found_new_matches = false;
             let mut found_new_tft_matches = false;
+            let mut triggered_mayhem_targets: Option<Vec<String>> = None;
+
+            // --- 1. Event-driven push check (Option 1) ---
+            if let Some(hub) = &background_config.relay_hub {
+                if let Some(rx) = game_ended_rx.as_mut() {
+                    while let Result::Ok(game_id) = rx.try_recv() {
+                        info!("Event push: GameEnded received from relay (game_id: {game_id:?})");
+                        let tracked: HashMap<String, String> = summoner_puuids
+                            .iter()
+                            .map(|(name, (puuid, _))| (name.clone(), puuid.clone()))
+                            .collect();
+                        let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
+                        if let Some(id) = game_id {
+                            match mayhem::inspect_single_game(hub.as_ref(), pool, &tracked, &mut cache, id).await {
+                                Result::Ok(true) => {
+                                    info!("GameEnded game {id} recorded! Triggering update.");
+                                    found_new_matches = true;
+                                    triggered_mayhem_targets = Some(Vec::new());
+                                }
+                                Result::Ok(false) => {}
+                                Result::Err(e) => warn!("Failed to inspect GameEnded game {id}: {e:#}"),
+                            }
+                        } else {
+                            let current_voice = background_active_users.read().await;
+                            let voice_players: Vec<String> = current_voice.iter().filter_map(|uid| summoners.get(uid)).cloned().collect();
+                            if !voice_players.is_empty() {
+                                let since_ms = get_start_time()? * 1000;
+                                if let Result::Ok(true) = mayhem::has_unseen_targets(hub.as_ref(), pool, &tracked, Some(&voice_players), &mut cache, since_ms).await {
+                                    found_new_matches = true;
+                                    triggered_mayhem_targets = Some(voice_players);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- 2. Sweep on leave check (Option 5) ---
+            while let Result::Ok(left_uid) = background_sweep_rx.try_recv() {
+                if let Some(hub) = &background_config.relay_hub {
+                    if hub.has_live_relay().await {
+                        if let Some(summoner_name) = summoners.get(&left_uid) {
+                            info!("User left voice; sweeping last 20 games for {summoner_name}");
+                            let tracked: HashMap<String, String> = summoner_puuids
+                                .iter()
+                                .map(|(name, (puuid, _))| (name.clone(), puuid.clone()))
+                                .collect();
+                            let since_ms = get_start_time()? * 1000;
+                            let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
+                            match mayhem::has_unseen_targets(hub.as_ref(), pool, &tracked, Some(std::slice::from_ref(summoner_name)), &mut cache, since_ms).await {
+                                Result::Ok(true) => {
+                                    info!("Leave sweep found unseen Mayhem game for {summoner_name}! Triggering update.");
+                                    found_new_matches = true;
+                                    triggered_mayhem_targets = Some(vec![summoner_name.clone()]);
+                                }
+                                Result::Ok(false) => {}
+                                Result::Err(e) => warn!("Leave sweep failed for {summoner_name}: {e:#}"),
+                            }
+                        }
+                    }
+                }
+            }
             for (lol_puuid, tft_puuid) in summoner_puuids.values() {
                 interval.tick().await; // Rate limit per PUUID check
                 if !found_new_matches {
@@ -664,26 +737,52 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Mayhem games never show up in match-v5; ask the relays instead.
+            // --- 3. Periodic voice-channel rotation check (Option 3: 1 player per tick) ---
             if !found_new_matches
                 && let Some(hub) = &background_config.relay_hub
-                && last_mayhem_poll.is_none_or(|t| t.elapsed() >= mayhem::POLL_INTERVAL)
                 && hub.has_live_relay().await
             {
-                last_mayhem_poll = Some(std::time::Instant::now());
-                let tracked: HashMap<String, String> = summoner_puuids
-                    .iter()
-                    .map(|(name, (puuid, _))| (name.clone(), puuid.clone()))
-                    .collect();
-                let since_ms = get_start_time()? * 1000;
-                let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
-                match mayhem::has_unseen(hub.as_ref(), pool, &tracked, &mut cache, since_ms).await {
-                    Result::Ok(true) => {
-                        info!("New Mayhem group game found via relay. Triggering full scan.");
-                        found_new_matches = true;
+                let current_voice = background_active_users.read().await;
+                let voice_players: Vec<String> = current_voice.iter().filter_map(|uid| summoners.get(uid)).cloned().collect();
+                let poll_interval = if voice_players.is_empty() {
+                    Duration::from_secs(600) // Empty voice: slow 10m heartbeat
+                } else {
+                    mayhem::POLL_INTERVAL // Voice has active members: 60s
+                };
+
+                if last_mayhem_poll.is_none_or(|t| t.elapsed() >= poll_interval) {
+                    last_mayhem_poll = Some(std::time::Instant::now());
+                    let tracked: HashMap<String, String> = summoner_puuids
+                        .iter()
+                        .map(|(name, (puuid, _))| (name.clone(), puuid.clone()))
+                        .collect();
+                    let since_ms = get_start_time()? * 1000;
+                    let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
+
+                    let target_to_poll = if !voice_players.is_empty() {
+                        let target = voice_players[round_robin_idx % voice_players.len()].clone();
+                        round_robin_idx = round_robin_idx.wrapping_add(1);
+                        Some(target)
+                    } else if !active_summoner_names.is_empty() {
+                        let names: Vec<_> = active_summoner_names.iter().cloned().collect();
+                        let target = names[round_robin_idx % names.len()].clone();
+                        round_robin_idx = round_robin_idx.wrapping_add(1);
+                        Some(target)
+                    } else {
+                        None
+                    };
+
+                    if let Some(target) = target_to_poll {
+                        match mayhem::has_unseen_targets(hub.as_ref(), pool, &tracked, Some(std::slice::from_ref(&target)), &mut cache, since_ms).await {
+                            Result::Ok(true) => {
+                                info!("New Mayhem game detected for rotated player {target}! Triggering update.");
+                                found_new_matches = true;
+                                triggered_mayhem_targets = Some(vec![target]);
+                            }
+                            Result::Ok(false) => {}
+                            Result::Err(e) => warn!("Mayhem relay poll failed for {target}: {e:#}"),
+                        }
                     }
-                    Result::Ok(false) => {}
-                    Result::Err(e) => warn!("Mayhem relay poll failed: {:#}", e),
                 }
             }
 
@@ -694,6 +793,7 @@ async fn main() -> Result<()> {
                     &background_discord_client,
                     &background_current_status,
                     &background_config,
+                    triggered_mayhem_targets.as_deref(),
                 )
                 .await
                 {
@@ -759,11 +859,42 @@ async fn main() -> Result<()> {
 
 /// Scores today's group Mayhem games read through the relay hub. Matches in
 /// `already_counted` were scored by the match-v5 pass and are skipped.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn apply_mayhem<S: relay_hub::MayhemSource>(
     source: &S,
     pool: &sqlx::SqlitePool,
     summoner_names: &HashSet<String>,
+    puuids: &HashSet<String>,
+    already_counted: &HashSet<String>,
+    start_time_ms: i64,
+    queue_scores: &mut HashMap<Queue, Score>,
+    queue_ids: &HashMap<Queue, &str>,
+    pentakillers: &mut Vec<(i64, GameId)>,
+    dom_earners: &mut Vec<(i64, GameId)>,
+) -> Result<()> {
+    apply_mayhem_targets(
+        source,
+        pool,
+        summoner_names,
+        None,
+        puuids,
+        already_counted,
+        start_time_ms,
+        queue_scores,
+        queue_ids,
+        pentakillers,
+        dom_earners,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_mayhem_targets<S: relay_hub::MayhemSource>(
+    source: &S,
+    pool: &sqlx::SqlitePool,
+    summoner_names: &HashSet<String>,
+    target_names: Option<&[String]>,
     puuids: &HashSet<String>,
     already_counted: &HashSet<String>,
     start_time_ms: i64,
@@ -779,7 +910,16 @@ async fn apply_mayhem<S: relay_hub::MayhemSource>(
         .collect();
     let scan = {
         let mut cache = mayhem::RAW_PUUID_CACHE.lock().await;
-        mayhem::scan(source, pool, &tracked, &mut cache, start_time_ms, already_counted).await?
+        mayhem::scan_targets(
+            source,
+            pool,
+            &tracked,
+            target_names,
+            &mut cache,
+            start_time_ms,
+            already_counted,
+        )
+        .await?
     };
     info!(
         "Mayhem scan: {} stored, {} new group game(s)",
@@ -810,6 +950,7 @@ async fn check_match_history(
     discord_client: &Arc<serenity::http::Http>,
     current_status: &Arc<RwLock<String>>,
     config: &Config,
+    mayhem_targets: Option<&[String]>,
 ) -> Result<()> {
     let queue_ids: HashMap<Queue, &str> = HashMap::from([
         (Queue::SUMMONERS_RIFT_5V5_DRAFT_PICK, "Draft"),
@@ -977,10 +1118,11 @@ async fn check_match_history(
 
     if let Some(hub) = relay_hub {
         // Relay problems must never block the match-v5 status update.
-        if let Err(e) = apply_mayhem(
+        if let Err(e) = apply_mayhem_targets(
             hub.as_ref(),
             pool,
             &summoner_names,
+            mayhem_targets,
             &puuids,
             &counted_ids,
             start_time_ms,

@@ -72,6 +72,8 @@ pub struct RelayHub {
     timeout: Duration,
     next_id: AtomicU64,
     state: Mutex<HubState>,
+    game_ended_notify: Arc<tokio::sync::Notify>,
+    game_ended_tx: tokio::sync::broadcast::Sender<Option<i64>>,
 }
 
 impl std::fmt::Debug for RelayHub {
@@ -91,12 +93,30 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 impl RelayHub {
     pub fn new(secret: String, timeout: Duration) -> Arc<Self> {
+        let (game_ended_tx, _) = tokio::sync::broadcast::channel(32);
         Arc::new(Self {
             secret,
             timeout,
             next_id: AtomicU64::new(1),
             state: Mutex::new(HubState::default()),
+            game_ended_notify: Arc::new(tokio::sync::Notify::new()),
+            game_ended_tx,
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn game_ended_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.game_ended_notify.clone()
+    }
+
+    pub fn subscribe_game_ended(&self) -> tokio::sync::broadcast::Receiver<Option<i64>> {
+        self.game_ended_tx.subscribe()
+    }
+
+    pub fn notify_game_ended(&self, game_id: Option<i64>) {
+        info!("Relay reported game ended (game_id: {game_id:?})");
+        let _ = self.game_ended_tx.send(game_id);
+        self.game_ended_notify.notify_waiters();
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -248,6 +268,7 @@ async fn handle_socket(hub: Arc<RelayHub>, socket: WebSocket, name: String) {
                     hub.complete(conn_id, id, Reply { status, body, error }).await;
                 }
                 Ok(RelayToPi::Status { lcu, .. }) => hub.set_lcu(conn_id, lcu == LcuState::Up).await,
+                Ok(RelayToPi::GameEnded { game_id }) => hub.notify_game_ended(game_id),
                 Err(e) => warn!("Relay '{name}' sent a malformed message: {e}"),
             },
             Message::Close(_) => break,

@@ -38,6 +38,11 @@ pub enum RelayToPi {
         relay: String,
         version: String,
     },
+    /// Notification that a game ended on this relay host's client.
+    GameEnded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        game_id: Option<i64>,
+    },
 }
 
 /// Path listing a player's recent LoL games (raw, unencrypted PUUID).
@@ -202,5 +207,15 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains(r#""lcu":"up""#));
         assert_eq!(serde_json::from_str::<RelayToPi>(&json).unwrap(), status);
+
+        let ended = RelayToPi::GameEnded { game_id: Some(56789) };
+        let json = serde_json::to_string(&ended).unwrap();
+        assert_eq!(json, r#"{"type":"game_ended","game_id":56789}"#);
+        assert_eq!(serde_json::from_str::<RelayToPi>(&json).unwrap(), ended);
+
+        let ended_none = RelayToPi::GameEnded { game_id: None };
+        let json = serde_json::to_string(&ended_none).unwrap();
+        assert_eq!(json, r#"{"type":"game_ended"}"#);
+        assert_eq!(serde_json::from_str::<RelayToPi>(&json).unwrap(), ended_none);
     }
 }

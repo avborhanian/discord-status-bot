@@ -18,12 +18,12 @@ use crate::relay_hub::MayhemSource;
 
 /// ARAM: Mayhem matchmade queue (`gameMode` `KIWI`).
 pub const MAYHEM_QUEUE: u16 = 2400;
-/// Recent games requested per tracked player on each poll.
-pub const RECENT_GAMES: u32 = 5;
+/// Recent games requested per tracked player on each poll (covers session backfill).
+pub const RECENT_GAMES: u32 = 20;
 /// Games created up to this long before the scan start may still end after it.
 pub const CREATION_LOOKBACK_MS: i64 = 2 * 60 * 60 * 1000;
-/// How often the background loop asks the relays for new Mayhem games.
-pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+/// How often the background loop asks the relays for new Mayhem games when players are active.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Riot ID (`name#tag`) to raw LCU PUUID. Raw PUUIDs never change for an
 /// account, so entries are kept for the life of the process.
@@ -73,7 +73,7 @@ pub async fn resolve_raw_puuids<S: MayhemSource>(
 }
 
 /// Mayhem games (match id -> game id) created at or after `since_ms` that appear
-/// in at least two tracked players' recent histories.
+/// in at least two tracked players' recent histories (or one player if checking a single target).
 pub async fn group_mayhem_games<S: MayhemSource>(
     source: &S,
     raw_puuids: &[String],
@@ -99,9 +99,10 @@ pub async fn group_mayhem_games<S: MayhemSource>(
         }
         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     }
+    let threshold = if raw_puuids.len() == 1 { 1 } else { 2 };
     seen_by
         .into_iter()
-        .filter(|(_, (_, players))| *players >= 2)
+        .filter(|(_, (_, players))| *players >= threshold)
         .map(|(match_id, (game_id, _))| (match_id, game_id))
         .collect()
 }
@@ -114,36 +115,81 @@ pub struct MayhemScan {
     pub new_matches: Vec<Match>,
 }
 
-/// Finds today's group Mayhem games, splitting them into stored and new ones.
-/// Ids in `skip_ids` were already counted elsewhere in this scan.
-pub async fn scan<S: MayhemSource>(
+/// Finds today's group Mayhem games for the given target players (or all tracked players if None),
+/// splitting them into stored and new ones.
+pub async fn scan_targets<S: MayhemSource>(
     source: &S,
     pool: &SqlitePool,
     tracked: &HashMap<String, String>,
+    target_names: Option<&[String]>,
     cache: &mut RawPuuidCache,
     start_ms: i64,
     skip_ids: &HashSet<String>,
 ) -> Result<MayhemScan> {
     let raw_to_encrypted = resolve_raw_puuids(source, tracked, cache).await;
-    let raws: Vec<String> = raw_to_encrypted.keys().cloned().collect();
-    let mut games = group_mayhem_games(source, &raws, start_ms - CREATION_LOOKBACK_MS).await;
-    games.retain(|match_id, _| !skip_ids.contains(match_id));
+    let mut result = MayhemScan::default();
+
+    // Load any Mayhem games already stored in SQLite for today so they are always included.
+    let stored_today = db::fetch_stored_matches_since(pool, start_ms).await?;
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    for info in stored_today {
+        if info.queue_id == MAYHEM_QUEUE.to_string() && !skip_ids.contains(&info.id) {
+            seen_ids.insert(info.id.clone());
+            result.seen.push(info);
+        }
+    }
+
+    let target_raws: Vec<String> = match target_names {
+        Some(targets) => targets
+            .iter()
+            .filter_map(|name| {
+                cache
+                    .get(name)
+                    .or_else(|| {
+                        let (gn, tl) = name.split_once('#').unwrap_or((name.as_str(), "NA1"));
+                        cache.get(&format!("{gn}#{tl}"))
+                    })
+                    .cloned()
+            })
+            .collect(),
+        None => raw_to_encrypted.keys().cloned().collect(),
+    };
+    if target_raws.is_empty() {
+        return Ok(result);
+    }
+    let mut games = group_mayhem_games(source, &target_raws, start_ms - CREATION_LOOKBACK_MS).await;
+    games.retain(|match_id, _| !skip_ids.contains(match_id) && !seen_ids.contains(match_id));
 
     let ids: Vec<String> = games.keys().cloned().collect();
     let mut stored = db::fetch_seen_events(pool, &ids).await?;
-    let mut result = MayhemScan::default();
     for (match_id, game_id) in games {
         if let Some(info) = stored.remove(&match_id) {
-            if info.end_timestamp.timestamp_millis() >= start_ms {
+            if info.end_timestamp.timestamp_millis() >= start_ms && info.queue_id == MAYHEM_QUEUE.to_string() {
+                seen_ids.insert(info.id.clone());
                 result.seen.push(info);
             }
             continue;
         }
         match source.game(game_id).await {
-            Ok(game) => match lcu_convert::to_match(&game, &raw_to_encrypted) {
-                Ok(converted) => result.new_matches.push(converted),
-                Err(e) => warn!("Could not convert Mayhem game {match_id}: {e:#}"),
-            },
+            Ok(game) => {
+                let group_players = game
+                    .participant_identities
+                    .iter()
+                    .filter(|i| raw_to_encrypted.contains_key(&i.player.puuid))
+                    .count();
+                if group_players >= 2 {
+                    match lcu_convert::to_match(&game, &raw_to_encrypted) {
+                        Ok(converted) => result.new_matches.push(converted),
+                        Err(e) => warn!("Could not convert Mayhem game {match_id}: {e:#}"),
+                    }
+                } else {
+                    // Solo game: record with dummy queue so we don't query its details on every poll
+                    let end_ts = (game.game_creation + game.game_duration * 1000) / 1000;
+                    if let Ok(solo_match) = lcu_convert::to_match(&game, &raw_to_encrypted) {
+                        let _ = db::update_match(pool, &match_id, 24000, false, end_ts, &solo_match).await;
+                    }
+                }
+            }
             Err(e) => {
                 warn!("Could not fetch Mayhem game {match_id}: {e:#}");
                 if e.to_string().contains("429") {
@@ -156,7 +202,116 @@ pub async fn scan<S: MayhemSource>(
     Ok(result)
 }
 
+/// Inspects a single game by ID (e.g. reported by a GameEnded push event) and stores it if it's a Mayhem game.
+/// Returns Ok(true) if a new group Mayhem game was stored.
+pub async fn inspect_single_game<S: MayhemSource>(
+    source: &S,
+    pool: &SqlitePool,
+    tracked: &HashMap<String, String>,
+    cache: &mut RawPuuidCache,
+    game_id: i64,
+) -> Result<bool> {
+    let match_id = format!("NA1_{game_id}");
+    let stored = db::fetch_seen_events(pool, std::slice::from_ref(&match_id)).await?;
+    if stored.contains_key(&match_id) {
+        return Ok(false);
+    }
+    let raw_to_encrypted = resolve_raw_puuids(source, tracked, cache).await;
+    match source.game(game_id).await {
+        Ok(game) => {
+            let end_ts = (game.game_creation + game.game_duration * 1000) / 1000;
+            if game.queue_id != MAYHEM_QUEUE {
+                // Not a Mayhem game; record dummy queue so we never query again
+                if let Ok(m) = lcu_convert::to_match(&game, &raw_to_encrypted) {
+                    let _ = db::update_match(pool, &match_id, game.queue_id as i64, false, end_ts, &m).await;
+                }
+                return Ok(false);
+            }
+            let group_players = game
+                .participant_identities
+                .iter()
+                .filter(|i| raw_to_encrypted.contains_key(&i.player.puuid))
+                .count();
+            if group_players >= 2 {
+                match lcu_convert::to_match(&game, &raw_to_encrypted) {
+                    Ok(converted) => {
+                        let win = converted
+                            .info
+                            .participants
+                            .iter()
+                            .any(|p| p.win && raw_to_encrypted.values().any(|enc| enc == &p.puuid));
+                        db::update_match(pool, &match_id, MAYHEM_QUEUE as i64, win, end_ts, &converted).await?;
+                        info!("Event-driven Mayhem match {match_id} stored ({group_players} group players)");
+                        return Ok(true);
+                    }
+                    Err(e) => warn!("Could not convert Mayhem game {match_id}: {e:#}"),
+                }
+            } else {
+                // Solo Mayhem game
+                if let Ok(solo_match) = lcu_convert::to_match(&game, &raw_to_encrypted) {
+                    let _ = db::update_match(pool, &match_id, 24000, false, end_ts, &solo_match).await;
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Could not fetch game details for {game_id}: {e:#}");
+        }
+    }
+    Ok(false)
+}
+
+/// Finds today's group Mayhem games across all tracked players.
+#[allow(dead_code)]
+pub async fn scan<S: MayhemSource>(
+    source: &S,
+    pool: &SqlitePool,
+    tracked: &HashMap<String, String>,
+    cache: &mut RawPuuidCache,
+    start_ms: i64,
+    skip_ids: &HashSet<String>,
+) -> Result<MayhemScan> {
+    scan_targets(source, pool, tracked, None, cache, start_ms, skip_ids).await
+}
+
+/// Checks if there is an unseen Mayhem game for the target players (or all tracked players if None).
+pub async fn has_unseen_targets<S: MayhemSource>(
+    source: &S,
+    pool: &SqlitePool,
+    tracked: &HashMap<String, String>,
+    target_names: Option<&[String]>,
+    cache: &mut RawPuuidCache,
+    since_ms: i64,
+) -> Result<bool> {
+    let raw_to_encrypted = resolve_raw_puuids(source, tracked, cache).await;
+    let target_raws: Vec<String> = match target_names {
+        Some(targets) => targets
+            .iter()
+            .filter_map(|name| {
+                cache
+                    .get(name)
+                    .or_else(|| {
+                        let (gn, tl) = name.split_once('#').unwrap_or((name.as_str(), "NA1"));
+                        cache.get(&format!("{gn}#{tl}"))
+                    })
+                    .cloned()
+            })
+            .collect(),
+        None => raw_to_encrypted.keys().cloned().collect(),
+    };
+    if target_raws.is_empty() {
+        return Ok(false);
+    }
+    let games = group_mayhem_games(source, &target_raws, since_ms).await;
+    if games.is_empty() {
+        return Ok(false);
+    }
+    let ids: Vec<String> = games.keys().cloned().collect();
+    let stored = db::fetch_seen_events(pool, &ids).await?;
+    Ok(ids.iter().any(|id| !stored.contains_key(id)))
+}
+
 /// Cheap trigger check: is there a group Mayhem game since `since_ms` that isn't stored yet?
+#[allow(dead_code)]
 pub async fn has_unseen<S: MayhemSource>(
     source: &S,
     pool: &SqlitePool,
@@ -164,15 +319,7 @@ pub async fn has_unseen<S: MayhemSource>(
     cache: &mut RawPuuidCache,
     since_ms: i64,
 ) -> Result<bool> {
-    let raw_to_encrypted = resolve_raw_puuids(source, tracked, cache).await;
-    let raws: Vec<String> = raw_to_encrypted.keys().cloned().collect();
-    let games = group_mayhem_games(source, &raws, since_ms).await;
-    if games.is_empty() {
-        return Ok(false);
-    }
-    let ids: Vec<String> = games.keys().cloned().collect();
-    let stored = db::fetch_seen_events(pool, &ids).await?;
-    Ok(ids.iter().any(|id| !stored.contains_key(id)))
+    has_unseen_targets(source, pool, tracked, None, cache, since_ms).await
 }
 
 #[cfg(test)]
@@ -393,5 +540,49 @@ mod tests {
             .await
             .unwrap();
         assert!(!has_unseen(&source, &pool, &tracked(), &mut cache, START).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn target_scan_and_has_unseen_targets_single_player() {
+        let source = FakeSource::with_group_game();
+        let pool = pool().await;
+        let mut cache = RawPuuidCache::new();
+
+        // Araam participated: has_unseen_targets returns true
+        let has = has_unseen_targets(&source, &pool, &tracked(), Some(&["Araam#NA1".to_string()]), &mut cache, START)
+            .await
+            .unwrap();
+        assert!(has);
+
+        // Unknown player target returns false
+        let has_other = has_unseen_targets(&source, &pool, &tracked(), Some(&["Unknown#NA1".to_string()]), &mut cache, START)
+            .await
+            .unwrap();
+        assert!(!has_other);
+
+        // scan_targets for Araam converts the game
+        let result = scan_targets(&source, &pool, &tracked(), Some(&["Araam#NA1".to_string()]), &mut cache, START, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(result.new_matches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inspect_single_game_stores_and_prevents_duplicate() {
+        let source = FakeSource::with_group_game();
+        let pool = pool().await;
+        let mut cache = RawPuuidCache::new();
+
+        // First inspect stores it and returns true
+        let stored = inspect_single_game(&source, &pool, &tracked(), &mut cache, FIXTURE_GAME_ID)
+            .await
+            .unwrap();
+        assert!(stored);
+
+        // Second inspect recognizes it's already in the DB and returns false
+        let second = inspect_single_game(&source, &pool, &tracked(), &mut cache, FIXTURE_GAME_ID)
+            .await
+            .unwrap();
+        assert!(!second);
     }
 }

@@ -153,12 +153,37 @@ pub async fn run_connection<L: LcuApi>(config: &RelayConfig, handler: &mut Reque
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.tick().await;
 
+    let mut gameflow_ticker = tokio::time::interval(Duration::from_secs(3));
+    gameflow_ticker.tick().await;
+    let mut last_phase: Option<String> = None;
+
     // Responses are produced sequentially; a channel keeps the sink single-owner.
     let (tx, mut rx) = mpsc::channel::<Message>(16);
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 sink.send(status_message(handler, &config.name).await).await?;
+            }
+            _ = gameflow_ticker.tick() => {
+                if handler.lcu().is_up().await {
+                    if let Ok((200, body)) = handler.lcu().get("/lol-gameflow/v1/gameflow-phase").await {
+                        let current_phase = body.as_str().unwrap_or_default().to_string();
+                        if let Some(prev) = &last_phase {
+                            if (prev == "InProgress" || prev == "PreEndOfGame") && current_phase == "EndOfGame" {
+                                let game_id = match handler.lcu().get("/lol-end-of-game/v1/eog-stats-block").await {
+                                    Ok((200, block)) => block.get("gameId").and_then(|v| v.as_i64()),
+                                    _ => None,
+                                };
+                                info!("Game ended on local client (game_id: {game_id:?}); notifying bot");
+                                let msg = RelayToPi::GameEnded { game_id };
+                                if let Ok(json) = serde_json::to_string(&msg) {
+                                    let _ = tx.send(Message::Text(json)).await;
+                                }
+                            }
+                        }
+                        last_phase = Some(current_phase);
+                    }
+                }
             }
             Some(out) = rx.recv() => {
                 sink.send(out).await?;

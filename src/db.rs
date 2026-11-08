@@ -217,6 +217,52 @@ pub async fn fetch_seen_events(
     Ok(seen_matches)
 }
 
+/// Fetches stored matches whose end timestamp is at or after `since_ms`.
+pub async fn fetch_stored_matches_since(
+    pool: &SqlitePool,
+    since_ms: i64,
+) -> Result<Vec<MatchInfo>> {
+    let rows = sqlx::query(
+        "SELECT Id, QUEUE_ID, Win, IFNULL(END_TIMESTAMP, 0) as end_ts, MatchInfo FROM MATCH WHERE IFNULL(END_TIMESTAMP, 0) >= ?",
+    )
+    .bind(since_ms)
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch stored matches since timestamp")?;
+
+    let mut matches = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get("Id")?;
+        let queue_id_str: String = row.try_get("QUEUE_ID")?;
+        let win: bool = row.try_get("Win")?;
+        let timestamp_ms: i64 = row.try_get("end_ts")?;
+        let match_info_str: Option<String> = row.try_get("MatchInfo")?;
+
+        let end_timestamp = DateTime::from_timestamp_millis(timestamp_ms)
+            .ok_or_else(|| anyhow!("Invalid timestamp millis from DB: {}", timestamp_ms))?;
+
+        let match_info: Option<Match> = match match_info_str {
+            Some(s) if !s.is_empty() => match serde_json::from_str(&s) {
+                std::result::Result::Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::error!("Failed to parse MatchInfo JSON for match {}: {}", id, e);
+                    None
+                }
+            },
+            _ => None,
+        };
+
+        matches.push(MatchInfo {
+            id,
+            queue_id: queue_id_str,
+            win,
+            end_timestamp,
+            match_info,
+        });
+    }
+    Ok(matches)
+}
+
 /// Removes a user and their summoner entry from the database.
 /// Returns true if a user row was deleted, false if no user was found.
 pub async fn unregister_user(pool: &SqlitePool, discord_id: u64) -> Result<bool> {
@@ -1119,6 +1165,34 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(new_user_name, "Araam#NA1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_stored_matches_since() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO MATCH (Id, QUEUE_ID, Win, END_TIMESTAMP, MatchInfo) VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)")
+            .bind("MATCH_OLD")
+            .bind("2400")
+            .bind(true)
+            .bind(100_000_i64)
+            .bind(Option::<String>::None)
+            .bind("MATCH_NEW")
+            .bind("2400")
+            .bind(false)
+            .bind(200_000_i64)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await?;
+
+        let res = fetch_stored_matches_since(&pool, 150_000).await?;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, "MATCH_NEW");
+        assert_eq!(res[0].queue_id, "2400");
+        assert_eq!(res[0].win, false);
+
+        let res_all = fetch_stored_matches_since(&pool, 50_000).await?;
+        assert_eq!(res_all.len(), 2);
         Ok(())
     }
 }
