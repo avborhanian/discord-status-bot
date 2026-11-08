@@ -57,8 +57,14 @@ pub async fn resolve_raw_puuids<S: MayhemSource>(
                 cache.insert(riot_id.clone(), raw.clone());
                 cache.insert(format!("{name}#{tag}"), raw);
             }
-            Err(e) => warn!("Could not resolve raw PUUID for {riot_id}: {e:#}"),
+            Err(e) => {
+                warn!("Could not resolve raw PUUID for {riot_id}: {e:#}");
+                if e.to_string().contains("429") {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     }
     tracked
         .iter()
@@ -84,8 +90,14 @@ pub async fn group_mayhem_games<S: MayhemSource>(
                     seen_by.entry(game.match_id()).or_insert((game.game_id, 0)).1 += 1;
                 }
             }
-            Err(e) => warn!("Could not list recent games for a tracked player: {e:#}"),
+            Err(e) => {
+                warn!("Could not list recent games for a tracked player: {e:#}");
+                if e.to_string().contains("429") {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     }
     seen_by
         .into_iter()
@@ -132,8 +144,14 @@ pub async fn scan<S: MayhemSource>(
                 Ok(converted) => result.new_matches.push(converted),
                 Err(e) => warn!("Could not convert Mayhem game {match_id}: {e:#}"),
             },
-            Err(e) => warn!("Could not fetch Mayhem game {match_id}: {e:#}"),
+            Err(e) => {
+                warn!("Could not fetch Mayhem game {match_id}: {e:#}");
+                if e.to_string().contains("429") {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     }
     Ok(result)
 }

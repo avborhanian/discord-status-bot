@@ -17,8 +17,8 @@ use crate::lcu::{LcuApi, LcuError};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Maximum LCU requests forwarded per minute.
-pub const REQUESTS_PER_MINUTE: u32 = 30;
+/// Maximum LCU requests forwarded per minute by default.
+pub const REQUESTS_PER_MINUTE: u32 = 120;
 
 /// Simple token bucket: `capacity` tokens, refilled continuously over one minute.
 pub struct TokenBucket {
@@ -69,9 +69,13 @@ pub struct RequestHandler<L: LcuApi> {
 
 impl<L: LcuApi> RequestHandler<L> {
     pub fn new(lcu: L) -> Self {
+        Self::with_rate_limit(lcu, REQUESTS_PER_MINUTE)
+    }
+
+    pub fn with_rate_limit(lcu: L, per_minute: u32) -> Self {
         Self {
             lcu,
-            bucket: TokenBucket::new(REQUESTS_PER_MINUTE, Instant::now()),
+            bucket: TokenBucket::new(per_minute, Instant::now()),
         }
     }
 
@@ -257,18 +261,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limit_kicks_in_after_30_per_minute() {
+    async fn rate_limit_kicks_in_after_capacity() {
         let lcu = MockLcu::default();
         let calls = lcu.calls.clone();
-        let mut handler = RequestHandler::new(lcu);
+        let mut handler = RequestHandler::with_rate_limit(lcu, 10);
         let now = Instant::now();
-        for i in 0..REQUESTS_PER_MINUTE {
+        for i in 0..10 {
             assert_eq!(status_of(&handler.handle(i as u64, GAME, now).await), 200);
         }
         assert_eq!(status_of(&handler.handle(99, GAME, now).await), 429);
-        assert_eq!(calls.load(Ordering::SeqCst), REQUESTS_PER_MINUTE as usize);
-        // Two seconds later one token has refilled.
-        assert_eq!(status_of(&handler.handle(100, GAME, now + Duration::from_secs(2)).await), 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 10);
+        // Six seconds later one token has refilled (10 req/min = 1 token per 6s).
+        assert_eq!(status_of(&handler.handle(100, GAME, now + Duration::from_secs(6)).await), 200);
     }
 
     #[tokio::test]

@@ -54,6 +54,7 @@ The relay will automatically connect to the bot whenever your PC starts. When th
 | `--secret` | `RELAY_SECRET` | *(required)* | Shared secret token matching the bot's `RELAY_SECRET` |
 | `--name` | `RELAY_NAME` | `%COMPUTERNAME%` | Friendly name for this relay instance |
 | `--lockfile` | `LCU_LOCKFILE` | `C:\Riot Games\League of Legends\lockfile` | Custom path to the League client `lockfile` if installed in a non-default directory |
+| `--rate-limit` | `RELAY_RATE_LIMIT` | `120` | Maximum requests forwarded per minute to prevent client flooding |
 
 ---
 
