@@ -505,7 +505,7 @@ async fn main() -> Result<()> {
             );
             chrono::Local::now().timestamp()
         });
-        let mut current_date = start_time; // Initialize current_date based on initial start_time logic
+        let mut current_date = 0; // Initialize to 0 so an initial scan runs immediately on boot
         let mut interval = time::interval(Duration::from_secs(5)); // Consider making interval configurable
         let mut last_mayhem_poll: Option<std::time::Instant> = None;
         let mut round_robin_idx: usize = 0;
@@ -523,10 +523,14 @@ async fn main() -> Result<()> {
             let is_new_day = current_date < new_start_time;
 
             if is_new_day {
-                info!(
-                    "It's a new day, time to scan histories at least once. Current day was {}, now it's {}",
-                    current_date, new_start_time
-                );
+                if current_date == 0 {
+                    info!("Startup: scanning histories for today (since timestamp {new_start_time})");
+                } else {
+                    info!(
+                        "It's a new day, time to scan histories at least once. Current day was {}, now it's {}",
+                        current_date, new_start_time
+                    );
+                }
                 match check_match_history(
                     &background_riot_api,
                     &background_discord_client,
@@ -589,14 +593,14 @@ async fn main() -> Result<()> {
                         }
                         Result::Err(e) => error!("Daily Riot ID sync error: {:#}", e),
                     }
-
-                    start_time = chrono::Local::now().timestamp(); // Reset scan window start
-                    info!(
-                        "Daily check done. Setting scan start time to {}",
-                        start_time
-                    );
-                    current_date = new_start_time; // Update the date marker
                 }
+
+                start_time = chrono::Local::now().timestamp(); // Reset scan window start
+                info!(
+                    "Daily/initial check done. Setting scan start time to {}",
+                    start_time
+                );
+                current_date = new_start_time; // Update the date marker
             }
 
             let mut found_new_matches = false;
