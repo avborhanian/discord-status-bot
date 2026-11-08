@@ -12,10 +12,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: Swatinem/rust-cache@v2
-      with:
-        cache-on-failure: "false"
+    - uses: actions/checkout@v4
+
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
 
@@ -29,14 +27,14 @@ jobs:
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     - name: Build
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: .github/workflows/image
         push: true
         tags: avbor/avbor:protoc
         
     - name: Build binary
-      uses: houseabsolute/actions-rust-cross@v0
+      uses: houseabsolute/actions-rust-cross@v1
       with:
         command: build
         target: arm-unknown-linux-gnueabihf
@@ -49,7 +47,7 @@ jobs:
         cp target/arm-unknown-linux-gnueabihf/release/discord_status_bot discord_status_bot
 
     - name: Copy over
-      uses: appleboy/scp-action@v0.1.4
+      uses: appleboy/scp-action@v1
       with:
         host: ${{ secrets.HOST }}
         username: ${{ secrets.USERNAME }}
@@ -59,7 +57,7 @@ jobs:
         target: ${{ secrets.TARGET_DIR }}
 
     - name: Restarting the job
-      uses: appleboy/ssh-action@v1.0.0
+      uses: appleboy/ssh-action@v1
       with:
         host: ${{ secrets.HOST }}
         username: ${{ secrets.USERNAME }}
