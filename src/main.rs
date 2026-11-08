@@ -457,6 +457,23 @@ async fn main() -> Result<()> {
         info!("RELAY_SECRET not set; Mayhem tracking via lcu_relay is disabled");
     }
 
+    // --- Automatic Riot ID sync (updates legacy summoner names to current gameName#tagLine) ---
+    let pool_for_backfill = config.pool.clone();
+    let api_token_for_backfill = config.riot_api_token.clone();
+    tokio::spawn(async move {
+        let api = RiotApi::new(&api_token_for_backfill);
+        match db::backfill_riot_ids(&pool_for_backfill, &api).await {
+            Result::Ok(count) => {
+                if count > 0 {
+                    info!("Riot ID sync complete: updated {count} summoner(s) with their current Riot ID");
+                } else {
+                    info!("Riot ID sync complete: all summoners have up-to-date Riot IDs");
+                }
+            }
+            Result::Err(e) => error!("Failed to sync Riot IDs: {:#}", e),
+        }
+    });
+
     // --- Background Task ---
     // Clone necessary Arcs and config values for the background task
     let background_config = config_arc.clone();
@@ -542,6 +559,16 @@ async fn main() -> Result<()> {
                             }
                         }
                         Result::Err(e) => error!("Failed to fetch summoners missing TFT PUUID: {}", e),
+                    }
+
+                    // Synchronize Riot IDs daily in case any member changed their name or tag
+                    match db::backfill_riot_ids(&background_config.pool, &background_riot_api).await {
+                        Result::Ok(count) => {
+                            if count > 0 {
+                                info!("Daily Riot ID sync updated {count} summoner(s)");
+                            }
+                        }
+                        Result::Err(e) => error!("Daily Riot ID sync error: {:#}", e),
                     }
 
                     start_time = chrono::Local::now().timestamp(); // Reset scan window start

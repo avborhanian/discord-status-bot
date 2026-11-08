@@ -281,6 +281,73 @@ pub async fn update_tft_puuid(pool: &SqlitePool, summoner_name: &str, tft_puuid:
     Ok(())
 }
 
+/// Updates a summoner's stored Riot ID in both Summoner and User tables.
+pub async fn update_summoner_riot_id(
+    pool: &SqlitePool,
+    puuid: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await.context("Failed to begin transaction for Riot ID update")?;
+    sqlx::query("UPDATE Summoner SET Name = ? WHERE Puuid = ?")
+        .bind(new_name)
+        .bind(puuid)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to update Summoner.Name")?;
+    sqlx::query("UPDATE User SET SummonerName = ? WHERE LOWER(SummonerName) = LOWER(?)")
+        .bind(new_name)
+        .bind(old_name)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to update User.SummonerName")?;
+    tx.commit().await.context("Failed to commit Riot ID update transaction")?;
+    Ok(())
+}
+
+/// Queries Riot API for all summoners in the database and updates both Summoner
+/// and User tables if their Riot ID (gameName#tagLine) is missing or has changed.
+pub async fn backfill_riot_ids(
+    pool: &SqlitePool,
+    riot_api: &riven::RiotApi,
+) -> Result<usize> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT Puuid, Name FROM Summoner")
+            .fetch_all(pool)
+            .await
+            .context("Failed to fetch summoners for Riot ID backfill")?;
+
+    let mut updated_count = 0;
+    for (puuid, old_name) in rows {
+        match riot_api
+            .account_v1()
+            .get_by_puuid(riven::consts::RegionalRoute::AMERICAS, &puuid)
+            .await
+        {
+            Ok(account) => {
+                if let (Some(game_name), Some(tag_line)) = (account.game_name, account.tag_line) {
+                    let current_riot_id = format!("{game_name}#{tag_line}");
+                    if current_riot_id != old_name {
+                        tracing::info!(
+                            "Riot ID migration: updating '{}' -> '{}' for PUUID {}",
+                            old_name, current_riot_id, puuid
+                        );
+                        if let Err(e) = update_summoner_riot_id(pool, &puuid, &old_name, &current_riot_id).await {
+                            tracing::error!("Failed to update database for '{}': {:#}", old_name, e);
+                        } else {
+                            updated_count += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Riot ID migration API error for '{}' ({}): {:#}", old_name, puuid, e);
+            }
+        }
+    }
+    Ok(updated_count)
+}
+
 /// Returns the Discord ID of the user already registered with this summoner name, if any.
 pub async fn find_existing_summoner_owner(
     pool: &SqlitePool,
@@ -1022,6 +1089,36 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(tft_puuid.0, Some("tft-puuid-new".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_summoner_riot_id() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        sqlx::query("INSERT INTO Summoner (Puuid, Name) VALUES (?, ?)")
+            .bind("ENC_123")
+            .bind("Araam")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO User (DiscordId, SummonerName) VALUES (?, ?)")
+            .bind("123456")
+            .bind("Araam")
+            .execute(&pool)
+            .await?;
+
+        update_summoner_riot_id(&pool, "ENC_123", "Araam", "Araam#NA1").await?;
+
+        let (new_name,): (String,) =
+            sqlx::query_as("SELECT Name FROM Summoner WHERE Puuid = 'ENC_123'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(new_name, "Araam#NA1");
+
+        let (new_user_name,): (String,) =
+            sqlx::query_as("SELECT SummonerName FROM User WHERE DiscordId = '123456'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(new_user_name, "Araam#NA1");
         Ok(())
     }
 }

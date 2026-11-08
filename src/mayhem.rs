@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use riven::models::match_v5::Match;
 use sqlx::SqlitePool;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::db;
 use crate::lcu_convert;
@@ -45,13 +45,17 @@ pub async fn resolve_raw_puuids<S: MayhemSource>(
         if cache.contains_key(riot_id) {
             continue;
         }
-        let Some((name, tag)) = riot_id.split_once('#') else {
-            warn!("Tracked summoner '{riot_id}' is not a Riot ID; skipping for Mayhem");
-            continue;
+        let (name, tag) = match riot_id.split_once('#') {
+            Some((name, tag)) => (name, tag),
+            None => {
+                info!("Tracked summoner '{riot_id}' has no tag; defaulting tag to 'NA1' for Mayhem");
+                (riot_id.as_str(), "NA1")
+            }
         };
         match source.resolve_raw_puuid(name, tag).await {
             Ok(raw) => {
-                cache.insert(riot_id.clone(), raw);
+                cache.insert(riot_id.clone(), raw.clone());
+                cache.insert(format!("{name}#{tag}"), raw);
             }
             Err(e) => warn!("Could not resolve raw PUUID for {riot_id}: {e:#}"),
         }
@@ -277,6 +281,21 @@ mod tests {
         resolve_raw_puuids(&source, &tracked, &mut cache).await;
         // Only the unresolved player is looked up again.
         assert_eq!(*source.alias_calls.lock().unwrap(), calls_after_first + 1);
+    }
+
+    #[tokio::test]
+    async fn resolves_summoner_without_tag_using_na1_fallback() {
+        let source = FakeSource::with_group_game();
+        let mut cache = RawPuuidCache::new();
+        // Summoner names stored without '#TAG' in legacy registrations
+        let tracked = HashMap::from([
+            ("Araam".to_string(), "ENC_ARAAM".to_string()),
+            ("RamJack".to_string(), "ENC_RAMJACK".to_string()),
+        ]);
+        let map = resolve_raw_puuids(&source, &tracked, &mut cache).await;
+        assert_eq!(map.get(RAW_ARAAM).map(String::as_str), Some("ENC_ARAAM"));
+        assert_eq!(map.get(RAW_RAMJACK).map(String::as_str), Some("ENC_RAMJACK"));
+        assert_eq!(map.len(), 2);
     }
 
     #[tokio::test]
