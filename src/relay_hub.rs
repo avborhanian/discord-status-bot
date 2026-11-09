@@ -182,9 +182,20 @@ impl RelayHub {
         }
     }
 
-    /// Sends `path` to the first live relay, failing over to the next one on
+    /// Sends `path` to the first live relay with GET, failing over to the next one on
     /// timeout, disconnect, or a 503 (client not running).
     pub async fn request(&self, path: &str) -> Result<Value, RelayError> {
+        self.request_with_method("GET", path, None).await
+    }
+
+    /// Sends a request with the given HTTP method and optional JSON body to the first live relay,
+    /// failing over to the next one on timeout, disconnect, or 503.
+    pub async fn request_with_method(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, RelayError> {
         let candidates: Vec<(u64, String, mpsc::UnboundedSender<String>)> = {
             let state = self.state.lock().await;
             state
@@ -202,14 +213,21 @@ impl RelayHub {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (waiter_tx, waiter_rx) = oneshot::channel();
             self.state.lock().await.pending.insert(id, (conn_id, waiter_tx));
-            let message = serde_json::to_string(&PiToRelay::Request { id, path: path.to_string() })
-                .expect("request serializes");
+            let message = serde_json::to_string(&PiToRelay::Request {
+                id,
+                method: method.to_string(),
+                path: path.to_string(),
+                body: body.clone(),
+            })
+            .expect("request serializes");
             if tx.send(message).is_err() {
                 self.state.lock().await.pending.remove(&id);
                 continue;
             }
             match tokio::time::timeout(self.timeout, waiter_rx).await {
-                Ok(Ok(Reply { status: 200, body, .. })) => return Ok(body.unwrap_or(Value::Null)),
+                Ok(Ok(Reply { status, body, .. })) if (200..=299).contains(&status) => {
+                    return Ok(body.unwrap_or(Value::Null));
+                }
                 Ok(Ok(Reply { status: 503, .. })) => {
                     self.set_lcu(conn_id, false).await;
                     continue;
@@ -224,6 +242,65 @@ impl RelayHub {
             }
         }
         Err(RelayError::Unavailable)
+    }
+
+    /// Requests download of a replay file (`.rofl`) for `game_id`.
+    #[allow(dead_code)]
+    pub async fn download_replay(&self, game_id: i64) -> Result<(), RelayError> {
+        let path = relay_protocol::replay_download_path(game_id);
+        self.request_with_method("POST", &path, None).await?;
+        Ok(())
+    }
+
+    /// Fetches replay metadata / download progress for `game_id`.
+    #[allow(dead_code)]
+    pub async fn get_replay_metadata(&self, game_id: i64) -> Result<relay_protocol::ReplayMetadata, RelayError> {
+        let path = relay_protocol::replay_metadata_path(game_id);
+        let val = self.request_with_method("GET", &path, None).await?;
+        serde_json::from_value(val).map_err(|e| RelayError::Status {
+            status: 502,
+            error: Some(format!("invalid replay metadata JSON: {e}")),
+        })
+    }
+
+    /// Launches replay viewer for `game_id` in the local League game client.
+    #[allow(dead_code)]
+    pub async fn watch_replay(&self, game_id: i64) -> Result<(), RelayError> {
+        let path = relay_protocol::replay_watch_path(game_id);
+        self.request_with_method("POST", &path, None).await?;
+        Ok(())
+    }
+
+    /// Returns the current gameflow phase (e.g. "None", "Lobby", "InProgress", etc.).
+    #[allow(dead_code)]
+    pub async fn gameflow_phase(&self) -> Result<String, RelayError> {
+        let path = relay_protocol::gameflow_phase_path();
+        let val = self.request_with_method("GET", path, None).await?;
+        Ok(val.as_str().unwrap_or_default().to_string())
+    }
+
+    /// Triggers download of `game_id` replay and waits until download finishes or fails/times out.
+    #[allow(dead_code)]
+    pub async fn wait_for_replay_download(&self, game_id: i64, timeout: Duration) -> Result<(), RelayError> {
+        self.download_replay(game_id).await?;
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            let meta = self.get_replay_metadata(game_id).await?;
+            if meta.is_watchable() {
+                return Ok(());
+            }
+            if meta.is_failed() {
+                return Err(RelayError::Status {
+                    status: 500,
+                    error: Some(format!("replay download failed with state: {}", meta.state)),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Err(RelayError::Status {
+            status: 408,
+            error: Some(format!("replay download timed out after {:?}", timeout)),
+        })
     }
 }
 
@@ -434,5 +511,61 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[tokio::test]
+    async fn replay_endpoints_and_helpers() {
+        let (hub, url) = start_hub(Duration::from_secs(2)).await;
+        let mut socket = connect(&url, SECRET, "replay-tester").await.unwrap();
+        let hello = RelayToPi::Status {
+            lcu: LcuState::Up,
+            relay: "replay-tester".into(),
+            version: "test".into(),
+        };
+        socket.send(TMessage::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+
+        tokio::spawn(async move {
+            while let Some(Ok(TMessage::Text(text))) = socket.next().await {
+                let PiToRelay::Request { id, method, path, .. } = serde_json::from_str(&text).unwrap();
+                let (status, body) = if method == "POST" && path.ends_with("/download") {
+                    (204, serde_json::Value::Null)
+                } else if method == "GET" && path.contains("/lol-replays/v1/rofls/") {
+                    (200, serde_json::json!({
+                        "gameId": 99999,
+                        "state": "watch",
+                        "downloadProgress": 100.0
+                    }))
+                } else if method == "POST" && path.ends_with("/watch") {
+                    (200, serde_json::json!({}))
+                } else if method == "GET" && path == "/lol-gameflow/v1/gameflow-phase" {
+                    (200, serde_json::json!("None"))
+                } else {
+                    (404, serde_json::Value::Null)
+                };
+                let reply = RelayToPi::Response {
+                    id,
+                    status,
+                    body: Some(body),
+                    error: None,
+                };
+                socket.send(TMessage::Text(serde_json::to_string(&reply).unwrap().into())).await.unwrap();
+            }
+        });
+
+        wait_for_relays(&hub, 1).await;
+        assert!(hub.has_live_relay().await);
+
+        hub.download_replay(99999).await.unwrap();
+
+        let meta = hub.get_replay_metadata(99999).await.unwrap();
+        assert_eq!(meta.game_id, 99999);
+        assert!(meta.is_watchable());
+
+        hub.watch_replay(99999).await.unwrap();
+
+        let phase = hub.gameflow_phase().await.unwrap();
+        assert_eq!(phase, "None");
+
+        hub.wait_for_replay_download(99999, Duration::from_secs(2)).await.unwrap();
     }
 }

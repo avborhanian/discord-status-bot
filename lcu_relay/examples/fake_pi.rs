@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let status = next(ws.next().await);
     println!("status: {status:?}");
 
-    let request = |id: u64, path: String| PiToRelay::Request { id, path };
+    let request = |id: u64, path: String| PiToRelay::get(id, path);
     let send_and_wait = async |ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
                                    msg: PiToRelay|
            -> anyhow::Result<(u16, Option<serde_json::Value>)> {

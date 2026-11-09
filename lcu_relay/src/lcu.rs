@@ -46,8 +46,28 @@ impl std::fmt::Display for LcuError {
 
 /// Minimal LCU surface the relay needs; mocked in tests.
 pub trait LcuApi {
+    /// Performs an HTTP request against the LCU and returns (HTTP status, JSON body).
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> impl std::future::Future<Output = Result<(u16, Value), LcuError>> + Send;
+
     /// Performs a GET against the LCU and returns (HTTP status, JSON body).
-    fn get(&self, path: &str) -> impl std::future::Future<Output = Result<(u16, Value), LcuError>> + Send;
+    fn get(&self, path: &str) -> impl std::future::Future<Output = Result<(u16, Value), LcuError>> + Send {
+        self.request("GET", path, None)
+    }
+
+    /// Performs a POST against the LCU and returns (HTTP status, JSON body).
+    fn post(
+        &self,
+        path: &str,
+        body: Option<&Value>,
+    ) -> impl std::future::Future<Output = Result<(u16, Value), LcuError>> + Send {
+        self.request("POST", path, body)
+    }
+
     /// Cheap check whether a client is currently reachable.
     fn is_up(&self) -> impl std::future::Future<Output = bool> + Send;
 }
@@ -79,15 +99,25 @@ impl LockfileLcu {
 }
 
 impl LcuApi for LockfileLcu {
-    async fn get(&self, path: &str) -> Result<(u16, Value), LcuError> {
+    async fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), LcuError> {
         let creds = self.credentials().await?;
         let auth = base64::engine::general_purpose::STANDARD.encode(format!("riot:{}", creds.password));
         let url = format!("https://127.0.0.1:{}{}", creds.port, path);
-        let response = self
+        let req_method = match method.to_ascii_uppercase().as_str() {
+            "GET" => reqwest::Method::GET,
+            "POST" => reqwest::Method::POST,
+            _ => reqwest::Method::from_bytes(method.as_bytes())
+                .map_err(|e| LcuError::Other(anyhow!("invalid HTTP method: {e}")))?,
+        };
+        let mut req = self
             .http
-            .get(url)
+            .request(req_method, url)
             .header("Authorization", format!("Basic {auth}"))
-            .header("Accept", "application/json")
+            .header("Accept", "application/json");
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let response = req
             .send()
             .await
             .map_err(|e| {

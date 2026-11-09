@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use relay_protocol::{LcuState, PiToRelay, RELAY_NAME_HEADER, RelayToPi, is_allowed_path};
+use relay_protocol::{LcuState, PiToRelay, RELAY_NAME_HEADER, RelayToPi, is_allowed_request};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
 use tracing::{info, warn};
@@ -83,24 +84,31 @@ impl<L: LcuApi> RequestHandler<L> {
         &self.lcu
     }
 
-    pub async fn handle(&mut self, id: u64, path: &str, now: Instant) -> RelayToPi {
+    pub async fn handle(
+        &mut self,
+        id: u64,
+        path: &str,
+        method: &str,
+        body: Option<&Value>,
+        now: Instant,
+    ) -> RelayToPi {
         let error = |status: u16, msg: &str| RelayToPi::Response {
             id,
             status,
             body: None,
             error: Some(msg.to_string()),
         };
-        if !is_allowed_path(path) {
-            warn!("Rejected disallowed path {}", mask_path(path));
-            return error(403, "path not allowed");
+        if !is_allowed_request(method, path) {
+            warn!("Rejected disallowed request {method} {}", mask_path(path));
+            return error(403, "path or method not allowed");
         }
         if !self.bucket.try_take(now) {
-            warn!("Rate limit hit, rejecting {}", mask_path(path));
+            warn!("Rate limit hit, rejecting {method} {}", mask_path(path));
             return error(429, "relay rate limit");
         }
-        match self.lcu.get(path).await {
+        match self.lcu.request(method, path, body).await {
             Ok((status, body)) => {
-                info!("{} -> {}", mask_path(path), status);
+                info!("{method} {} -> {}", mask_path(path), status);
                 RelayToPi::Response {
                     id,
                     status,
@@ -192,8 +200,8 @@ pub async fn run_connection<L: LcuApi>(config: &RelayConfig, handler: &mut Reque
                 let Some(incoming) = incoming else { return Ok(()) };
                 match incoming? {
                     Message::Text(text) => match serde_json::from_str::<PiToRelay>(&text) {
-                        Ok(PiToRelay::Request { id, path }) => {
-                            let reply = handler.handle(id, &path, Instant::now()).await;
+                        Ok(PiToRelay::Request { id, method, path, body }) => {
+                            let reply = handler.handle(id, &path, &method, body.as_ref(), Instant::now()).await;
                             tx.send(Message::Text(serde_json::to_string(&reply)?)).await?;
                         }
                         Err(e) => warn!("Ignoring malformed message from bot: {e}"),
@@ -238,7 +246,12 @@ mod tests {
     }
 
     impl LcuApi for MockLcu {
-        async fn get(&self, _path: &str) -> Result<(u16, serde_json::Value), LcuError> {
+        async fn request(
+            &self,
+            _method: &str,
+            _path: &str,
+            _body: Option<&Value>,
+        ) -> Result<(u16, serde_json::Value), LcuError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.not_running {
                 Err(LcuError::NotRunning("test".into()))
@@ -265,7 +278,7 @@ mod tests {
         let lcu = MockLcu::default();
         let calls = lcu.calls.clone();
         let mut handler = RequestHandler::new(lcu);
-        let reply = handler.handle(1, "/riotclient/region-locale", Instant::now()).await;
+        let reply = handler.handle(1, "/riotclient/region-locale", "GET", None, Instant::now()).await;
         assert_eq!(status_of(&reply), 403);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -273,11 +286,28 @@ mod tests {
     #[tokio::test]
     async fn allowed_path_is_forwarded() {
         let mut handler = RequestHandler::new(MockLcu::default());
-        let reply = handler.handle(9, GAME, Instant::now()).await;
+        let reply = handler.handle(9, GAME, "GET", None, Instant::now()).await;
         assert_eq!(
             reply,
             RelayToPi::Response {
                 id: 9,
+                status: 200,
+                body: Some(serde_json::json!({"ok": true})),
+                error: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_post_replay_is_forwarded() {
+        let mut handler = RequestHandler::new(MockLcu::default());
+        let reply = handler
+            .handle(10, "/lol-replays/v1/rofls/12345/download", "POST", None, Instant::now())
+            .await;
+        assert_eq!(
+            reply,
+            RelayToPi::Response {
+                id: 10,
                 status: 200,
                 body: Some(serde_json::json!({"ok": true})),
                 error: None
@@ -292,12 +322,12 @@ mod tests {
         let mut handler = RequestHandler::with_rate_limit(lcu, 10);
         let now = Instant::now();
         for i in 0..10 {
-            assert_eq!(status_of(&handler.handle(i as u64, GAME, now).await), 200);
+            assert_eq!(status_of(&handler.handle(i as u64, GAME, "GET", None, now).await), 200);
         }
-        assert_eq!(status_of(&handler.handle(99, GAME, now).await), 429);
+        assert_eq!(status_of(&handler.handle(99, GAME, "GET", None, now).await), 429);
         assert_eq!(calls.load(Ordering::SeqCst), 10);
         // Six seconds later one token has refilled (10 req/min = 1 token per 6s).
-        assert_eq!(status_of(&handler.handle(100, GAME, now + Duration::from_secs(6)).await), 200);
+        assert_eq!(status_of(&handler.handle(100, GAME, "GET", None, now + Duration::from_secs(6)).await), 200);
     }
 
     #[tokio::test]
@@ -306,7 +336,7 @@ mod tests {
             not_running: true,
             ..Default::default()
         });
-        assert_eq!(status_of(&handler.handle(1, GAME, Instant::now()).await), 503);
+        assert_eq!(status_of(&handler.handle(1, GAME, "GET", None, Instant::now()).await), 503);
     }
 
     #[test]
