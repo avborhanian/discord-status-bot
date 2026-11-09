@@ -418,6 +418,7 @@ async fn main() -> Result<()> {
 
     let active_users: Arc<RwLock<HashSet<u64>>> = Arc::new(RwLock::new(HashSet::new()));
     let current_status: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let current_tft_status: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
 
     // Use config for Discord bot token
     let intents = GatewayIntents::non_privileged()
@@ -494,6 +495,7 @@ async fn main() -> Result<()> {
     let background_tft_riot_api = Arc::new(tft_riot_api);
     let background_discord_client = discord_client.clone();
     let background_current_status = current_status.clone();
+    let background_current_tft_status = current_tft_status.clone();
     let background_active_users = active_users.clone();
     let mut background_sweep_rx = sweep_rx;
 
@@ -547,9 +549,9 @@ async fn main() -> Result<()> {
 
                 if &config.tft_riot_api_token != "" {
                     match check_tft_match_history(
-                        &background_riot_api,
+                        &background_tft_riot_api,
                         &background_discord_client,
-                        &background_current_status,
+                        &background_current_tft_status,
                         &background_config,
                     )
                     .await
@@ -825,7 +827,7 @@ async fn main() -> Result<()> {
                 match check_tft_match_history(
                     &background_tft_riot_api,
                     &background_discord_client,
-                    &background_current_status,
+                    &background_current_tft_status,
                     &background_config,
                 )
                 .await
@@ -1051,14 +1053,20 @@ async fn check_match_history(
         _ => None,
     };
 
-    if unique_match_ids.is_empty() && relay_hub.is_none() {
+    // Always fetch stored Mayhem matches for today from SQLite so that completed Mayhem
+    // games are preserved even when the relay is disconnected or League is closed!
+    let stored_today = db::fetch_stored_matches_since(pool, start_time_ms).await?;
+    let stored_mayhem: Vec<_> = stored_today
+        .into_iter()
+        .filter(|m| m.queue_id == mayhem::MAYHEM_QUEUE.to_string())
+        .collect();
+    let has_mayhem = !stored_mayhem.is_empty() || !extra_mayhem_matches.is_empty();
+
+    if unique_match_ids.is_empty() && relay_hub.is_none() && !has_mayhem {
         info!(
             "No relevant matches found since start time {}",
             start_time_secs
         );
-        // Update status to "No games" if it wasn't already, maybe?
-        // Or just return early if no matches need processing.
-        // Let's update the status to ensure it reflects reality if empty.
         let results = String::from("No LoL games yet!");
         update_discord_status(
             &results,
@@ -1162,6 +1170,41 @@ async fn check_match_history(
         .await
         {
             error!("Mayhem relay scan failed: {:#}", e);
+        }
+    } else {
+        // Relay is not currently live (League closed, PC asleep, etc.), but we still
+        // score all stored Mayhem games from SQLite (plus any extra_mayhem_matches).
+        info!(
+            "Relay is offline/inactive; scoring {} stored Mayhem match(es) from SQLite",
+            stored_mayhem.len()
+        );
+        for stored in &stored_mayhem {
+            if counted_ids.insert(stored.id.clone()) {
+                if let Err(e) = process_seen_match_score(stored, &mut queue_scores, &puuids) {
+                    warn!("Failed to score stored Mayhem match {}: {e:#}", stored.id);
+                }
+            }
+        }
+        for extra in extra_mayhem_matches {
+            if counted_ids.insert(extra.metadata.match_id.clone()) {
+                if let Err(e) = update_match_info(
+                    pool,
+                    &extra,
+                    &mut queue_scores,
+                    &queue_ids,
+                    &puuids,
+                    &mut pentakillers,
+                    &mut dom_earners,
+                    start_time_ms,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to update extra Mayhem match {}: {e:#}",
+                        extra.metadata.match_id
+                    );
+                }
+            }
         }
     }
 
@@ -3253,6 +3296,52 @@ mod tests {
             .unwrap();
         assert_eq!(score.games, 1);
         assert_eq!(score.wins, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stored_mayhem_scored_even_when_relay_offline() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        let mut queue_scores: HashMap<Queue, Score> = HashMap::new();
+        let queue_ids: HashMap<Queue, &str> = HashMap::from([(Queue(2400), "Mayhem")]);
+        let puuids: HashSet<String> = HashSet::from(["puuid1".to_string(), "puuid2".to_string()]);
+        let start_time_ms = chrono::Local::now().timestamp_millis() - 1000 * 60 * 60;
+        let match_end = start_time_ms + 1000 * 60 * 30;
+
+        let p1 = create_test_participant("puuid1", "Player1#NA1", TeamId::BLUE, true, 5, 2, 8, 0, None, false);
+        let p2 = create_test_participant("puuid2", "Player2#NA1", TeamId::BLUE, true, 8, 1, 5, 0, None, false);
+        let team = create_test_team(TeamId::BLUE, true);
+        let mayhem_match = create_test_match(
+            "NA1_5676147450",
+            Queue(2400),
+            Some(match_end),
+            vec![p1, p2],
+            vec![team],
+        );
+
+        db::update_match(&pool, "NA1_5676147450", 2400, true, match_end, &mayhem_match).await?;
+
+        // Relay is offline (None), but stored Mayhem matches must still be fetched and scored
+        let stored_today = db::fetch_stored_matches_since(&pool, start_time_ms).await?;
+        let stored_mayhem: Vec<_> = stored_today
+            .into_iter()
+            .filter(|m| m.queue_id == "2400")
+            .collect();
+        assert_eq!(stored_mayhem.len(), 1);
+
+        let mut counted_ids = HashSet::new();
+        for stored in &stored_mayhem {
+            if counted_ids.insert(stored.id.clone()) {
+                process_seen_match_score(stored, &mut queue_scores, &puuids)?;
+            }
+        }
+
+        let score = queue_scores.get(&Queue(2400)).expect("Mayhem score exists");
+        assert_eq!(score.wins, 1);
+        assert_eq!(score.games, 1);
+        let msg = generate_status_message(&queue_scores, &queue_ids);
+        assert_eq!(msg, "Mayhem:\u{2006}1\u{2006}-\u{2006}0");
 
         Ok(())
     }
