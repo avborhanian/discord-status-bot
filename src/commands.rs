@@ -937,6 +937,192 @@ pub mod rank {
     }
 }
 
+pub mod highlight {
+    use crate::db;
+    use crate::Config;
+    use anyhow::{anyhow, Context, Result};
+    use riven::consts::RegionalRoute;
+    use riven::RiotApi;
+    use serenity::all::{
+        CommandDataOption, CommandDataOptionValue, CreateCommandOption,
+        CreateInteractionResponseMessage,
+    };
+    use serenity::builder;
+    use serenity::model::application::CommandOptionType;
+    use serenity::model::user::User;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tracing::{error, info};
+
+    pub fn register() -> builder::CreateCommand {
+        builder::CreateCommand::new("highlight")
+            .description("Generates a highlight replay for a match (Admin only)")
+            .default_member_permissions(serenity::model::Permissions::ADMINISTRATOR)
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "game_id",
+                    "The match ID (e.g. 5676140397 or NA1_5676140397)",
+                )
+                .required(true),
+            )
+    }
+
+    pub async fn run(
+        ctx: &serenity::prelude::Context,
+        options: &[CommandDataOption],
+        config: Arc<Config>,
+        user: &User,
+    ) -> Result<CreateInteractionResponseMessage> {
+        let user_id_str = user.id.get().to_string();
+        if !db::is_admin(&config.pool, &user_id_str).await? {
+            return Ok(CreateInteractionResponseMessage::new()
+                .content("⛔ Only administrators can trigger highlight replay generation.")
+                .ephemeral(true));
+        }
+
+        let game_id_str = options
+            .iter()
+            .find(|o| o.name == "game_id")
+            .and_then(|o| match &o.value {
+                CommandDataOptionValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("Missing game_id argument"))?;
+
+        let numeric_str = game_id_str
+            .trim()
+            .strip_prefix("NA1_")
+            .unwrap_or(game_id_str.trim());
+        let game_id: i64 = numeric_str
+            .parse()
+            .context("Invalid game_id: must be a number or NA1_<number>")?;
+
+        let relay_hub = match &config.relay_hub {
+            Some(hub) if hub.has_live_relay().await => hub.clone(),
+            _ => {
+                return Ok(CreateInteractionResponseMessage::new()
+                    .content("❌ No connected computer with a running League client is available right now.")
+                    .ephemeral(true));
+            }
+        };
+
+        let match_id = format!("NA1_{game_id}");
+        let riot_api = RiotApi::new(&config.riot_api_token);
+
+        let match_data = riot_api
+            .match_v5()
+            .get_match(RegionalRoute::AMERICAS, &match_id)
+            .await
+            .context("Failed to fetch match details from Riot API")?
+            .ok_or_else(|| anyhow!("Match {match_id} not found in Riot API"))?;
+
+        let timeline = riot_api
+            .match_v5()
+            .get_timeline(RegionalRoute::AMERICAS, &match_id)
+            .await
+            .context("Failed to fetch match timeline from Riot API")?
+            .ok_or_else(|| anyhow!("Timeline for {match_id} not found"))?;
+
+        // Find pentakill or highest multi-kill
+        let penta_event = timeline
+            .info
+            .frames
+            .iter()
+            .flat_map(|f| f.events.iter())
+            .find(|e| e.multi_kill_length == Some(5));
+
+        let (start_ms, end_ms, player_name) = match penta_event {
+            Some(penta) => {
+                let all_kills: Vec<_> = timeline
+                    .info
+                    .frames
+                    .iter()
+                    .flat_map(|f| f.events.iter())
+                    .filter(|e| {
+                        penta.timestamp >= e.timestamp
+                            && e.killer_id == penta.killer_id
+                            && e.r#type == "CHAMPION_KILL"
+                    })
+                    .collect();
+                let start = if all_kills.len() >= 5 {
+                    (all_kills[all_kills.len() - 5].timestamp - 10_000).max(0)
+                } else {
+                    (penta.timestamp - 15_000).max(0)
+                };
+                let end = penta.timestamp + 5_000;
+
+                let participant = match_data
+                    .info
+                    .participants
+                    .iter()
+                    .find(|p| Some(p.participant_id) == penta.killer_id);
+                let name = participant
+                    .map(|p| {
+                        if !p.riot_id_game_name.as_deref().unwrap_or_default().is_empty() {
+                            p.riot_id_game_name.clone().unwrap()
+                        } else {
+                            p.summoner_name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| "player".to_string());
+                (start, end, name)
+            }
+            None => {
+                return Ok(CreateInteractionResponseMessage::new()
+                    .content(format!("⚠️ No Pentakill event found in match `{match_id}` timeline."))
+                    .ephemeral(true));
+            }
+        };
+
+        // Dispatch in background to a random connected computer
+        let http = ctx.http.clone();
+        let updates_channel = config.updates_channel_id;
+        let match_id_clone = match_id.clone();
+        let player_name_clone = player_name.clone();
+
+        tokio::spawn(async move {
+            info!("Requesting highlight for {match_id_clone} ({player_name_clone}) from random relay...");
+            match relay_hub
+                .request_highlight_from_random_relay(
+                    game_id,
+                    start_ms,
+                    end_ms,
+                    player_name_clone.clone(),
+                    Duration::from_secs(180),
+                )
+                .await
+            {
+                Ok((relay_name, reply)) => {
+                    if reply.success {
+                        let path = reply.file_path.as_deref().unwrap_or("Highlights folder");
+                        let msg = format!(
+                            "🎬 **Highlight Replay Generated!**\nMatch: `{match_id_clone}`\nPlayer: **{player_name_clone}**\nGenerated on client: **{relay_name}**\nSaved to: `{path}`"
+                        );
+                        let _ = crate::update_highlight_reel(&msg, &http, updates_channel).await;
+                    } else {
+                        let err = reply.error.as_deref().unwrap_or("unknown error");
+                        let msg = format!(
+                            "⚠️ Highlight generation failed on **{relay_name}** for `{match_id_clone}`: {err}"
+                        );
+                        let _ = crate::update_highlight_reel(&msg, &http, updates_channel).await;
+                    }
+                }
+                Err(e) => {
+                    error!("Highlight generation failed for {match_id_clone}: {e}");
+                    let msg = format!("❌ Highlight generation failed for `{match_id_clone}`: {e}");
+                    let _ = crate::update_highlight_reel(&msg, &http, updates_channel).await;
+                }
+            }
+        });
+
+        Ok(CreateInteractionResponseMessage::new().content(format!(
+            "🎬 Dispatched Pentakill highlight generation for match `{match_id}` (**{player_name}**) to a random connected computer!\nUpdates will be posted in <#{}> when ready.",
+            config.updates_channel_id
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

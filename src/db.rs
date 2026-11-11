@@ -454,6 +454,64 @@ pub async fn register_user_summoner(
     Ok(())
 }
 
+/// Default admin Discord ID (araam@).
+pub const DEFAULT_ADMIN_DISCORD_ID: &str = "107500291624017920";
+
+/// Initializes the Admin table if it does not exist, and seeds the default admin.
+pub async fn init_admin_table(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS Admin (
+            DiscordId TEXT PRIMARY KEY
+        );",
+    )
+    .execute(pool)
+    .await
+    .context("Failed to create Admin table")?;
+
+    sqlx::query("INSERT OR IGNORE INTO Admin (DiscordId) VALUES (?);")
+        .bind(DEFAULT_ADMIN_DISCORD_ID)
+        .execute(pool)
+        .await
+        .context("Failed to seed default admin")?;
+
+    Ok(())
+}
+
+/// Checks whether a Discord user ID has admin privileges.
+pub async fn is_admin(pool: &SqlitePool, discord_id: &str) -> Result<bool> {
+    if discord_id == DEFAULT_ADMIN_DISCORD_ID {
+        return Ok(true);
+    }
+    let exists: Option<String> = sqlx::query_scalar("SELECT DiscordId FROM Admin WHERE DiscordId = ?")
+        .bind(discord_id)
+        .fetch_optional(pool)
+        .await
+        .context("Failed to check Admin table")?;
+    Ok(exists.is_some())
+}
+
+/// Adds a Discord user ID as an admin.
+#[allow(dead_code)]
+pub async fn add_admin(pool: &SqlitePool, discord_id: &str) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO Admin (DiscordId) VALUES (?);")
+        .bind(discord_id)
+        .execute(pool)
+        .await
+        .context("Failed to add admin")?;
+    Ok(())
+}
+
+/// Removes a Discord user ID from the admin table.
+#[allow(dead_code)]
+pub async fn remove_admin(pool: &SqlitePool, discord_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM Admin WHERE DiscordId = ?;")
+        .bind(discord_id)
+        .execute(pool)
+        .await
+        .context("Failed to remove admin")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*; // Import items from outer scope
@@ -1193,6 +1251,30 @@ mod tests {
 
         let res_all = fetch_stored_matches_since(&pool, 50_000).await?;
         assert_eq!(res_all.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_admin_management() -> Result<()> {
+        let pool = setup_in_memory_db_pool().await?;
+        init_admin_table(&pool).await?;
+
+        // Default admin should be recognized
+        assert!(is_admin(&pool, DEFAULT_ADMIN_DISCORD_ID).await?);
+
+        // Random user should not be admin
+        assert!(!is_admin(&pool, "99999999").await?);
+
+        // Add admin
+        add_admin(&pool, "99999999").await?;
+        assert!(is_admin(&pool, "99999999").await?);
+
+        // Remove admin
+        remove_admin(&pool, "99999999").await?;
+        assert!(!is_admin(&pool, "99999999").await?);
+
+        // Default admin remains admin
+        assert!(is_admin(&pool, DEFAULT_ADMIN_DISCORD_ID).await?);
         Ok(())
     }
 }

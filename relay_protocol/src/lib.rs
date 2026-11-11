@@ -18,6 +18,14 @@ pub enum PiToRelay {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<serde_json::Value>,
     },
+    /// Directs a relay to record a highlight video for a specific match.
+    GenerateHighlight {
+        id: u64,
+        game_id: i64,
+        start_ms: i64,
+        end_ms: i64,
+        player_name: String,
+    },
 }
 
 impl PiToRelay {
@@ -79,6 +87,16 @@ pub enum RelayToPi {
     GameEnded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         game_id: Option<i64>,
+    },
+    /// Result of a highlight recording request on this relay.
+    HighlightResult {
+        id: u64,
+        game_id: i64,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -395,5 +413,27 @@ mod tests {
         let json = serde_json::to_string(&ended_none).unwrap();
         assert_eq!(json, r#"{"type":"game_ended"}"#);
         assert_eq!(serde_json::from_str::<RelayToPi>(&json).unwrap(), ended_none);
+
+        let highlight_req = PiToRelay::GenerateHighlight {
+            id: 100,
+            game_id: 56789,
+            start_ms: 120_500,
+            end_ms: 145_000,
+            player_name: "WarMachineZ".into(),
+        };
+        let json = serde_json::to_string(&highlight_req).unwrap();
+        assert_eq!(json, r#"{"type":"generate_highlight","id":100,"game_id":56789,"start_ms":120500,"end_ms":145000,"player_name":"WarMachineZ"}"#);
+        assert_eq!(serde_json::from_str::<PiToRelay>(&json).unwrap(), highlight_req);
+
+        let res = RelayToPi::HighlightResult {
+            id: 100,
+            game_id: 56789,
+            success: true,
+            file_path: Some("Highlights/clip.webm".into()),
+            error: None,
+        };
+        let json = serde_json::to_string(&res).unwrap();
+        assert_eq!(json, r#"{"type":"highlight_result","id":100,"game_id":56789,"success":true,"file_path":"Highlights/clip.webm"}"#);
+        assert_eq!(serde_json::from_str::<RelayToPi>(&json).unwrap(), res);
     }
 }

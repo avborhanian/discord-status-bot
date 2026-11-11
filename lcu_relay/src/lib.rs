@@ -2,6 +2,7 @@
 //! fixed allowlist of read-only League Client match-history requests.
 
 pub mod lcu;
+pub mod recorder;
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -141,7 +142,10 @@ async fn status_message<L: LcuApi>(handler: &RequestHandler<L>, name: &str) -> M
 }
 
 /// Runs one connection until it closes or errors.
-pub async fn run_connection<L: LcuApi>(config: &RelayConfig, handler: &mut RequestHandler<L>) -> Result<()> {
+pub async fn run_connection<L: LcuApi + Clone + Send + Sync + 'static>(
+    config: &RelayConfig,
+    handler: &mut RequestHandler<L>,
+) -> Result<()> {
     let mut request = config.server.as_str().into_client_request().context("invalid server URL")?;
     request.headers_mut().insert(
         "Authorization",
@@ -204,6 +208,35 @@ pub async fn run_connection<L: LcuApi>(config: &RelayConfig, handler: &mut Reque
                             let reply = handler.handle(id, &path, &method, body.as_ref(), Instant::now()).await;
                             tx.send(Message::Text(serde_json::to_string(&reply)?)).await?;
                         }
+                        Ok(PiToRelay::GenerateHighlight {
+                            id,
+                            game_id,
+                            start_ms,
+                            end_ms,
+                            player_name,
+                        }) => {
+                            let tx = tx.clone();
+                            let lcu = handler.lcu().clone();
+                            tokio::spawn(async move {
+                                let result =
+                                    recorder::record_highlight(&lcu, game_id, start_ms, end_ms, &player_name)
+                                        .await;
+                                let (success, file_path, error) = match result {
+                                    Ok(path) => (true, Some(path), None),
+                                    Err(e) => (false, None, Some(e.to_string())),
+                                };
+                                let reply = RelayToPi::HighlightResult {
+                                    id,
+                                    game_id,
+                                    success,
+                                    file_path,
+                                    error,
+                                };
+                                if let Ok(json) = serde_json::to_string(&reply) {
+                                    let _ = tx.send(Message::Text(json)).await;
+                                }
+                            });
+                        }
                         Err(e) => warn!("Ignoring malformed message from bot: {e}"),
                     },
                     Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
@@ -216,7 +249,7 @@ pub async fn run_connection<L: LcuApi>(config: &RelayConfig, handler: &mut Reque
 }
 
 /// Connects forever, reconnecting with exponential backoff (1 s up to 60 s).
-pub async fn run_forever<L: LcuApi>(config: RelayConfig, mut handler: RequestHandler<L>) {
+pub async fn run_forever<L: LcuApi + Clone + Send + Sync + 'static>(config: RelayConfig, mut handler: RequestHandler<L>) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();

@@ -129,6 +129,9 @@ async fn load_config() -> Result<Config> {
     .execute(&pool)
     .await;
 
+    // Initialize Admin table with default admin (araam@)
+    db::init_admin_table(&pool).await?;
+
     let relay_hub = env::var("RELAY_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -233,6 +236,7 @@ impl EventHandler for Handler {
                 commands::unregister::register(),
                 commands::list_users::register(),
                 commands::rank::register(),
+                commands::highlight::register(),
             ],
         )
         .await
@@ -271,6 +275,15 @@ impl EventHandler for Handler {
                 }
                 "rank" => {
                     commands::rank::run(
+                        &ctx,
+                        &command.data.options,
+                        self.config.clone(),
+                        &command.user,
+                    )
+                    .await
+                }
+                "highlight" => {
+                    commands::highlight::run(
                         &ctx,
                         &command.data.options,
                         self.config.clone(),
@@ -1914,7 +1927,7 @@ async fn check_pentakill_info(
         name: String::from("player"),
         tag: String::from("NA1"),
     };
-    for (game_id, riot_ids) in pentakill_games {
+    for (game_id, riot_ids) in &pentakill_games {
         let game_names_formatted =
             format_names_list(&riot_ids.iter().map(|id| id.name()).collect::<Vec<_>>());
         let riot_id = riot_ids.first().unwrap_or(&unknown_id);
@@ -1941,6 +1954,131 @@ async fn check_pentakill_info(
         config.updates_channel_id,
     )
     .await?;
+
+    // If a live relay is connected, automatically request a random computer to record the pentakill!
+    if let Some(relay_hub) = &config.relay_hub {
+        if relay_hub.has_live_relay().await {
+            for (game_id, riot_ids) in pentakill_games {
+                let hub = relay_hub.clone();
+                let riot_token = config.riot_api_token.clone();
+                let http = discord_auth.clone();
+                let updates_channel = config.updates_channel_id;
+                let primary_player = riot_ids.first().map(|r| r.name()).unwrap_or_else(|| "player".to_string());
+                tokio::spawn(async move {
+                    if let Err(e) = auto_trigger_highlight(game_id, &primary_player, &riot_token, &hub, &http, updates_channel).await {
+                        warn!("Auto-dispatch of highlight for game {game_id} failed: {e:#}");
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn auto_trigger_highlight(
+    game_id: i64,
+    fallback_player_name: &str,
+    riot_api_token: &str,
+    hub: &Arc<relay_hub::RelayHub>,
+    http: &Arc<serenity::http::Http>,
+    updates_channel_id: ChannelId,
+) -> Result<()> {
+    let match_id = format!("NA1_{game_id}");
+    let riot_api = riven::RiotApi::new(riot_api_token);
+
+    let match_data = riot_api
+        .match_v5()
+        .get_match(riven::consts::RegionalRoute::AMERICAS, &match_id)
+        .await
+        .context("Failed to fetch match details for auto highlight")?
+        .ok_or_else(|| anyhow!("Match {match_id} not found"))?;
+
+    let timeline = riot_api
+        .match_v5()
+        .get_timeline(riven::consts::RegionalRoute::AMERICAS, &match_id)
+        .await
+        .context("Failed to fetch timeline for auto highlight")?
+        .ok_or_else(|| anyhow!("Timeline for {match_id} not found"))?;
+
+    let penta_event = timeline
+        .info
+        .frames
+        .iter()
+        .flat_map(|f| f.events.iter())
+        .find(|e| e.multi_kill_length == Some(5));
+
+    let (start_ms, end_ms, player_name) = match penta_event {
+        Some(penta) => {
+            let all_kills: Vec<_> = timeline
+                .info
+                .frames
+                .iter()
+                .flat_map(|f| f.events.iter())
+                .filter(|e| {
+                    penta.timestamp >= e.timestamp
+                        && e.killer_id == penta.killer_id
+                        && e.r#type == "CHAMPION_KILL"
+                })
+                .collect();
+            let start = if all_kills.len() >= 5 {
+                (all_kills[all_kills.len() - 5].timestamp - 10_000).max(0)
+            } else {
+                (penta.timestamp - 15_000).max(0)
+            };
+            let end = penta.timestamp + 5_000;
+
+            let participant = match_data
+                .info
+                .participants
+                .iter()
+                .find(|p| Some(p.participant_id) == penta.killer_id);
+            let name = participant
+                .map(|p| {
+                    if !p.riot_id_game_name.as_deref().unwrap_or_default().is_empty() {
+                        p.riot_id_game_name.clone().unwrap()
+                    } else {
+                        p.summoner_name.clone()
+                    }
+                })
+                .unwrap_or_else(|| fallback_player_name.to_string());
+            (start, end, name)
+        }
+        None => {
+            return Err(anyhow!("No pentakill found in timeline for auto highlight"));
+        }
+    };
+
+    info!("Auto-requesting highlight for {match_id} ({player_name}) from random relay...");
+    match hub
+        .request_highlight_from_random_relay(
+            game_id,
+            start_ms,
+            end_ms,
+            player_name.clone(),
+            Duration::from_secs(180),
+        )
+        .await
+    {
+        Result::Ok((relay_name, reply)) => {
+            if reply.success {
+                let path = reply.file_path.as_deref().unwrap_or("Highlights folder");
+                let msg = format!(
+                    "🎬 **Highlight Replay Generated!**\nMatch: `{match_id}`\nPlayer: **{player_name}**\nGenerated by client: **{relay_name}**\nSaved to: `{path}`"
+                );
+                let _ = update_highlight_reel(&msg, http, updates_channel_id).await;
+            } else {
+                let err = reply.error.as_deref().unwrap_or("unknown error");
+                let msg = format!(
+                    "⚠️ Highlight generation failed on **{relay_name}** for `{match_id}`: {err}"
+                );
+                let _ = update_highlight_reel(&msg, http, updates_channel_id).await;
+            }
+        }
+        Result::Err(e) => {
+            warn!("Highlight generation failed for {match_id}: {e}");
+        }
+    }
 
     Ok(())
 }

@@ -52,6 +52,13 @@ struct Reply {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HighlightReply {
+    pub success: bool,
+    pub file_path: Option<String>,
+    pub error: Option<String>,
+}
+
 struct RelayConn {
     conn_id: u64,
     name: String,
@@ -65,6 +72,8 @@ struct HubState {
     relays: Vec<RelayConn>,
     /// request id -> (connection id, waiter)
     pending: HashMap<u64, (u64, oneshot::Sender<Reply>)>,
+    /// highlight request id -> (connection id, waiter)
+    pending_highlights: HashMap<u64, (u64, oneshot::Sender<HighlightReply>)>,
 }
 
 pub struct RelayHub {
@@ -155,6 +164,7 @@ impl RelayHub {
         state.relays.retain(|r| r.conn_id != conn_id);
         // Dropping the waiters makes in-flight requests fail over immediately.
         state.pending.retain(|_, (c, _)| *c != conn_id);
+        state.pending_highlights.retain(|_, (c, _)| *c != conn_id);
     }
 
     async fn set_lcu(&self, conn_id: u64, up: bool) {
@@ -177,6 +187,20 @@ impl RelayHub {
                 // A relay answered someone else's request id; put it back and ignore.
                 state.pending.insert(id, entry);
                 warn!("Relay connection {conn_id} answered request {id} it does not own");
+            }
+            None => {}
+        }
+    }
+
+    async fn complete_highlight(&self, conn_id: u64, id: u64, reply: HighlightReply) {
+        let mut state = self.state.lock().await;
+        match state.pending_highlights.remove(&id) {
+            Some((owner, waiter)) if owner == conn_id => {
+                let _ = waiter.send(reply);
+            }
+            Some(entry) => {
+                state.pending_highlights.insert(id, entry);
+                warn!("Relay connection {conn_id} answered highlight {id} it does not own");
             }
             None => {}
         }
@@ -302,6 +326,73 @@ impl RelayHub {
             error: Some(format!("replay download timed out after {:?}", timeout)),
         })
     }
+
+    /// Requests a random live connected relay to record a highlight video for `game_id`.
+    #[allow(dead_code)]
+    pub async fn request_highlight_from_random_relay(
+        &self,
+        game_id: i64,
+        start_ms: i64,
+        end_ms: i64,
+        player_name: String,
+        timeout: Duration,
+    ) -> Result<(String, HighlightReply), RelayError> {
+        use rand::seq::SliceRandom;
+        let candidates: Vec<(u64, String, mpsc::UnboundedSender<String>)> = {
+            let state = self.state.lock().await;
+            state
+                .relays
+                .iter()
+                .filter(|r| r.lcu_up)
+                .map(|r| (r.conn_id, r.name.clone(), r.tx.clone()))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Err(RelayError::NoRelay);
+        }
+
+        let (conn_id, name, tx) = {
+            let mut rng = rand::thread_rng();
+            candidates
+                .choose(&mut rng)
+                .cloned()
+                .ok_or(RelayError::NoRelay)?
+        };
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        self.state
+            .lock()
+            .await
+            .pending_highlights
+            .insert(id, (conn_id, waiter_tx));
+
+        let message = serde_json::to_string(&PiToRelay::GenerateHighlight {
+            id,
+            game_id,
+            start_ms,
+            end_ms,
+            player_name,
+        })
+        .expect("generate_highlight serializes");
+
+        if tx.send(message).is_err() {
+            self.state.lock().await.pending_highlights.remove(&id);
+            return Err(RelayError::Unavailable);
+        }
+
+        match tokio::time::timeout(timeout, waiter_rx).await {
+            Ok(Ok(reply)) => Ok((name, reply)),
+            Ok(Err(_)) => Err(RelayError::Unavailable), // disconnected
+            Err(_) => {
+                self.state.lock().await.pending_highlights.remove(&id);
+                Err(RelayError::Status {
+                    status: 408,
+                    error: Some(format!("Highlight generation on relay '{name}' timed out")),
+                })
+            }
+        }
+    }
 }
 
 async fn ws_handler(State(hub): State<Arc<RelayHub>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
@@ -346,6 +437,9 @@ async fn handle_socket(hub: Arc<RelayHub>, socket: WebSocket, name: String) {
                 }
                 Ok(RelayToPi::Status { lcu, .. }) => hub.set_lcu(conn_id, lcu == LcuState::Up).await,
                 Ok(RelayToPi::GameEnded { game_id }) => hub.notify_game_ended(game_id),
+                Ok(RelayToPi::HighlightResult { id, game_id: _, success, file_path, error }) => {
+                    hub.complete_highlight(conn_id, id, HighlightReply { success, file_path, error }).await;
+                }
                 Err(e) => warn!("Relay '{name}' sent a malformed message: {e}"),
             },
             Message::Close(_) => break,
@@ -427,15 +521,16 @@ mod tests {
         let name = name.to_string();
         tokio::spawn(async move {
             while let Some(Ok(TMessage::Text(text))) = socket.next().await {
-                let PiToRelay::Request { id, .. } = serde_json::from_str(&text).unwrap();
-                if let Some(status) = status {
-                    let reply = RelayToPi::Response {
-                        id,
-                        status,
-                        body: Some(serde_json::json!({"answeredBy": name})),
-                        error: None,
-                    };
-                    socket.send(TMessage::Text(serde_json::to_string(&reply).unwrap().into())).await.unwrap();
+                if let Ok(PiToRelay::Request { id, .. }) = serde_json::from_str(&text) {
+                    if let Some(status) = status {
+                        let reply = RelayToPi::Response {
+                            id,
+                            status,
+                            body: Some(serde_json::json!({"answeredBy": name})),
+                            error: None,
+                        };
+                        socket.send(TMessage::Text(serde_json::to_string(&reply).unwrap().into())).await.unwrap();
+                    }
                 }
             }
         });
@@ -526,29 +621,30 @@ mod tests {
 
         tokio::spawn(async move {
             while let Some(Ok(TMessage::Text(text))) = socket.next().await {
-                let PiToRelay::Request { id, method, path, .. } = serde_json::from_str(&text).unwrap();
-                let (status, body) = if method == "POST" && path.ends_with("/download") {
-                    (204, serde_json::Value::Null)
-                } else if method == "GET" && path.contains("/lol-replays/v1/rofls/") {
-                    (200, serde_json::json!({
-                        "gameId": 99999,
-                        "state": "watch",
-                        "downloadProgress": 100.0
-                    }))
-                } else if method == "POST" && path.ends_with("/watch") {
-                    (200, serde_json::json!({}))
-                } else if method == "GET" && path == "/lol-gameflow/v1/gameflow-phase" {
-                    (200, serde_json::json!("None"))
-                } else {
-                    (404, serde_json::Value::Null)
-                };
-                let reply = RelayToPi::Response {
-                    id,
-                    status,
-                    body: Some(body),
-                    error: None,
-                };
-                socket.send(TMessage::Text(serde_json::to_string(&reply).unwrap().into())).await.unwrap();
+                if let Ok(PiToRelay::Request { id, method, path, .. }) = serde_json::from_str(&text) {
+                    let (status, body) = if method == "POST" && path.ends_with("/download") {
+                        (204, serde_json::Value::Null)
+                    } else if method == "GET" && path.contains("/lol-replays/v1/rofls/") {
+                        (200, serde_json::json!({
+                            "gameId": 99999,
+                            "state": "watch",
+                            "downloadProgress": 100.0
+                        }))
+                    } else if method == "POST" && path.ends_with("/watch") {
+                        (200, serde_json::json!({}))
+                    } else if method == "GET" && path == "/lol-gameflow/v1/gameflow-phase" {
+                        (200, serde_json::json!("None"))
+                    } else {
+                        (404, serde_json::Value::Null)
+                    };
+                    let reply = RelayToPi::Response {
+                        id,
+                        status,
+                        body: Some(body),
+                        error: None,
+                    };
+                    socket.send(TMessage::Text(serde_json::to_string(&reply).unwrap().into())).await.unwrap();
+                }
             }
         });
 
@@ -567,5 +663,45 @@ mod tests {
         assert_eq!(phase, "None");
 
         hub.wait_for_replay_download(99999, Duration::from_secs(2)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn random_relay_highlight_dispatch() {
+        let (hub, url) = start_hub(Duration::from_secs(2)).await;
+        let mut socket = connect(&url, SECRET, "pc-random").await.unwrap();
+        let hello = RelayToPi::Status {
+            lcu: LcuState::Up,
+            relay: "pc-random".into(),
+            version: "test".into(),
+        };
+        socket.send(TMessage::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+
+        tokio::spawn(async move {
+            while let Some(Ok(TMessage::Text(text))) = socket.next().await {
+                if let Ok(PiToRelay::GenerateHighlight { id, game_id, .. }) = serde_json::from_str(&text) {
+                    let reply = RelayToPi::HighlightResult {
+                        id,
+                        game_id,
+                        success: true,
+                        file_path: Some("Highlights/sample.webm".into()),
+                        error: None,
+                    };
+                    let resp_text = serde_json::to_string(&reply).unwrap();
+                    socket.send(TMessage::Text(resp_text.into())).await.unwrap();
+                }
+            }
+        });
+
+        wait_for_relays(&hub, 1).await;
+        assert!(hub.has_live_relay().await);
+
+        let (relay_name, reply) = hub
+            .request_highlight_from_random_relay(55555, 10_000, 25_000, "WarMachineZ".into(), Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(relay_name, "pc-random");
+        assert!(reply.success);
+        assert_eq!(reply.file_path, Some("Highlights/sample.webm".into()));
     }
 }

@@ -45,7 +45,7 @@ impl std::fmt::Display for LcuError {
 }
 
 /// Minimal LCU surface the relay needs; mocked in tests.
-pub trait LcuApi {
+pub trait LcuApi: Send + Sync {
     /// Performs an HTTP request against the LCU and returns (HTTP status, JSON body).
     fn request(
         &self,
@@ -74,6 +74,7 @@ pub trait LcuApi {
 
 /// Real LCU client. Re-reads the lockfile on every call because the port and
 /// password change whenever the League client restarts.
+#[derive(Clone)]
 pub struct LockfileLcu {
     lockfile: PathBuf,
     http: reqwest::Client,
