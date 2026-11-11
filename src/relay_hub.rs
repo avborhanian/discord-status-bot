@@ -56,6 +56,7 @@ struct Reply {
 pub struct HighlightReply {
     pub success: bool,
     pub file_path: Option<String>,
+    pub video_bytes: Option<Vec<u8>>,
     pub error: Option<String>,
 }
 
@@ -428,7 +429,8 @@ async fn ws_handler(State(hub): State<Arc<RelayHub>>, headers: HeaderMap, ws: We
         .chars()
         .take(64)
         .collect::<String>();
-    ws.on_upgrade(move |socket| handle_socket(hub, socket, name))
+    ws.max_message_size(64 * 1024 * 1024)
+        .on_upgrade(move |socket| handle_socket(hub, socket, name))
 }
 
 async fn handle_socket(hub: Arc<RelayHub>, socket: WebSocket, name: String) {
@@ -453,8 +455,12 @@ async fn handle_socket(hub: Arc<RelayHub>, socket: WebSocket, name: String) {
                 }
                 Ok(RelayToPi::Status { lcu, .. }) => hub.set_lcu(conn_id, lcu == LcuState::Up).await,
                 Ok(RelayToPi::GameEnded { game_id }) => hub.notify_game_ended(game_id),
-                Ok(RelayToPi::HighlightResult { id, game_id: _, success, file_path, error }) => {
-                    hub.complete_highlight(conn_id, id, HighlightReply { success, file_path, error }).await;
+                Ok(RelayToPi::HighlightResult { id, game_id: _, success, file_path, video_base64, error }) => {
+                    let video_bytes = video_base64.and_then(|b64| {
+                        use base64::prelude::*;
+                        BASE64_STANDARD.decode(b64.as_bytes()).ok()
+                    });
+                    hub.complete_highlight(conn_id, id, HighlightReply { success, file_path, video_bytes, error }).await;
                 }
                 Err(e) => warn!("Relay '{name}' sent a malformed message: {e}"),
             },
@@ -699,6 +705,7 @@ mod tests {
                         game_id,
                         success: true,
                         file_path: Some("Highlights/sample.webm".into()),
+                        video_base64: None,
                         error: None,
                     };
                     let resp_text = serde_json::to_string(&reply).unwrap();

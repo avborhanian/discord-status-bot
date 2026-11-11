@@ -16,11 +16,10 @@ axum = { version = "0.8", features = ["ws"] }
 chrono = "0.4.30"
 console-subscriber = "0.1.10"
 dotenvy = "0.15.7"
+base64 = "0.22"
 futures = "0.3.28"
 futures-util = "0.3.28"
 http = "0.2.9"
-pbjson = "0.6.0"
-prost = "0.12.1"
 rand = "0.8.5"
 regex = "1.10.0"
 relay_protocol = { path = "relay_protocol" }

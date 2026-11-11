@@ -1420,6 +1420,7 @@ pub mod highlight {
         let player_name_clone = player_name.clone();
         let mode_desc_clone = mode_desc.clone();
         let command_clone = command.clone();
+        let updates_channel = config.updates_channel_id;
 
         tokio::spawn(async move {
             info!("Requesting highlight for {match_id_clone} ({player_name_clone}, {start_ms}ms-{end_ms}ms) from random relay...");
@@ -1462,6 +1463,31 @@ pub mod highlight {
                         .content(&followup_msg)
                         .ephemeral(true);
                     let _ = command_clone.create_followup(&http, followup).await;
+
+                    // If replay was recorded successfully, upload the video clip to the highlight reel!
+                    if reply.success {
+                        let attachment = reply.video_bytes.map(|b| {
+                            let filename = format!("{match_id_clone}_{player_name_clone}.webm");
+                            (b, filename)
+                        });
+                        let reel_msg = if attachment.is_some() {
+                            format!(
+                                "🎬 **Highlight Replay Generated!**\nMatch: `{match_id_clone}`\nPlayer: **{player_name_clone}**"
+                            )
+                        } else {
+                            let path = reply.file_path.as_deref().unwrap_or("Highlights folder");
+                            format!(
+                                "🎬 **Highlight Replay Generated!**\nMatch: `{match_id_clone}`\nPlayer: **{player_name_clone}**\nSaved on client: `{path}`"
+                            )
+                        };
+                        let _ = crate::upload_to_highlight_reel(
+                            &reel_msg,
+                            attachment,
+                            &http,
+                            updates_channel,
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     error!("Highlight generation failed for {match_id_clone}: {e}");

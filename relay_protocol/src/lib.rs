@@ -96,6 +96,8 @@ pub enum RelayToPi {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_base64: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
 }
@@ -454,6 +456,7 @@ mod tests {
             game_id: 56789,
             success: true,
             file_path: Some("Highlights/clip.webm".into()),
+            video_base64: None,
             error: None,
         };
         let json = serde_json::to_string(&res).unwrap();

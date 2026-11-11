@@ -221,15 +221,38 @@ pub async fn run_connection<L: LcuApi + Clone + Send + Sync + 'static>(
                                 let result =
                                     recorder::record_highlight(&lcu, game_id, start_ms, end_ms, &player_name)
                                         .await;
-                                let (success, file_path, error) = match result {
-                                    Ok(path) => (true, Some(path), None),
-                                    Err(e) => (false, None, Some(e.to_string())),
+                                let (success, file_path, video_base64, error) = match result {
+                                    Ok(path) => {
+                                        // Give filesystem a moment to flush the recorded file
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        let mut video_b64 = None;
+                                        match tokio::fs::read(&path).await {
+                                            Ok(bytes) => {
+                                                if bytes.len() <= 25 * 1024 * 1024 {
+                                                    use base64::prelude::*;
+                                                    info!("Highlight video loaded ({} bytes), encoding for upload...", bytes.len());
+                                                    video_b64 = Some(BASE64_STANDARD.encode(&bytes));
+                                                } else {
+                                                    warn!(
+                                                        "Highlight video at {path} is {} MB, exceeding Discord's 25 MB upload limit",
+                                                        bytes.len() / (1024 * 1024)
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to read highlight video file at {path}: {e}");
+                                            }
+                                        }
+                                        (true, Some(path), video_b64, None)
+                                    }
+                                    Err(e) => (false, None, None, Some(e.to_string())),
                                 };
                                 let reply = RelayToPi::HighlightResult {
                                     id,
                                     game_id,
                                     success,
                                     file_path,
+                                    video_base64,
                                     error,
                                 };
                                 if let Ok(json) = serde_json::to_string(&reply) {
