@@ -124,6 +124,11 @@ pub fn alias_lookup_path(game_name: &str, tag_line: &str) -> String {
     )
 }
 
+/// Path creating replay metadata on LCU before downloading (POST).
+pub fn replay_create_metadata_path(game_id: i64) -> String {
+    format!("/lol-replays/v2/metadata/{game_id}/create")
+}
+
 /// Path triggering download of a replay (.rofl) file (POST).
 pub fn replay_download_path(game_id: i64) -> String {
     format!("/lol-replays/v1/rofls/{game_id}/download")
@@ -131,7 +136,7 @@ pub fn replay_download_path(game_id: i64) -> String {
 
 /// Path querying metadata / download status of a replay file (GET).
 pub fn replay_metadata_path(game_id: i64) -> String {
-    format!("/lol-replays/v1/rofls/{game_id}")
+    format!("/lol-replays/v1/metadata/{game_id}")
 }
 
 /// Path launching replay playback in the League game client (POST).
@@ -187,6 +192,12 @@ pub fn is_allowed_request(method: &str, path: &str) -> bool {
     static GAME_TIMELINE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"^/lol-match-history/v1/game-timelines/[0-9]{1,20}$").expect("valid regex")
     });
+    static REPLAY_META: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^/lol-replays/v1/metadata/[0-9]{1,20}$").expect("valid regex")
+    });
+    static REPLAY_META_CREATE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^/lol-replays/v2/metadata/[0-9]{1,20}/create$").expect("valid regex")
+    });
     static REPLAY_ROFL: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"^/lol-replays/v1/rofls/[0-9]{1,20}$").expect("valid regex")
     });
@@ -237,7 +248,7 @@ pub fn is_allowed_request(method: &str, path: &str) -> bool {
                 query.is_none()
             } else if route == "/lol-summoner/v1/alias/lookup" {
                 keys_are(&["gameName", "tagLine"]) && pairs.iter().all(|(_, v)| ALIAS_VALUE.is_match(v))
-            } else if REPLAY_ROFL.is_match(route) {
+            } else if REPLAY_META.is_match(route) || REPLAY_ROFL.is_match(route) {
                 query.is_none()
             } else if route == "/lol-gameflow/v1/gameflow-phase" {
                 query.is_none()
@@ -249,7 +260,9 @@ pub fn is_allowed_request(method: &str, path: &str) -> bool {
             if query.is_some() {
                 return false;
             }
-            REPLAY_DOWNLOAD.is_match(route) || REPLAY_WATCH.is_match(route)
+            REPLAY_DOWNLOAD.is_match(route)
+                || REPLAY_WATCH.is_match(route)
+                || REPLAY_META_CREATE.is_match(route)
         }
         _ => false,
     }
@@ -285,6 +298,9 @@ mod tests {
         assert!(is_allowed_request("POST", &replay_download_path(game_id)));
         assert!(!is_allowed_request("GET", &replay_download_path(game_id)));
         assert!(!is_allowed_request("POST", &format!("{}?x=1", replay_download_path(game_id))));
+
+        assert!(is_allowed_request("POST", &replay_create_metadata_path(game_id)));
+        assert!(!is_allowed_request("GET", &replay_create_metadata_path(game_id)));
 
         assert!(is_allowed_request("GET", &replay_metadata_path(game_id)));
         assert!(!is_allowed_request("POST", &replay_metadata_path(game_id)));

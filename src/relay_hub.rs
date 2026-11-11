@@ -639,7 +639,7 @@ mod tests {
                 if let Ok(PiToRelay::Request { id, method, path, .. }) = serde_json::from_str(&text) {
                     let (status, body) = if method == "POST" && path.ends_with("/download") {
                         (204, serde_json::Value::Null)
-                    } else if method == "GET" && path.contains("/lol-replays/v1/rofls/") {
+                    } else if method == "GET" && (path.contains("/lol-replays/v1/metadata/") || path.contains("/lol-replays/v1/rofls/")) {
                         (200, serde_json::json!({
                             "gameId": 99999,
                             "state": "watch",

@@ -9,6 +9,24 @@ use tracing::{info, warn};
 
 use crate::lcu::LcuApi;
 
+/// Checks that `EnableReplayApi=1` is set in League's `game.cfg` so port 2999 is accessible during replays.
+fn ensure_replay_api_enabled() {
+    let cfg_path = std::path::Path::new(r"C:\Riot Games\League of Legends\Config\game.cfg");
+    if cfg_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(cfg_path) {
+            if content.contains("EnableReplayApi=0") {
+                let updated = content.replace("EnableReplayApi=0", "EnableReplayApi=1");
+                let _ = std::fs::write(cfg_path, updated);
+                info!("Automatically enabled Replay API in game.cfg (EnableReplayApi=1)");
+            } else if !content.contains("EnableReplayApi") {
+                let updated = format!("{content}\n[General]\nEnableReplayApi=1\n");
+                let _ = std::fs::write(cfg_path, updated);
+                info!("Added EnableReplayApi=1 to game.cfg");
+            }
+        }
+    }
+}
+
 /// Downloads a replay via LCU, launches it into the game client, and records the
 /// requested time window using the Game Client Replay API on port 2999.
 pub async fn record_highlight<L: LcuApi>(
@@ -18,6 +36,7 @@ pub async fn record_highlight<L: LcuApi>(
     end_ms: i64,
     player_name: &str,
 ) -> Result<String> {
+    ensure_replay_api_enabled();
     let start_time = (start_ms as f64 / 1000.0).max(0.0);
     let end_time = (end_ms as f64 / 1000.0).max(start_time + 1.0);
     info!(
@@ -34,15 +53,22 @@ pub async fn record_highlight<L: LcuApi>(
         }
     }
 
-    // 2. Trigger replay download on LCU
+    // 2. Initialize replay metadata on LCU (required if replay hasn't been viewed in client yet)
+    let create_path = relay_protocol::replay_create_metadata_path(game_id);
+    let empty_body = json!({});
+    if let Err(e) = lcu.post(&create_path, Some(&empty_body)).await {
+        warn!("Replay metadata create attempt returned error: {e}");
+    }
+
+    // 3. Trigger replay download on LCU
     let dl_path = relay_protocol::replay_download_path(game_id);
     let (dl_status, _) = lcu
-        .post(&dl_path, None)
+        .post(&dl_path, Some(&empty_body))
         .await
         .map_err(|e| anyhow!("Failed to trigger replay download: {e}"))?;
     info!("Replay download requested (status {dl_status})");
 
-    // 3. Wait for replay to be downloaded (state == "watch")
+    // 4. Wait for replay to be downloaded (state == "watch")
     let meta_path = relay_protocol::replay_metadata_path(game_id);
     let mut downloaded = false;
     let poll_start = std::time::Instant::now();
@@ -65,10 +91,10 @@ pub async fn record_highlight<L: LcuApi>(
     }
     info!("Replay is watchable. Launching replay viewer...");
 
-    // 4. Launch replay
+    // 5. Launch replay
     let watch_path = relay_protocol::replay_watch_path(game_id);
     let (watch_status, _) = lcu
-        .post(&watch_path, None)
+        .post(&watch_path, Some(&empty_body))
         .await
         .map_err(|e| anyhow!("Failed to launch replay: {e}"))?;
     info!("Replay launch sent (status {watch_status})");
