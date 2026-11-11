@@ -1407,10 +1407,12 @@ pub mod highlight {
             "Pentakill highlight".to_string()
         };
 
-        Ok(CreateInteractionResponseMessage::new().content(format!(
-            "🎬 Dispatched {mode_desc} for match `{match_id}` (**{player_name}**) to a random connected computer!\nUpdates will be posted in <#{}> when ready.",
-            config.updates_channel_id
-        )))
+        Ok(CreateInteractionResponseMessage::new()
+            .content(format!(
+                "🎬 Dispatched {mode_desc} for match `{match_id}` (**{player_name}**) to a random connected computer!\nUpdates will be posted in <#{}> when ready.",
+                config.updates_channel_id
+            ))
+            .ephemeral(true))
     }
 }
 
