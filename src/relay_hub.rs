@@ -327,6 +327,22 @@ impl RelayHub {
         })
     }
 
+    /// Fetches the details of a single game from LCU via a live relay.
+    pub async fn get_game(&self, game_id: i64) -> Result<crate::lcu_convert::LcuGame, RelayError> {
+        let path = relay_protocol::game_path(game_id);
+        let body = self.request(&path).await?;
+        serde_json::from_value(body).map_err(|e| RelayError::Status {
+            status: 500,
+            error: Some(format!("failed to parse game details: {e}")),
+        })
+    }
+
+    /// Fetches the event timeline of a single game from LCU via a live relay.
+    pub async fn game_timeline(&self, game_id: i64) -> Result<serde_json::Value, RelayError> {
+        let path = relay_protocol::game_timeline_path(game_id);
+        self.request(&path).await
+    }
+
     /// Requests a random live connected relay to record a highlight video for `game_id`.
     #[allow(dead_code)]
     pub async fn request_highlight_from_random_relay(
@@ -478,8 +494,7 @@ impl MayhemSource for RelayHub {
     }
 
     async fn game(&self, game_id: i64) -> Result<LcuGame> {
-        let body = self.request(&relay_protocol::game_path(game_id)).await?;
-        serde_json::from_value(body).with_context(|| format!("unexpected LCU game shape for {game_id}"))
+        self.get_game(game_id).await.map_err(Into::into)
     }
 }
 

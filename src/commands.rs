@@ -966,6 +966,293 @@ pub mod highlight {
                 )
                 .required(true),
             )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "start",
+                    "Start timestamp (e.g. '12:30' or '750's). Auto-detected if omitted.",
+                )
+                .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "duration",
+                    "Clip duration in seconds (default: 25s, max: 60s)",
+                )
+                .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "player",
+                    "Player name to focus camera on (auto-detected if omitted)",
+                )
+                .required(false),
+            )
+    }
+
+    /// Parses a user-supplied timestamp string into milliseconds.
+    /// Supports "MM:SS" (e.g. "12:30"), "SS" (e.g. "750"), "750s", or float seconds.
+    pub fn parse_timestamp_ms(input: &str) -> Option<i64> {
+        let s = input.trim();
+        if let Some((m, sec)) = s.split_once(':') {
+            let mins: f64 = m.trim().parse().ok()?;
+            let secs: f64 = sec.trim().parse().ok()?;
+            return Some(((mins * 60.0 + secs) * 1000.0) as i64);
+        }
+        let cleaned = s.trim_end_matches(|c: char| c == 's' || c == 'S');
+        if let Ok(secs) = cleaned.parse::<f64>() {
+            return Some((secs * 1000.0) as i64);
+        }
+        None
+    }
+
+    /// Searches an LCU timeline JSON structure for a pentakill event streak.
+    /// Returns `Some((start_ms, end_ms, killer_id))`.
+    pub fn find_penta_in_lcu_timeline(timeline: &serde_json::Value) -> Option<(i64, i64, i64)> {
+        let frames = timeline.get("frames").and_then(serde_json::Value::as_array)?;
+        let mut kills: Vec<(i64, i64)> = Vec::new(); // (timestamp, killer_id)
+
+        for frame in frames {
+            if let Some(events) = frame.get("events").and_then(serde_json::Value::as_array) {
+                for event in events {
+                    let ev_type = event
+                        .get("type")
+                        .or_else(|| event.get("eventType"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if ev_type == "CHAMPION_KILL" {
+                        let ts = event.get("timestamp").and_then(serde_json::Value::as_i64);
+                        let killer = event
+                            .get("killerId")
+                            .or_else(|| event.get("killer_id"))
+                            .and_then(serde_json::Value::as_i64);
+                        if let (Some(ts), Some(killer)) = (ts, killer) {
+                            if killer > 0 {
+                                kills.push((ts, killer));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        kills.sort_by_key(|(ts, _)| *ts);
+
+        // Group kills by killer_id
+        let mut by_killer: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+        for (ts, killer) in kills {
+            by_killer.entry(killer).or_default().push(ts);
+        }
+
+        // Check each killer for a 5-kill streak within 35s between consecutive kills
+        for (killer, mut killer_kills) in by_killer {
+            killer_kills.sort();
+            if killer_kills.len() >= 5 {
+                for window in killer_kills.windows(5) {
+                    let is_streak = window
+                        .windows(2)
+                        .all(|pair| (pair[1] - pair[0]) <= 35_000 && pair[1] >= pair[0]);
+                    if is_streak {
+                        let start = (window[0] - 10_000).max(0);
+                        let end = window[4] + 5_000;
+                        return Some((start, end, killer));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolves the primary player or pentakiller from Riot API, DB, or LCU Relay.
+    pub async fn resolve_game_player(
+        game_id: i64,
+        match_id: &str,
+        riot_api: &RiotApi,
+        pool: &sqlx::SqlitePool,
+        hub: &crate::relay_hub::RelayHub,
+    ) -> Option<String> {
+        // 1. Try Riot API
+        if let Ok(Some(match_data)) = riot_api
+            .match_v5()
+            .get_match(RegionalRoute::AMERICAS, match_id)
+            .await
+        {
+            if let Some(p) = match_data
+                .info
+                .participants
+                .iter()
+                .find(|p| p.penta_kills > 0)
+                .or_else(|| match_data.info.participants.iter().max_by_key(|p| p.kills))
+            {
+                let name = if !p.riot_id_game_name.as_deref().unwrap_or_default().is_empty() {
+                    p.riot_id_game_name.clone().unwrap()
+                } else {
+                    p.summoner_name.clone()
+                };
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+
+        // 2. Try DB
+        if let Ok(stored) = db::fetch_seen_events(pool, &[match_id.to_string()]).await {
+            if let Some(info) = stored.get(match_id) {
+                if let Some(m) = &info.match_info {
+                    if let Some(p) = m
+                        .info
+                        .participants
+                        .iter()
+                        .find(|p| p.penta_kills > 0)
+                        .or_else(|| m.info.participants.iter().max_by_key(|p| p.kills))
+                    {
+                        let name = if !p.riot_id_game_name.as_deref().unwrap_or_default().is_empty() {
+                            p.riot_id_game_name.clone().unwrap()
+                        } else {
+                            p.summoner_name.clone()
+                        };
+                        if !name.is_empty() {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Try LCU Relay
+        if let Ok(lcu_game) = hub.get_game(game_id).await {
+            let top_p = lcu_game
+                .participants
+                .iter()
+                .find(|p| p.stats.penta_kills > 0)
+                .or_else(|| lcu_game.participants.iter().max_by_key(|p| p.stats.kills));
+            if let Some(p) = top_p {
+                if let Some(ident) = lcu_game
+                    .participant_identities
+                    .iter()
+                    .find(|i| i.participant_id == p.participant_id)
+                {
+                    let name = if !ident.player.game_name.is_empty() {
+                        ident.player.game_name.clone()
+                    } else {
+                        ident.player.summoner_name.clone()
+                    };
+                    if !name.is_empty() {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Automatically discovers the pentakill window `(start_ms, end_ms, player_name)`
+    /// using Riot API timeline or the connected LCU relay's timeline.
+    pub async fn resolve_pentakill_highlight(
+        game_id: i64,
+        match_id: &str,
+        manual_player: Option<&str>,
+        riot_api: &RiotApi,
+        pool: &sqlx::SqlitePool,
+        hub: &crate::relay_hub::RelayHub,
+    ) -> Result<(i64, i64, String)> {
+        // 1. Try Riot API timeline (standard queues)
+        if let Ok(Some(timeline)) = riot_api
+            .match_v5()
+            .get_timeline(RegionalRoute::AMERICAS, match_id)
+            .await
+        {
+            let penta_event = timeline
+                .info
+                .frames
+                .iter()
+                .flat_map(|f| f.events.iter())
+                .find(|e| e.multi_kill_length == Some(5));
+
+            if let Some(penta) = penta_event {
+                let all_kills: Vec<_> = timeline
+                    .info
+                    .frames
+                    .iter()
+                    .flat_map(|f| f.events.iter())
+                    .filter(|e| {
+                        penta.timestamp >= e.timestamp
+                            && e.killer_id == penta.killer_id
+                            && e.r#type == "CHAMPION_KILL"
+                    })
+                    .collect();
+                let start = if all_kills.len() >= 5 {
+                    (all_kills[all_kills.len() - 5].timestamp - 10_000).max(0)
+                } else {
+                    (penta.timestamp - 15_000).max(0)
+                };
+                let end = penta.timestamp + 5_000;
+
+                let player_name = if let Some(p) = manual_player {
+                    p.to_string()
+                } else {
+                    let mut name = None;
+                    if let Ok(Some(match_data)) = riot_api
+                        .match_v5()
+                        .get_match(RegionalRoute::AMERICAS, match_id)
+                        .await
+                    {
+                        if let Some(p) = match_data
+                            .info
+                            .participants
+                            .iter()
+                            .find(|p| Some(p.participant_id) == penta.killer_id)
+                        {
+                            name = Some(if !p.riot_id_game_name.as_deref().unwrap_or_default().is_empty() {
+                                p.riot_id_game_name.clone().unwrap()
+                            } else {
+                                p.summoner_name.clone()
+                            });
+                        }
+                    }
+                    name.unwrap_or_else(|| "player".to_string())
+                };
+
+                return Ok((start, end, player_name));
+            }
+        }
+
+        // 2. Try LCU game timeline via relay (supports Mayhem & custom games)
+        if let Ok(timeline_val) = hub.game_timeline(game_id).await {
+            if let Some((start, end, killer_id)) = find_penta_in_lcu_timeline(&timeline_val) {
+                let player_name = if let Some(p) = manual_player {
+                    p.to_string()
+                } else {
+                    let mut name = None;
+                    if let Ok(lcu_game) = hub.get_game(game_id).await {
+                        if let Some(ident) = lcu_game
+                            .participant_identities
+                            .iter()
+                            .find(|i| i.participant_id == killer_id as i32)
+                        {
+                            name = Some(if !ident.player.game_name.is_empty() {
+                                ident.player.game_name.clone()
+                            } else {
+                                ident.player.summoner_name.clone()
+                            });
+                        }
+                    }
+                    name.unwrap_or_else(|| "player".to_string())
+                };
+                return Ok((start, end, player_name));
+            }
+        }
+
+        // 3. Fallback check: did the game exist or have a pentakill?
+        let resolved_name = resolve_game_player(game_id, match_id, riot_api, pool, hub).await;
+        match resolved_name {
+            Some(name) => Err(anyhow!("Game found ({name}), but no pentakill event was detected in the timeline")),
+            None => Err(anyhow!("Match details not found in Riot API, database, or client")),
+        }
     }
 
     pub async fn run(
@@ -998,6 +1285,30 @@ pub mod highlight {
             .parse()
             .context("Invalid game_id: must be a number or NA1_<number>")?;
 
+        let manual_start_str = options
+            .iter()
+            .find(|o| o.name == "start")
+            .and_then(|o| match &o.value {
+                CommandDataOptionValue::String(s) => Some(s.trim().to_string()),
+                _ => None,
+            });
+
+        let manual_duration = options
+            .iter()
+            .find(|o| o.name == "duration")
+            .and_then(|o| match &o.value {
+                CommandDataOptionValue::Integer(i) => Some(*i),
+                _ => None,
+            });
+
+        let manual_player = options
+            .iter()
+            .find(|o| o.name == "player")
+            .and_then(|o| match &o.value {
+                CommandDataOptionValue::String(s) => Some(s.trim().to_string()),
+                _ => None,
+            });
+
         let relay_hub = match &config.relay_hub {
             Some(hub) if hub.has_live_relay().await => hub.clone(),
             _ => {
@@ -1010,68 +1321,40 @@ pub mod highlight {
         let match_id = format!("NA1_{game_id}");
         let riot_api = RiotApi::new(&config.riot_api_token);
 
-        let match_data = riot_api
-            .match_v5()
-            .get_match(RegionalRoute::AMERICAS, &match_id)
+        let (start_ms, end_ms, player_name, is_manual) = if let Some(ref s_str) = manual_start_str {
+            let start = parse_timestamp_ms(s_str).ok_or_else(|| {
+                anyhow!("Invalid start format '{s_str}'. Use MM:SS (e.g. 12:30) or seconds (e.g. 750).")
+            })?;
+            let duration_sec = manual_duration.unwrap_or(25).clamp(5, 60);
+            let end = start + duration_sec * 1000;
+            let player = match manual_player {
+                Some(p) => p,
+                None => resolve_game_player(game_id, &match_id, &riot_api, &config.pool, &relay_hub)
+                    .await
+                    .unwrap_or_else(|| "player".to_string()),
+            };
+            (start, end, player, true)
+        } else {
+            match resolve_pentakill_highlight(
+                game_id,
+                &match_id,
+                manual_player.as_deref(),
+                &riot_api,
+                &config.pool,
+                &relay_hub,
+            )
             .await
-            .context("Failed to fetch match details from Riot API")?
-            .ok_or_else(|| anyhow!("Match {match_id} not found in Riot API"))?;
-
-        let timeline = riot_api
-            .match_v5()
-            .get_timeline(RegionalRoute::AMERICAS, &match_id)
-            .await
-            .context("Failed to fetch match timeline from Riot API")?
-            .ok_or_else(|| anyhow!("Timeline for {match_id} not found"))?;
-
-        // Find pentakill or highest multi-kill
-        let penta_event = timeline
-            .info
-            .frames
-            .iter()
-            .flat_map(|f| f.events.iter())
-            .find(|e| e.multi_kill_length == Some(5));
-
-        let (start_ms, end_ms, player_name) = match penta_event {
-            Some(penta) => {
-                let all_kills: Vec<_> = timeline
-                    .info
-                    .frames
-                    .iter()
-                    .flat_map(|f| f.events.iter())
-                    .filter(|e| {
-                        penta.timestamp >= e.timestamp
-                            && e.killer_id == penta.killer_id
-                            && e.r#type == "CHAMPION_KILL"
-                    })
-                    .collect();
-                let start = if all_kills.len() >= 5 {
-                    (all_kills[all_kills.len() - 5].timestamp - 10_000).max(0)
-                } else {
-                    (penta.timestamp - 15_000).max(0)
-                };
-                let end = penta.timestamp + 5_000;
-
-                let participant = match_data
-                    .info
-                    .participants
-                    .iter()
-                    .find(|p| Some(p.participant_id) == penta.killer_id);
-                let name = participant
-                    .map(|p| {
-                        if !p.riot_id_game_name.as_deref().unwrap_or_default().is_empty() {
-                            p.riot_id_game_name.clone().unwrap()
-                        } else {
-                            p.summoner_name.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| "player".to_string());
-                (start, end, name)
-            }
-            None => {
-                return Ok(CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ No Pentakill event found in match `{match_id}` timeline."))
-                    .ephemeral(true));
+            {
+                Ok((start, end, player)) => (start, end, player, false),
+                Err(e) => {
+                    return Ok(CreateInteractionResponseMessage::new()
+                        .content(format!(
+                            "⚠️ Could not automatically detect a Pentakill timeline for match `{match_id}`: {e}\n\n\
+                             You can trigger highlight recording by providing the start timestamp manually:\n\
+                             `/highlight game_id:{game_id} start:MM:SS` (e.g. `/highlight game_id:{game_id} start:12:30`)"
+                        ))
+                        .ephemeral(true));
+                }
             }
         };
 
@@ -1082,7 +1365,7 @@ pub mod highlight {
         let player_name_clone = player_name.clone();
 
         tokio::spawn(async move {
-            info!("Requesting highlight for {match_id_clone} ({player_name_clone}) from random relay...");
+            info!("Requesting highlight for {match_id_clone} ({player_name_clone}, {start_ms}ms-{end_ms}ms) from random relay...");
             match relay_hub
                 .request_highlight_from_random_relay(
                     game_id,
@@ -1116,8 +1399,16 @@ pub mod highlight {
             }
         });
 
+        let start_sec = start_ms / 1000;
+        let time_display = format!("{:02}:{:02}", start_sec / 60, start_sec % 60);
+        let mode_desc = if is_manual {
+            format!("highlight clip at **{time_display}**")
+        } else {
+            "Pentakill highlight".to_string()
+        };
+
         Ok(CreateInteractionResponseMessage::new().content(format!(
-            "🎬 Dispatched Pentakill highlight generation for match `{match_id}` (**{player_name}**) to a random connected computer!\nUpdates will be posted in <#{}> when ready.",
+            "🎬 Dispatched {mode_desc} for match `{match_id}` (**{player_name}**) to a random connected computer!\nUpdates will be posted in <#{}> when ready.",
             config.updates_channel_id
         )))
     }
@@ -1239,5 +1530,36 @@ mod tests {
             &mut rng,
         );
         assert_content!("Group 1:\n\n<@9> <@8> <@7> <@6> <@12>\n\nGroup 2:\n\n<@2> <@14> <@1> <@19> <@10>\n\nGroup 3:\n\n<@13> <@5> <@17> <@16> <@18>\n\nGroup 4:\n\n<@11> <@15> <@20> <@4> <@3>", value);
+    }
+
+    #[test]
+    fn test_parse_timestamp_ms() {
+        use super::highlight::parse_timestamp_ms;
+        assert_eq!(parse_timestamp_ms("12:30"), Some(750_000));
+        assert_eq!(parse_timestamp_ms("0:00"), Some(0));
+        assert_eq!(parse_timestamp_ms("750"), Some(750_000));
+        assert_eq!(parse_timestamp_ms("750s"), Some(750_000));
+        assert_eq!(parse_timestamp_ms("750.5"), Some(750_500));
+        assert_eq!(parse_timestamp_ms("invalid"), None);
+    }
+
+    #[test]
+    fn test_find_penta_in_lcu_timeline() {
+        use super::highlight::find_penta_in_lcu_timeline;
+        let timeline = serde_json::json!({
+            "frames": [
+                {
+                    "events": [
+                        { "type": "CHAMPION_KILL", "timestamp": 100000, "killerId": 1 },
+                        { "type": "CHAMPION_KILL", "timestamp": 105000, "killerId": 1 },
+                        { "type": "CHAMPION_KILL", "timestamp": 110000, "killerId": 1 },
+                        { "type": "CHAMPION_KILL", "timestamp": 115000, "killerId": 1 },
+                        { "type": "CHAMPION_KILL", "timestamp": 120000, "killerId": 1 }
+                    ]
+                }
+            ]
+        });
+        let result = find_penta_in_lcu_timeline(&timeline);
+        assert_eq!(result, Some((90000, 125000, 1)));
     }
 }

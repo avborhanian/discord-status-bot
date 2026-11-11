@@ -110,6 +110,11 @@ pub fn game_path(game_id: i64) -> String {
     format!("/lol-match-history/v1/games/{game_id}")
 }
 
+/// Path returning the timeline events of a single game.
+pub fn game_timeline_path(game_id: i64) -> String {
+    format!("/lol-match-history/v1/game-timelines/{game_id}")
+}
+
 /// Path resolving a Riot ID to its raw PUUID.
 pub fn alias_lookup_path(game_name: &str, tag_line: &str) -> String {
     format!(
@@ -179,6 +184,9 @@ pub fn is_allowed_request(method: &str, path: &str) -> bool {
     static GAME: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"^/lol-match-history/v1/games/[0-9]{1,20}$").expect("valid regex")
     });
+    static GAME_TIMELINE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^/lol-match-history/v1/game-timelines/[0-9]{1,20}$").expect("valid regex")
+    });
     static REPLAY_ROFL: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"^/lol-replays/v1/rofls/[0-9]{1,20}$").expect("valid regex")
     });
@@ -225,7 +233,7 @@ pub fn is_allowed_request(method: &str, path: &str) -> bool {
 
             if MATCHES.is_match(route) {
                 keys_are(&["begIndex", "endIndex"]) && pairs.iter().all(|(_, v)| NUMBER.is_match(v))
-            } else if GAME.is_match(route) {
+            } else if GAME.is_match(route) || GAME_TIMELINE.is_match(route) {
                 query.is_none()
             } else if route == "/lol-summoner/v1/alias/lookup" {
                 keys_are(&["gameName", "tagLine"]) && pairs.iter().all(|(_, v)| ALIAS_VALUE.is_match(v))
@@ -317,12 +325,12 @@ mod tests {
             "/lol-match-history/v1/products/lol/current-summoner/matches",
             "/lol-match-history/v1/games/123/extra",
             "/lol-match-history/v1/games/1/../../riotclient/region-locale",
-            "/lol-match-history/v1/game-timelines/123",
             "",
             "/",
         ] {
             assert!(!is_allowed_path(path), "should reject {path}");
         }
+        assert!(is_allowed_path("/lol-match-history/v1/game-timelines/123"));
     }
 
     #[test]

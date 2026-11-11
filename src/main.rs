@@ -1963,9 +1963,10 @@ async fn check_pentakill_info(
                 let riot_token = config.riot_api_token.clone();
                 let http = discord_auth.clone();
                 let updates_channel = config.updates_channel_id;
+                let pool = config.pool.clone();
                 let primary_player = riot_ids.first().map(|r| r.name()).unwrap_or_else(|| "player".to_string());
                 tokio::spawn(async move {
-                    if let Err(e) = auto_trigger_highlight(game_id, &primary_player, &riot_token, &hub, &http, updates_channel).await {
+                    if let Err(e) = auto_trigger_highlight(game_id, &primary_player, &riot_token, &hub, &http, updates_channel, &pool).await {
                         warn!("Auto-dispatch of highlight for game {game_id} failed: {e:#}");
                     }
                 });
@@ -1983,69 +1984,30 @@ async fn auto_trigger_highlight(
     hub: &Arc<relay_hub::RelayHub>,
     http: &Arc<serenity::http::Http>,
     updates_channel_id: ChannelId,
+    pool: &sqlx::SqlitePool,
 ) -> Result<()> {
     let match_id = format!("NA1_{game_id}");
     let riot_api = riven::RiotApi::new(riot_api_token);
 
-    let match_data = riot_api
-        .match_v5()
-        .get_match(riven::consts::RegionalRoute::AMERICAS, &match_id)
-        .await
-        .context("Failed to fetch match details for auto highlight")?
-        .ok_or_else(|| anyhow!("Match {match_id} not found"))?;
-
-    let timeline = riot_api
-        .match_v5()
-        .get_timeline(riven::consts::RegionalRoute::AMERICAS, &match_id)
-        .await
-        .context("Failed to fetch timeline for auto highlight")?
-        .ok_or_else(|| anyhow!("Timeline for {match_id} not found"))?;
-
-    let penta_event = timeline
-        .info
-        .frames
-        .iter()
-        .flat_map(|f| f.events.iter())
-        .find(|e| e.multi_kill_length == Some(5));
-
-    let (start_ms, end_ms, player_name) = match penta_event {
-        Some(penta) => {
-            let all_kills: Vec<_> = timeline
-                .info
-                .frames
-                .iter()
-                .flat_map(|f| f.events.iter())
-                .filter(|e| {
-                    penta.timestamp >= e.timestamp
-                        && e.killer_id == penta.killer_id
-                        && e.r#type == "CHAMPION_KILL"
-                })
-                .collect();
-            let start = if all_kills.len() >= 5 {
-                (all_kills[all_kills.len() - 5].timestamp - 10_000).max(0)
-            } else {
-                (penta.timestamp - 15_000).max(0)
-            };
-            let end = penta.timestamp + 5_000;
-
-            let participant = match_data
-                .info
-                .participants
-                .iter()
-                .find(|p| Some(p.participant_id) == penta.killer_id);
-            let name = participant
-                .map(|p| {
-                    if !p.riot_id_game_name.as_deref().unwrap_or_default().is_empty() {
-                        p.riot_id_game_name.clone().unwrap()
-                    } else {
-                        p.summoner_name.clone()
-                    }
-                })
-                .unwrap_or_else(|| fallback_player_name.to_string());
-            (start, end, name)
-        }
-        None => {
-            return Err(anyhow!("No pentakill found in timeline for auto highlight"));
+    let (start_ms, end_ms, player_name) = match commands::highlight::resolve_pentakill_highlight(
+        game_id,
+        &match_id,
+        Some(fallback_player_name),
+        &riot_api,
+        pool,
+        hub,
+    )
+    .await
+    {
+        Result::Ok(res) => res,
+        Result::Err(e) => {
+            warn!("Automatic pentakill timeline detection failed for {match_id}: {e}");
+            let msg = format!(
+                "🎬 A Pentakill was scored by **{fallback_player_name}** in `{match_id}`, but automated replay timeline events are unavailable for this mode.\n\
+                 You can record the highlight clip using:\n`/highlight game_id:{game_id} start:MM:SS`"
+            );
+            let _ = update_highlight_reel(&msg, http, updates_channel_id).await;
+            return Ok(());
         }
     };
 
