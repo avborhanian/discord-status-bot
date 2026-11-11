@@ -224,3 +224,81 @@ pub async fn record_highlight<L: LcuApi>(
     info!("Highlight recording finished! Output path: {out_path}");
     Ok(out_path)
 }
+
+/// Optimizes a raw highlight video using FFmpeg (if available) for Discord upload.
+/// - Transcodes to H.264 MP4 with AAC audio (universal playback across Discord desktop/mobile/web).
+/// - Scales down to 720p60 if higher (e.g. 1440p) to keep high framerate while avoiding bloat.
+/// - Uses CRF 23 with maxrate capping to guarantee the file stays under Discord's 25 MB limit.
+/// Returns the path to the optimized `.mp4` file, or `None` if FFmpeg failed or is unavailable.
+pub async fn optimize_highlight_for_discord(input_path: &str) -> Option<std::path::PathBuf> {
+    let input = std::path::Path::new(input_path);
+    if !input.exists() {
+        return None;
+    }
+
+    let out_path = input.with_extension("discord.mp4");
+
+    info!("Checking for ffmpeg to post-process highlight {:?}...", input);
+    let check = tokio::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .await;
+
+    if check.is_err() {
+        info!("FFmpeg is not installed or not in PATH; skipping post-processing.");
+        return None;
+    }
+
+    info!("Transcoding highlight with FFmpeg for Discord ({:?} -> {:?})...", input, out_path);
+
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            input_path,
+            "-vf",
+            "scale=-2:'min(720,ih)'",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "faster",
+            "-crf",
+            "23",
+            "-maxrate",
+            "4.5M",
+            "-bufsize",
+            "9M",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&out_path)
+        .output()
+        .await;
+
+    match status {
+        Ok(out) if out.status.success() => {
+            if let Ok(meta) = tokio::fs::metadata(&out_path).await {
+                let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
+                info!("FFmpeg transcode succeeded: {:?} ({:.2} MB)", out_path, size_mb);
+                if meta.len() <= 25 * 1024 * 1024 {
+                    return Some(out_path);
+                } else {
+                    warn!("Transcoded video is still {:.2} MB (exceeds 25 MB); falling back.", size_mb);
+                }
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            warn!("FFmpeg transcode failed (exit code {:?}): {stderr}", out.status.code());
+        }
+        Err(e) => {
+            warn!("Failed to execute FFmpeg: {e}");
+        }
+    }
+
+    None
+}

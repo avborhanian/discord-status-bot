@@ -2027,7 +2027,12 @@ async fn auto_trigger_highlight(
                     "🎬 **Highlight Replay Generated!**\nMatch: `{match_id}`\nPlayer: **{player_name}**"
                 );
                 let attachment = reply.video_bytes.map(|b| {
-                    let filename = format!("{match_id}_{player_name}.webm");
+                    let ext = if b.len() >= 8 && &b[4..8] == b"ftyp" {
+                        "mp4"
+                    } else {
+                        "webm"
+                    };
+                    let filename = format!("{match_id}_{player_name}.{ext}");
                     (b, filename)
                 });
                 let _ = upload_to_highlight_reel(&msg, attachment, http, updates_channel_id).await;

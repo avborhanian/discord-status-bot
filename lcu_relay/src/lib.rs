@@ -225,22 +225,34 @@ pub async fn run_connection<L: LcuApi + Clone + Send + Sync + 'static>(
                                     Ok(path) => {
                                         // Give filesystem a moment to flush the recorded file
                                         tokio::time::sleep(Duration::from_millis(500)).await;
+
+                                        // Optimize with FFmpeg for Discord if available
+                                        let upload_path = match recorder::optimize_highlight_for_discord(&path).await {
+                                            Some(opt_path) => opt_path,
+                                            None => std::path::PathBuf::from(&path),
+                                        };
+
                                         let mut video_b64 = None;
-                                        match tokio::fs::read(&path).await {
+                                        match tokio::fs::read(&upload_path).await {
                                             Ok(bytes) => {
                                                 if bytes.len() <= 25 * 1024 * 1024 {
                                                     use base64::prelude::*;
-                                                    info!("Highlight video loaded ({} bytes), encoding for upload...", bytes.len());
+                                                    info!(
+                                                        "Highlight video loaded ({} bytes from {:?}), encoding for upload...",
+                                                        bytes.len(),
+                                                        upload_path
+                                                    );
                                                     video_b64 = Some(BASE64_STANDARD.encode(&bytes));
                                                 } else {
                                                     warn!(
-                                                        "Highlight video at {path} is {} MB, exceeding Discord's 25 MB upload limit",
+                                                        "Highlight video at {:?} is {} MB, exceeding Discord's 25 MB upload limit",
+                                                        upload_path,
                                                         bytes.len() / (1024 * 1024)
                                                     );
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!("Failed to read highlight video file at {path}: {e}");
+                                                warn!("Failed to read highlight video file at {:?}: {e}", upload_path);
                                             }
                                         }
                                         (true, Some(path), video_b64, None)

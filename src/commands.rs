@@ -1467,7 +1467,12 @@ pub mod highlight {
                     // If replay was recorded successfully, upload the video clip to the highlight reel!
                     if reply.success {
                         let attachment = reply.video_bytes.map(|b| {
-                            let filename = format!("{match_id_clone}_{player_name_clone}.webm");
+                            let ext = if b.len() >= 8 && &b[4..8] == b"ftyp" {
+                                "mp4"
+                            } else {
+                                "webm"
+                            };
+                            let filename = format!("{match_id_clone}_{player_name_clone}.{ext}");
                             (b, filename)
                         });
                         let reel_msg = if attachment.is_some() {
