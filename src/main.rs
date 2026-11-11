@@ -285,9 +285,8 @@ impl EventHandler for Handler {
                 "highlight" => {
                     commands::highlight::run(
                         &ctx,
-                        &command.data.options,
+                        &command,
                         self.config.clone(),
-                        &command.user,
                     )
                     .await
                 }

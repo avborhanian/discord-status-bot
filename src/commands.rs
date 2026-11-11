@@ -944,12 +944,11 @@ pub mod highlight {
     use riven::consts::RegionalRoute;
     use riven::RiotApi;
     use serenity::all::{
-        CommandDataOption, CommandDataOptionValue, CreateCommandOption,
-        CreateInteractionResponseMessage,
+        CommandDataOptionValue, CreateCommandOption, CreateInteractionResponseFollowup,
+        CreateInteractionResponseMessage, EditInteractionResponse,
     };
     use serenity::builder;
     use serenity::model::application::CommandOptionType;
-    use serenity::model::user::User;
     use std::sync::Arc;
     use std::time::Duration;
     use tracing::{error, info};
@@ -1304,10 +1303,11 @@ pub mod highlight {
 
     pub async fn run(
         ctx: &serenity::prelude::Context,
-        options: &[CommandDataOption],
+        command: &serenity::model::application::CommandInteraction,
         config: Arc<Config>,
-        user: &User,
     ) -> Result<CreateInteractionResponseMessage> {
+        let user = &command.user;
+        let options = &command.data.options;
         let user_id_str = user.id.get().to_string();
         if !db::is_admin(&config.pool, &user_id_str).await? {
             return Ok(CreateInteractionResponseMessage::new()
@@ -1406,11 +1406,20 @@ pub mod highlight {
             }
         };
 
+        let start_sec = start_ms / 1000;
+        let time_display = format!("{:02}:{:02}", start_sec / 60, start_sec % 60);
+        let mode_desc = if is_manual {
+            format!("highlight clip at **{time_display}**")
+        } else {
+            "Pentakill highlight".to_string()
+        };
+
         // Dispatch in background to a random connected computer
         let http = ctx.http.clone();
-        let updates_channel = config.updates_channel_id;
         let match_id_clone = match_id.clone();
         let player_name_clone = player_name.clone();
+        let mode_desc_clone = mode_desc.clone();
+        let command_clone = command.clone();
 
         tokio::spawn(async move {
             info!("Requesting highlight for {match_id_clone} ({player_name_clone}, {start_ms}ms-{end_ms}ms) from random relay...");
@@ -1425,40 +1434,55 @@ pub mod highlight {
                 .await
             {
                 Ok((relay_name, reply)) => {
-                    if reply.success {
+                    let (status_text, followup_msg) = if reply.success {
                         let path = reply.file_path.as_deref().unwrap_or("Highlights folder");
-                        let msg = format!(
-                            "🎬 **Highlight Replay Generated!**\nMatch: `{match_id_clone}`\nPlayer: **{player_name_clone}**\nGenerated on client: **{relay_name}**\nSaved to: `{path}`"
-                        );
-                        let _ = crate::update_highlight_reel(&msg, &http, updates_channel).await;
+                        (
+                            format!(
+                                "🎬 Dispatched {mode_desc_clone} for match `{match_id_clone}` (**{player_name_clone}**) — **Complete!** ✅"
+                            ),
+                            format!(
+                                "🎬 **Highlight Replay Generated!**\nMatch: `{match_id_clone}`\nPlayer: **{player_name_clone}**\nGenerated on client: **{relay_name}**\nSaved to: `{path}`"
+                            ),
+                        )
                     } else {
                         let err = reply.error.as_deref().unwrap_or("unknown error");
-                        let msg = format!(
-                            "⚠️ Highlight generation failed on **{relay_name}** for `{match_id_clone}`: {err}"
-                        );
-                        let _ = crate::update_highlight_reel(&msg, &http, updates_channel).await;
-                    }
+                        (
+                            format!(
+                                "🎬 Dispatched {mode_desc_clone} for match `{match_id_clone}` (**{player_name_clone}**) — **Failed** ❌"
+                            ),
+                            format!(
+                                "⚠️ Highlight generation failed on **{relay_name}** for `{match_id_clone}`: {err}"
+                            ),
+                        )
+                    };
+                    let _ = command_clone
+                        .edit_response(&http, EditInteractionResponse::new().content(&status_text))
+                        .await;
+                    let followup = CreateInteractionResponseFollowup::new()
+                        .content(&followup_msg)
+                        .ephemeral(true);
+                    let _ = command_clone.create_followup(&http, followup).await;
                 }
                 Err(e) => {
                     error!("Highlight generation failed for {match_id_clone}: {e}");
+                    let status_text = format!(
+                        "🎬 Dispatched {mode_desc_clone} for match `{match_id_clone}` (**{player_name_clone}**) — **Failed** ❌"
+                    );
+                    let _ = command_clone
+                        .edit_response(&http, EditInteractionResponse::new().content(&status_text))
+                        .await;
                     let msg = format!("❌ Highlight generation failed for `{match_id_clone}`: {e}");
-                    let _ = crate::update_highlight_reel(&msg, &http, updates_channel).await;
+                    let followup = CreateInteractionResponseFollowup::new()
+                        .content(&msg)
+                        .ephemeral(true);
+                    let _ = command_clone.create_followup(&http, followup).await;
                 }
             }
         });
 
-        let start_sec = start_ms / 1000;
-        let time_display = format!("{:02}:{:02}", start_sec / 60, start_sec % 60);
-        let mode_desc = if is_manual {
-            format!("highlight clip at **{time_display}**")
-        } else {
-            "Pentakill highlight".to_string()
-        };
-
         Ok(CreateInteractionResponseMessage::new()
             .content(format!(
-                "🎬 Dispatched {mode_desc} for match `{match_id}` (**{player_name}**) to a random connected computer!\nUpdates will be posted in <#{}> when ready.",
-                config.updates_channel_id
+                "🎬 Dispatched {mode_desc} for match `{match_id}` (**{player_name}**) to a random connected computer!\nRecording in progress...",
             ))
             .ephemeral(true))
     }
